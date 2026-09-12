@@ -28,12 +28,17 @@ from quant_engine import (
     calculate_color,
     calculate_gamma_theta_ratio,
     calculate_speed,
+    calculate_ultima,
     calculate_vanna,
+    calculate_veta,
     calculate_volga,
+    calculate_vomma,
+    calculate_zomma,
     generate_3d_gamma_surface,
     generate_3d_greek_surface,
     generate_delta_term_structure,
     generate_greek_curve,
+    generate_pro_surface_data,
     generate_vol_surface_data,
 )
 
@@ -51,6 +56,10 @@ GREEK_COLORS = {
     "IV": "#8b949e",
     "Vanna": "#79c0ff",
     "Volga": "#ffa657",
+    "Vomma": "#ffa657",
+    "Zomma": "#db6d28",
+    "Veta": "#39d353",
+    "Ultima": "#e3b341",
     "Charm": "#d2a8ff",
     "Speed": "#f0883e",
     "Color": "#a371f7",
@@ -58,6 +67,14 @@ GREEK_COLORS = {
 RATIO_THRESHOLD = 0.5
 PRICE_SPAN = 0.30
 CURVE_POINTS = 201
+PRO_METRICS = ("Vanna", "Vomma", "Zomma", "Veta", "Ultima")
+PRO_METRIC_HELP = (
+    "Vanna: sensitivity of delta to volatility. "
+    "Vomma: sensitivity of vega to volatility. "
+    "Zomma: sensitivity of gamma to volatility. "
+    "Veta: sensitivity of vega to time. "
+    "Ultima: sensitivity of vomma to volatility."
+)
 DARK_BG = "#0e1117"
 PANEL_BG = "#161b22"
 CARD_BG = "#1c2330"
@@ -106,6 +123,7 @@ def _init_state() -> None:
         "vol_surface_fp": None,
         "run_heston_gamma_surface": False,
         "run_heston_term": False,
+        "pro_metric_name": "Vanna",
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -660,6 +678,7 @@ def _sidebar_inputs() -> tuple[str, float, date, float, str, bool, Any]:
             cached_delta_term_structure.clear()
             cached_vanna_volga.clear()
             cached_vol_surface.clear()
+            cached_pro_surface.clear()
             st.session_state.price_ticker = ""
             st.session_state.iv_fingerprint = None
             st.session_state.persisted_iv = None
@@ -1084,6 +1103,78 @@ def cached_greek_surface(
     )
 
 
+@st.cache_data(show_spinner="Building pro metric surface…")
+def cached_pro_surface(
+    ticker: str,
+    greek_name: str,
+    strike: float,
+    expiry_range: tuple[float, ...],
+    prices: tuple[float, ...],
+    sigma: float,
+    option_type: str,
+    model: str,
+    v0: float,
+    kappa: float,
+    theta: float,
+    heston_sigma: float,
+    rho: float,
+) -> pd.DataFrame:
+    return generate_pro_surface_data(
+        ticker,
+        greek_name,
+        strike=strike,
+        expiry_range=expiry_range,
+        price_range=prices if prices else None,
+        r=DEFAULT_RATE,
+        sigma=sigma,
+        option_type=option_type,
+        model=model,
+        v0=v0,
+        kappa=kappa,
+        theta=theta,
+        heston_sigma=heston_sigma,
+        rho=rho,
+    )
+
+
+@st.cache_data(show_spinner=False)
+def cached_pro_curve(
+    prices: tuple[float, ...],
+    greek_name: str,
+    strike: float,
+    expiry: str,
+    sigma: float,
+    option_type: str,
+    model: str,
+    v0: float,
+    kappa: float,
+    theta: float,
+    heston_sigma: float,
+    rho: float,
+) -> pd.DataFrame:
+    spots = np.asarray(prices, dtype="float64")
+    time_years = max((date.fromisoformat(expiry) - date.today()).days, 0) / DAYS_PER_YEAR
+    kwargs = {
+        "q": 0.0,
+        "option_type": option_type,
+        "v0": v0,
+        "kappa": kappa,
+        "theta": theta,
+        "heston_sigma": heston_sigma,
+        "rho": rho,
+    }
+    calculators = {
+        "Vanna": calculate_vanna,
+        "Vomma": calculate_vomma,
+        "Zomma": calculate_zomma,
+        "Veta": calculate_veta,
+        "Ultima": calculate_ultima,
+    }
+    fn = calculators.get(str(greek_name), calculate_vanna)
+    values = fn(spots, strike, time_years, DEFAULT_RATE, sigma, model, **kwargs)
+    return pd.DataFrame({"Price": spots, "Value": np.asarray(values, dtype="float64")})
+
+
 @st.cache_data(show_spinner="Building delta term structure…")
 def cached_delta_term_structure(
     ticker: str,
@@ -1226,6 +1317,146 @@ def render_gamma_surface(frame: pd.DataFrame) -> None:
         config={"displayModeBar": True, "scrollZoom": True},
         key="gamma-surface-chart",
     )
+
+
+def render_pro_surface(frame: pd.DataFrame, greek_name: str) -> None:
+    required = {"Price", "DaysToExpiry", "Value"}
+    if frame.empty or not required.issubset(frame.columns):
+        st.info(f"No {greek_name} surface data to plot.")
+        return
+    pivot = frame.pivot_table(index="DaysToExpiry", columns="Price", values="Value", aggfunc="mean")
+    pivot = pivot.sort_index().sort_index(axis=1)
+    z = pivot.to_numpy(dtype=float)
+    z[~np.isfinite(z)] = np.nan
+    fig = go.Figure(
+        data=[
+            go.Surface(
+                x=pivot.columns.to_numpy(dtype=float),
+                y=pivot.index.to_numpy(dtype=float),
+                z=z,
+                colorscale="Viridis",
+                connectgaps=False,
+                colorbar={"title": greek_name},
+                hovertemplate="Price=%{x:.2f}<br>DTE=%{y:.1f}<br>" + greek_name + "=%{z:.6f}<extra></extra>",
+            )
+        ]
+    )
+    fig.update_layout(
+        template="plotly_dark",
+        paper_bgcolor=DARK_BG,
+        font={"color": TEXT},
+        height=560,
+        title={"text": f"{greek_name} surface", "x": 0.0, "xanchor": "left"},
+        scene={
+            "xaxis_title": "Price",
+            "yaxis_title": "Days to Expiry",
+            "zaxis_title": greek_name,
+            "bgcolor": PANEL_BG,
+            "dragmode": "orbit",
+        },
+        margin={"l": 8, "r": 8, "t": 48, "b": 8},
+        uirevision=f"pro-surface-{greek_name}",
+    )
+    st.plotly_chart(
+        fig,
+        width="stretch",
+        config={"displayModeBar": True, "scrollZoom": True},
+        key=f"pro-surface-chart-{greek_name}",
+    )
+
+
+def render_pro_line(frame: pd.DataFrame, greek_name: str) -> None:
+    if frame.empty or "Price" not in frame.columns or "Value" not in frame.columns:
+        st.info(f"No {greek_name} line data to plot.")
+        return
+    prices = pd.to_numeric(frame["Price"], errors="coerce")
+    values = pd.to_numeric(frame["Value"], errors="coerce")
+    valid = prices.notna() & values.notna()
+    if not valid.any():
+        st.info(f"No valid {greek_name} points to plot.")
+        return
+    fig = go.Figure(
+        data=[
+            go.Scatter(
+                x=prices.loc[valid],
+                y=values.loc[valid],
+                mode="lines",
+                name=greek_name,
+                line={"color": GREEK_COLORS.get(greek_name, "#58a6ff"), "width": 2.5},
+                hovertemplate="Price=%{x:.4f}<br>" + greek_name + "=%{y:.6f}<extra></extra>",
+            )
+        ]
+    )
+    fig.update_layout(
+        template="plotly_dark",
+        paper_bgcolor=DARK_BG,
+        plot_bgcolor=PANEL_BG,
+        font={"color": TEXT},
+        height=340,
+        title={"text": f"{greek_name} vs Price", "x": 0.0, "xanchor": "left"},
+        xaxis={"title": "Price", "gridcolor": GRID, "zeroline": False},
+        yaxis={"title": greek_name, "gridcolor": GRID, "zeroline": True},
+        hovermode="x unified",
+        showlegend=False,
+        margin={"l": 48, "r": 16, "t": 48, "b": 48},
+        uirevision=f"pro-line-{greek_name}",
+    )
+    st.plotly_chart(
+        fig,
+        width="stretch",
+        config={"displayModeBar": True},
+        key=f"pro-line-chart-{greek_name}",
+    )
+
+
+def add_pro_metrics_tab(
+    tab: Any,
+    ticker: str,
+    strike: float,
+    expiry: date,
+    frame: pd.DataFrame,
+    sigma: float,
+    option_type: str,
+    model: str,
+    v0: float,
+    kappa: float,
+    theta: float,
+    heston_sigma: float,
+    rho: float,
+) -> None:
+    with tab:
+        greek_name = st.radio(
+            "Pro metric",
+            options=("Vanna", "Vomma", "Zomma", "Veta", "Ultima"),
+            horizontal=True,
+            key="pro_metric_name",
+            help="Third-order and mixed Greeks on a price × days-to-expiry grid.",
+        )
+        dte = max((expiry - date.today()).days, 1)
+        expiry_range = tuple(sorted({float(d) for d in range(7, 91, 7)} | {float(dte)}))
+        prices = tuple(
+            float(p)
+            for p in pd.to_numeric(frame["Price"], errors="coerce").dropna().tolist()[::4]
+        )
+        try:
+            pro_frame = cached_pro_surface(
+                ticker,
+                str(greek_name),
+                float(strike),
+                expiry_range,
+                prices,
+                float(sigma),
+                option_type,
+                model,
+                v0,
+                kappa,
+                theta,
+                heston_sigma,
+                rho,
+            )
+            render_pro_surface(pro_frame, str(greek_name))
+        except Exception:
+            st.error(f"Could not render the {greek_name} pro surface.")
 
 
 def render_vol_surface(frame: pd.DataFrame | str) -> None:
@@ -1607,9 +1838,15 @@ def main() -> None:
         except Exception:
             st.error("Could not render the Vanna/Volga chart.")
 
-    greeks_tab, advanced_tab, surface_tab, time_tab, vol_tab = st.tabs(
-        ["Greeks", "Advanced Metrics", "3D Surface", "Time-Sensitivity", "Volatility Surface"]
-    )
+    tab_labels = [
+        "Greeks",
+        "Advanced Metrics",
+        "3D Surface",
+        "Time-Sensitivity",
+        "Volatility Surface",
+    ]
+    tab_labels.append("Pro Metrics")
+    greeks_tab, advanced_tab, surface_tab, time_tab, vol_tab, pro_tab = st.tabs(tab_labels)
     with greeks_tab:
         for pair in CHART_ROWS:
             cols = st.columns(len(pair), gap="medium")
@@ -1739,6 +1976,22 @@ def main() -> None:
             render_vol_surface(vol_surface)
         except Exception as error:
             st.exception(error)
+
+    add_pro_metrics_tab(
+        pro_tab,
+        ticker,
+        float(strike),
+        expiry,
+        frame,
+        float(sigma),
+        option_type,
+        model,
+        v0,
+        kappa,
+        theta,
+        heston_sigma,
+        rho,
+    )
 
 
 if __name__ == "__main__":

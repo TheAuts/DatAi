@@ -1192,3 +1192,304 @@ def generate_vol_surface_data(ticker: str) -> pd.DataFrame | str:
         }
     )
     return _finish(frame)
+
+
+def _safe_div(numerator: np.ndarray, denominator: np.ndarray | float) -> np.ndarray:
+    """Elementwise divide; zero/near-zero denominators become NaN."""
+    num = np.asarray(numerator, dtype=np.float64)
+    den = np.asarray(denominator, dtype=np.float64)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        out = np.where(np.abs(den) < 1e-12, np.nan, num / den)
+        return np.where(np.isfinite(out), out, np.nan)
+
+
+def _pro_metrics_vector(
+    S: Any,
+    K: float,
+    T: float,
+    r: float,
+    sigma: float,
+    model: str = MODEL_BLACK_SCHOLES,
+    *,
+    q: float = 0.0,
+    option_type: str = "call",
+    v0: float | None = None,
+    kappa: float = DEFAULT_HESTON_KAPPA,
+    theta: float = DEFAULT_HESTON_THETA,
+    heston_sigma: float = DEFAULT_HESTON_SIGMA,
+    rho: float = DEFAULT_HESTON_RHO,
+) -> dict[str, np.ndarray]:
+    """Vanna, Vomma/Volga, Zomma, Veta, and Ultima for BS or Heston."""
+    spots = np.atleast_1d(np.asarray(S, dtype=np.float64))
+    n = spots.shape[0]
+    empty = {
+        "Vanna": np.full(n, np.nan, dtype=np.float64),
+        "Vomma": np.full(n, np.nan, dtype=np.float64),
+        "Volga": np.full(n, np.nan, dtype=np.float64),
+        "Zomma": np.full(n, np.nan, dtype=np.float64),
+        "Veta": np.full(n, np.nan, dtype=np.float64),
+        "Ultima": np.full(n, np.nan, dtype=np.float64),
+    }
+    try:
+        strike, time_years, rate, vol, dividend = float(K), float(T), float(r), float(sigma), float(q)
+    except (TypeError, ValueError):
+        return empty
+    is_put = str(option_type).strip().lower().startswith("p")
+    if not np.isfinite(strike) or strike <= 0 or not np.isfinite(time_years) or time_years < T_MIN:
+        return empty
+    if _model_is_heston(model):
+        try:
+            var0 = float(vol) ** 2 if v0 is None else float(v0)
+            mean_rev = float(kappa)
+            long_var = float(theta)
+            eta = float(heston_sigma)
+            corr = float(rho)
+        except (TypeError, ValueError):
+            return empty
+        if var0 <= 0 or eta <= 0:
+            return empty
+        base = _heston_greeks_vector(
+            spots, strike, time_years, rate, dividend, var0, mean_rev, long_var, eta, corr, is_put
+        )
+        empty["Vanna"] = np.asarray(base.get("Vanna", empty["Vanna"]), dtype=np.float64)
+        empty["Volga"] = np.asarray(base.get("Volga", empty["Volga"]), dtype=np.float64)
+        empty["Vomma"] = empty["Volga"].copy()
+        dv = max(var0 * 0.02, 1e-4)
+        sigma0 = float(np.sqrt(var0))
+        d_sigma = float(np.sqrt(var0 + dv) - sigma0)
+        if d_sigma > 1e-12:
+            bumped = _heston_greeks_vector(
+                spots, strike, time_years, rate, dividend, var0 + dv, mean_rev, long_var, eta, corr, is_put
+            )
+            empty["Zomma"] = _safe_div(bumped["Gamma"] - base["Gamma"], d_sigma)
+            empty["Ultima"] = _safe_div(bumped["Volga"] - base["Volga"], d_sigma)
+        t_down = time_years - (1.0 / DAYS_PER_YEAR)
+        if t_down >= T_MIN:
+            earlier = _heston_greeks_vector(
+                spots, strike, t_down, rate, dividend, var0, mean_rev, long_var, eta, corr, is_put
+            )
+            empty["Veta"] = earlier["Vega"] - base["Vega"]
+        return empty
+
+    if not np.isfinite(vol) or vol < SIGMA_MIN:
+        return empty
+    valid = np.isfinite(spots) & (spots > 0)
+    if not np.any(valid):
+        return empty
+    s = spots[valid]
+    sqrt_t = np.sqrt(time_years)
+    denom = vol * sqrt_t
+    if not np.isfinite(denom) or abs(float(denom)) < 1e-12:
+        return empty
+    with np.errstate(divide="ignore", invalid="ignore"):
+        d1 = (np.log(s / strike) + (rate - dividend + 0.5 * vol * vol) * time_years) / denom
+        d2 = d1 - denom
+        n_d1 = norm.pdf(d1)
+        disc_q = np.exp(-dividend * time_years)
+        gamma = _safe_div(disc_q * n_d1, s * denom)
+        vega_raw = s * disc_q * n_d1 * sqrt_t
+        vanna = _safe_div(-disc_q * n_d1 * d2, vol)
+        vomma = _safe_div(vega_raw * d1 * d2, vol)
+        zomma = _safe_div(gamma * (d1 * d2 - 1.0), vol)
+        veta_annual = vega_raw * (
+            dividend + _safe_div((rate - dividend) * d1, denom) - _safe_div(1.0 + d1 * d2, 2.0 * time_years)
+        )
+        ultima = _safe_div(
+            -vega_raw * (d1 * d2 * (1.0 - d1 * d2) + d1 * d1 + d2 * d2),
+            vol * vol,
+        )
+    empty["Vanna"][valid] = vanna
+    empty["Vomma"][valid] = vomma
+    empty["Volga"][valid] = vomma
+    empty["Zomma"][valid] = zomma
+    empty["Veta"][valid] = veta_annual / DAYS_PER_YEAR
+    empty["Ultima"][valid] = ultima
+    return empty
+
+
+def calculate_vomma(
+    S: Any,
+    K: float,
+    T: float,
+    r: float,
+    sigma: float,
+    model: str = MODEL_BLACK_SCHOLES,
+    *,
+    q: float = 0.0,
+    option_type: str = "call",
+    v0: float | None = None,
+    kappa: float = DEFAULT_HESTON_KAPPA,
+    theta: float = DEFAULT_HESTON_THETA,
+    heston_sigma: float = DEFAULT_HESTON_SIGMA,
+    rho: float = DEFAULT_HESTON_RHO,
+) -> Any:
+    """Vomma (Volga) ∂²V/∂σ². ``model`` is ``black-scholes`` or ``heston``.
+
+    Returns None/NaN when T, sigma, or S are non-positive or the divide is undefined.
+    """
+    values = _pro_metrics_vector(
+        S, K, T, r, sigma, model, q=q, option_type=option_type, v0=v0, kappa=kappa, theta=theta, heston_sigma=heston_sigma, rho=rho
+    )
+    return _pack_second_order(S, values["Vomma"])
+
+
+def calculate_zomma(
+    S: Any,
+    K: float,
+    T: float,
+    r: float,
+    sigma: float,
+    model: str = MODEL_BLACK_SCHOLES,
+    *,
+    q: float = 0.0,
+    option_type: str = "call",
+    v0: float | None = None,
+    kappa: float = DEFAULT_HESTON_KAPPA,
+    theta: float = DEFAULT_HESTON_THETA,
+    heston_sigma: float = DEFAULT_HESTON_SIGMA,
+    rho: float = DEFAULT_HESTON_RHO,
+) -> Any:
+    """Zomma ∂Γ/∂σ. ``model`` is ``black-scholes`` or ``heston``.
+
+    Returns None/NaN when T, sigma, or S are non-positive or sigma is near zero.
+    """
+    values = _pro_metrics_vector(
+        S, K, T, r, sigma, model, q=q, option_type=option_type, v0=v0, kappa=kappa, theta=theta, heston_sigma=heston_sigma, rho=rho
+    )
+    return _pack_second_order(S, values["Zomma"])
+
+
+def calculate_veta(
+    S: Any,
+    K: float,
+    T: float,
+    r: float,
+    sigma: float,
+    model: str = MODEL_BLACK_SCHOLES,
+    *,
+    q: float = 0.0,
+    option_type: str = "call",
+    v0: float | None = None,
+    kappa: float = DEFAULT_HESTON_KAPPA,
+    theta: float = DEFAULT_HESTON_THETA,
+    heston_sigma: float = DEFAULT_HESTON_SIGMA,
+    rho: float = DEFAULT_HESTON_RHO,
+) -> Any:
+    """Veta ∂Vega/∂t per calendar day. ``model`` is ``black-scholes`` or ``heston``.
+
+    Returns None/NaN when T, sigma, or S are non-positive.
+    """
+    values = _pro_metrics_vector(
+        S, K, T, r, sigma, model, q=q, option_type=option_type, v0=v0, kappa=kappa, theta=theta, heston_sigma=heston_sigma, rho=rho
+    )
+    return _pack_second_order(S, values["Veta"])
+
+
+def calculate_ultima(
+    S: Any,
+    K: float,
+    T: float,
+    r: float,
+    sigma: float,
+    model: str = MODEL_BLACK_SCHOLES,
+    *,
+    q: float = 0.0,
+    option_type: str = "call",
+    v0: float | None = None,
+    kappa: float = DEFAULT_HESTON_KAPPA,
+    theta: float = DEFAULT_HESTON_THETA,
+    heston_sigma: float = DEFAULT_HESTON_SIGMA,
+    rho: float = DEFAULT_HESTON_RHO,
+) -> Any:
+    """Ultima ∂Vomma/∂σ. ``model`` is ``black-scholes`` or ``heston``.
+
+    Returns None/NaN when T, sigma, or S are non-positive or sigma is near zero.
+    """
+    values = _pro_metrics_vector(
+        S, K, T, r, sigma, model, q=q, option_type=option_type, v0=v0, kappa=kappa, theta=theta, heston_sigma=heston_sigma, rho=rho
+    )
+    return _pack_second_order(S, values["Ultima"])
+
+
+def generate_pro_surface_data(
+    ticker: str,
+    greek_name: str,
+    *,
+    strike: float | None = None,
+    expiry_range: Iterable[Any] | None = None,
+    price_range: Iterable[Any] | None = None,
+    r: float = DEFAULT_RATE,
+    sigma: float = DEFAULT_SIGMA,
+    q: float = 0.0,
+    option_type: str = "call",
+    model: str = MODEL_BLACK_SCHOLES,
+    v0: float = DEFAULT_HESTON_V0,
+    kappa: float = DEFAULT_HESTON_KAPPA,
+    theta: float = DEFAULT_HESTON_THETA,
+    heston_sigma: float = DEFAULT_HESTON_SIGMA,
+    rho: float = DEFAULT_HESTON_RHO,
+) -> pd.DataFrame:
+    """3D Price × Days-to-Expiry grid for a Pro Metric (Vanna, Vomma, Zomma, Veta, Ultima).
+
+    ``ticker`` is unused in pricing and kept for dashboard identity.
+    Invalid or unknown ``greek_name`` defaults to Vanna. Edge cells are NaN, not inf.
+    """
+    del ticker
+    aliases = {
+        "vanna": "Vanna",
+        "vomma": "Vomma",
+        "volga": "Vomma",
+        "zomma": "Zomma",
+        "veta": "Veta",
+        "ultima": "Ultima",
+    }
+    name = aliases.get(str(greek_name).strip().lower(), "Vanna")
+    empty = pd.DataFrame(columns=["Price", "DaysToExpiry", "Value"])
+    if expiry_range is None:
+        expiry_range = tuple(float(d) for d in range(7, 91, 7))
+    dtes: list[float] = []
+    for item in expiry_range:
+        if isinstance(item, (date, datetime)):
+            years = _time_to_expiry_years(item)
+            dtes.append(years * DAYS_PER_YEAR)
+        else:
+            try:
+                dtes.append(float(item))
+            except (TypeError, ValueError):
+                continue
+    dtes = [dte for dte in dtes if np.isfinite(dte) and dte > 0]
+    if not dtes:
+        return empty
+    try:
+        k = 100.0 if strike is None else float(strike)
+    except (TypeError, ValueError):
+        return empty
+    if not np.isfinite(k) or k <= 0:
+        return empty
+    if price_range is None:
+        prices = np.linspace(max(k * 0.7, 1e-6), k * 1.3, 41)
+    else:
+        prices = pd.to_numeric(pd.Series(list(price_range), dtype="object"), errors="coerce").to_numpy(dtype=np.float64)
+    rows: list[dict[str, float]] = []
+    for dte in dtes:
+        time_years = dte / DAYS_PER_YEAR
+        metrics = _pro_metrics_vector(
+            prices,
+            k,
+            time_years,
+            r,
+            sigma,
+            model,
+            q=q,
+            option_type=option_type,
+            v0=v0,
+            kappa=kappa,
+            theta=theta,
+            heston_sigma=heston_sigma,
+            rho=rho,
+        )
+        series = metrics.get(name, metrics["Vanna"])
+        for price, value in zip(prices, series):
+            raw = float(value) if np.isfinite(value) else float("nan")
+            rows.append({"Price": float(price), "DaysToExpiry": float(dte), "Value": raw})
+    return pd.DataFrame(rows)

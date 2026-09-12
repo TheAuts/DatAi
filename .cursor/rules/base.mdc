@@ -1,0 +1,6 @@
+---
+description: Core project standards — concision, pytest, modularity, performance
+alwaysApply: true
+---
+
+Always be concise. No conversational filler. Use pytest for math logic. Keep code modular. Prioritize performance.
