@@ -22,8 +22,8 @@ DEFAULT_HESTON_KAPPA = 2.0
 DEFAULT_HESTON_THETA = 0.04
 DEFAULT_HESTON_SIGMA = 0.40
 DEFAULT_HESTON_RHO = -0.70
-HESTON_PATHS = 10000
-HESTON_STEPS = 1000
+HESTON_PATHS = 4096
+HESTON_STEPS = 600
 CURVE_RESOLUTION = 201
 SMOOTH_WINDOW = 5
 VOL_SURFACE_IV_MIN = 0.01
@@ -627,34 +627,34 @@ def generate_greek_curve(
             long_var = float(theta)
             vol_vol = float(heston_sigma)
             corr = float(rho)
-        except (TypeError, ValueError):
-            var0 = mean_reversion = long_var = vol_vol = corr = float("nan")
-        heston = _heston_greeks_vector(
-            spots,
-            k,
-            time_years,
-            rate,
-            dividend,
-            var0,
-            mean_reversion,
-            long_var,
-            vol_vol,
-            corr,
-            is_put,
-            n_paths=HESTON_PATHS,
-            n_steps=HESTON_STEPS,
-            seed=42,
-        )
-        frame["Delta_Heston"] = heston["Delta"]
-        frame["Gamma_Heston"] = heston["Gamma"]
-        frame["Theta_Heston"] = heston["Theta"]
-        frame["Vega_Heston"] = heston["Vega"]
-        frame["Rho_Heston"] = heston["Rho"]
-        frame["Vanna_Heston"] = heston["Vanna"]
-        frame["Volga_Heston"] = heston["Volga"]
-        frame["Charm_Heston"] = heston["Charm"]
-        frame["Speed_Heston"] = heston["Speed"]
-        frame["Color_Heston"] = heston["Color"]
+            heston = _heston_greeks_vector(
+                spots,
+                k,
+                time_years,
+                rate,
+                dividend,
+                var0,
+                mean_reversion,
+                long_var,
+                vol_vol,
+                corr,
+                is_put,
+                n_paths=HESTON_PATHS,
+                n_steps=HESTON_STEPS,
+                seed=42,
+            )
+            frame["Delta_Heston"] = heston["Delta"]
+            frame["Gamma_Heston"] = heston["Gamma"]
+            frame["Theta_Heston"] = heston["Theta"]
+            frame["Vega_Heston"] = heston["Vega"]
+            frame["Rho_Heston"] = heston["Rho"]
+            frame["Vanna_Heston"] = heston["Vanna"]
+            frame["Volga_Heston"] = heston["Volga"]
+            frame["Charm_Heston"] = heston["Charm"]
+            frame["Speed_Heston"] = heston["Speed"]
+            frame["Color_Heston"] = heston["Color"]
+        except (TypeError, ValueError, MemoryError, FloatingPointError):
+            pass
     frame = _smooth_curve_frame(frame, "Price")
     if "Gamma" in frame.columns and "Theta" in frame.columns:
         frame["GammaThetaRatio"] = calculate_gamma_theta_ratio(frame["Gamma"], frame["Theta"])

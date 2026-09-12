@@ -104,6 +104,8 @@ def _init_state() -> None:
         "vanna_volga_fp": None,
         "vol_surface_frame": None,
         "vol_surface_fp": None,
+        "run_heston_gamma_surface": False,
+        "run_heston_term": False,
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -258,7 +260,7 @@ def _parse_manual_strike(raw: str) -> float | None:
     return value if value > 0 else None
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner="Computing Greeks…")
 def cached_greek_curve(
     ticker: str,
     strike: float,
@@ -516,9 +518,9 @@ def render_greek_chart(frame: pd.DataFrame, y_column: str, container: Any, revis
     )
     container.plotly_chart(
         fig,
-        use_container_width=True,
+        width="stretch",
         config={"displayModeBar": True},
-        key=f"greek-chart-{y_column}",
+        key=f"greek-chart-{y_column}-{revision}",
     )
 
 
@@ -733,7 +735,19 @@ def _load_curve(
         ticker, strike, expiry, option_type, current_price, sigma, model, v0, kappa, theta, heston_sigma, rho
     )
     existing = st.session_state.get("greeks_frame")
-    if fingerprint == st.session_state.get("sim_fingerprint") and isinstance(existing, pd.DataFrame) and not existing.empty:
+    heston_ok = True
+    if str(model) == MODEL_HESTON:
+        heston_ok = (
+            isinstance(existing, pd.DataFrame)
+            and "Delta_Heston" in existing.columns
+            and pd.to_numeric(existing["Delta_Heston"], errors="coerce").notna().any()
+        )
+    if (
+        fingerprint == st.session_state.get("sim_fingerprint")
+        and isinstance(existing, pd.DataFrame)
+        and not existing.empty
+        and heston_ok
+    ):
         st.session_state.last_ok = True
         return existing
 
@@ -987,7 +1001,13 @@ def _price_greek_chart(
         margin={"l": 48, "r": 16, "t": 48, "b": 48},
         uirevision=y_column,
     )
-    st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": True}, key=f"price-greek-{y_column}")
+    model_tag = "heston" if f"{y_column}_Heston" in frame.columns else "bs"
+    st.plotly_chart(
+        fig,
+        width="stretch",
+        config={"displayModeBar": True},
+        key=f"price-greek-{y_column}-{model_tag}",
+    )
 
 
 def render_speed_chart(frame: pd.DataFrame) -> None:
@@ -1550,6 +1570,12 @@ def main() -> None:
     if frame is None:
         return
 
+    if heston_selected and (
+        "Delta_Heston" not in frame.columns
+        or not pd.to_numeric(frame.get("Delta_Heston"), errors="coerce").notna().any()
+    ):
+        st.warning("Heston traces are missing for this run. Click Refresh, or wait for the Greeks compute to finish.")
+
     if current_iv is None:
         frame = frame.copy()
         frame["IV"] = pd.NA
@@ -1650,6 +1676,13 @@ def main() -> None:
             float(p)
             for p in pd.to_numeric(frame["Price"], errors="coerce").dropna().tolist()
         )
+        surface_model = model
+        if heston_selected:
+            st.caption("Heston 3D is opt-in so the 2D Heston curves on Greeks can render first.")
+            if st.button("Build Heston gamma surface", key="build_heston_gamma_surface"):
+                st.session_state["run_heston_gamma_surface"] = True
+            if not st.session_state.get("run_heston_gamma_surface"):
+                surface_model = MODEL_BLACK_SCHOLES
         try:
             surface = _load_gamma_surface(
                 ticker,
@@ -1658,7 +1691,7 @@ def main() -> None:
                 prices,
                 float(sigma),
                 option_type,
-                model,
+                surface_model,
                 v0,
                 kappa,
                 theta,
@@ -1674,6 +1707,13 @@ def main() -> None:
         near = list(range(1, min(dte, 14) + 1))
         far = list(range(21, dte + 1, 7))
         expiry_range = tuple(sorted({float(x) for x in near + far + [dte] if x > 0}))
+        term_model = model
+        if heston_selected:
+            st.caption("Heston term structure is opt-in so the 2D Heston curves on Greeks can render first.")
+            if st.button("Build Heston term structure", key="build_heston_term"):
+                st.session_state["run_heston_term"] = True
+            if not st.session_state.get("run_heston_term"):
+                term_model = MODEL_BLACK_SCHOLES
         try:
             term = _load_term_structure(
                 ticker,
@@ -1682,7 +1722,7 @@ def main() -> None:
                 expiry_range,
                 float(sigma),
                 option_type,
-                model,
+                term_model,
                 v0,
                 kappa,
                 theta,
