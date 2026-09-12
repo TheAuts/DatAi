@@ -1,0 +1,1589 @@
+"""DatAi Streamlit dashboard: Price vs Delta / Gamma / Theta / Rho."""
+
+from __future__ import annotations
+
+import time
+from datetime import date, timedelta
+from typing import Any
+
+import pandas as pd
+import numpy as np
+import plotly.graph_objects as go
+import streamlit as st
+
+from data_ingestion import get_available_expirations, get_available_strikes, get_contract_iv, get_current_price
+from quant_engine import (
+    DAYS_PER_YEAR,
+    DEFAULT_HESTON_KAPPA,
+    DEFAULT_HESTON_RHO,
+    DEFAULT_HESTON_SIGMA,
+    DEFAULT_HESTON_THETA,
+    DEFAULT_HESTON_V0,
+    DEFAULT_RATE,
+    DEFAULT_SIGMA,
+    MODEL_BLACK_SCHOLES,
+    MODEL_HESTON,
+    calculate_charm,
+    calculate_color,
+    calculate_gamma_theta_ratio,
+    calculate_speed,
+    calculate_vanna,
+    calculate_volga,
+    generate_3d_gamma_surface,
+    generate_3d_greek_surface,
+    generate_delta_term_structure,
+    generate_greek_curve,
+)
+
+PAGE_TITLE = "DatAi"
+DEFAULT_TICKER = "SPY"
+GREEK_COLUMNS = ("Delta", "Gamma", "Theta", "Vega", "Rho")
+CHART_ROWS = (("Delta", "Gamma"), ("Theta", "Vega"), ("Rho",))
+CSV_COLUMNS = ("Price", "Delta", "Gamma", "Theta", "Vega", "IV")
+GREEK_COLORS = {
+    "Delta": "#58a6ff",
+    "Gamma": "#3fb950",
+    "Theta": "#d29922",
+    "Vega": "#f778ba",
+    "Rho": "#bc8cff",
+    "IV": "#8b949e",
+    "Vanna": "#79c0ff",
+    "Volga": "#ffa657",
+    "Charm": "#d2a8ff",
+    "Speed": "#f0883e",
+    "Color": "#a371f7",
+}
+RATIO_THRESHOLD = 0.5
+PRICE_SPAN = 0.30
+CURVE_POINTS = 201
+DARK_BG = "#0e1117"
+PANEL_BG = "#161b22"
+CARD_BG = "#1c2330"
+GRID = "#30363d"
+TEXT = "#e6edf3"
+
+
+def _init_state() -> None:
+    defaults: dict[str, Any] = {
+        "ticker": DEFAULT_TICKER,
+        "expiry": date.today() + timedelta(days=30),
+        "current_price": 0.0,
+        "option_type": "call",
+        "last_latency_ms": None,
+        "last_ok": False,
+        "recent_tickers": [DEFAULT_TICKER],
+        "greeks_frame": None,
+        "manual_strike": False,
+        "manual_strike_text": "",
+        "price_ticker": "",
+        "recent_pick": DEFAULT_TICKER,
+        "expiry_iso": None,
+        "listed_strike": None,
+        "pricing_model": "Black-Scholes",
+        "heston_v0": DEFAULT_HESTON_V0,
+        "heston_kappa": DEFAULT_HESTON_KAPPA,
+        "heston_theta": DEFAULT_HESTON_THETA,
+        "heston_sigma": DEFAULT_HESTON_SIGMA,
+        "heston_rho": DEFAULT_HESTON_RHO,
+        "show_second_order": False,
+        "advanced_view_3d": False,
+        "advanced_surface_greek": "Charm",
+        "main_view": "Greeks",
+        "sim_fingerprint": None,
+        "iv_fingerprint": None,
+        "persisted_iv": None,
+        "gamma_surface_frame": None,
+        "gamma_surface_fp": None,
+        "greek_surface_frame": None,
+        "greek_surface_fp": None,
+        "term_structure_frame": None,
+        "term_structure_fp": None,
+        "vanna_volga_frame": None,
+        "vanna_volga_fp": None,
+    }
+    for key, value in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
+    if not str(st.session_state.ticker).strip():
+        st.session_state.ticker = DEFAULT_TICKER
+
+
+def _apply_theme() -> None:
+    st.markdown(
+        f"""
+        <style>
+        .stApp {{ background-color: {DARK_BG}; color: {TEXT}; }}
+        [data-testid="stSidebar"] {{ background-color: {PANEL_BG}; }}
+        [data-testid="stMetric"] {{
+            background-color: {CARD_BG};
+            border: 1px solid {GRID};
+            border-radius: 12px;
+            padding: 0.85rem 1rem;
+        }}
+        [data-testid="stMetricValue"] {{
+            font-variant-numeric: tabular-nums;
+            font-size: 1.55rem;
+        }}
+        [data-testid="stMetricLabel"] {{
+            text-transform: uppercase;
+            letter-spacing: 0.04em;
+        }}
+        div[data-testid="stVerticalBlock"] > div {{ gap: 0.6rem; }}
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def _heston_from_state() -> tuple[float, float, float, float, float]:
+    return (
+        float(st.session_state.get("heston_v0", DEFAULT_HESTON_V0)),
+        float(st.session_state.get("heston_kappa", DEFAULT_HESTON_KAPPA)),
+        float(st.session_state.get("heston_theta", DEFAULT_HESTON_THETA)),
+        float(st.session_state.get("heston_sigma", DEFAULT_HESTON_SIGMA)),
+        float(st.session_state.get("heston_rho", DEFAULT_HESTON_RHO)),
+    )
+
+
+def _model_from_state() -> str:
+    return MODEL_HESTON if str(st.session_state.get("pricing_model")) == "Heston" else MODEL_BLACK_SCHOLES
+
+
+def _sim_fingerprint(
+    ticker: str,
+    strike: float,
+    expiry: date,
+    option_type: str,
+    current_price: float,
+    sigma: float,
+    model: str,
+    v0: float,
+    kappa: float,
+    theta: float,
+    heston_sigma: float,
+    rho: float,
+) -> tuple[Any, ...]:
+    heston = (
+        round(float(v0), 8),
+        round(float(kappa), 8),
+        round(float(theta), 8),
+        round(float(heston_sigma), 8),
+        round(float(rho), 8),
+    )
+    if str(model) != MODEL_HESTON:
+        heston = (0.0, 0.0, 0.0, 0.0, 0.0)
+    return (
+        ticker,
+        round(float(strike), 8),
+        expiry.isoformat() if isinstance(expiry, date) else str(expiry),
+        str(option_type),
+        round(float(current_price), 6),
+        round(float(sigma), 8),
+        str(model),
+        *heston,
+    )
+
+
+def _clear_persisted_results() -> None:
+    st.session_state.greeks_frame = None
+    st.session_state.sim_fingerprint = None
+    st.session_state.gamma_surface_frame = None
+    st.session_state.gamma_surface_fp = None
+    st.session_state.greek_surface_frame = None
+    st.session_state.greek_surface_fp = None
+    st.session_state.term_structure_frame = None
+    st.session_state.term_structure_fp = None
+    st.session_state.vanna_volga_frame = None
+    st.session_state.vanna_volga_fp = None
+
+
+def _price_range(spot: float, span: float = PRICE_SPAN, n: int = CURVE_POINTS) -> tuple[float, ...]:
+    lo = max(spot * (1.0 - span), 1e-6)
+    hi = spot * (1.0 + span)
+    if hi <= lo:
+        hi = lo * 1.01
+    return tuple(float(x) for x in np.linspace(lo, hi, max(int(n), 200)))
+
+
+@st.cache_data(ttl=60, show_spinner="Loading last price…")
+def cached_current_price(ticker: str) -> float | None:
+    try:
+        return get_current_price(ticker)
+    except Exception:
+        return None
+
+
+@st.cache_data(ttl=300, show_spinner="Loading expirations…")
+def cached_available_expirations(ticker: str) -> list[str]:
+    try:
+        return list(get_available_expirations(ticker) or [])
+    except Exception:
+        return []
+
+
+@st.cache_data(ttl=300, show_spinner="Loading listed strikes…")
+def cached_available_strikes(ticker: str, expiry: str) -> list[float]:
+    try:
+        return list(get_available_strikes(ticker, expiry) or [])
+    except Exception:
+        return []
+
+
+@st.cache_data(ttl=60, show_spinner="Loading contract IV…")
+def cached_contract_iv(ticker: str, expiry: str, strike: float, option_type: str) -> float | None:
+    try:
+        return get_contract_iv(ticker, expiry, strike, option_type)
+    except Exception:
+        return None
+
+
+def _nearest_strike(strikes: list[float], spot: float) -> float:
+    return min(strikes, key=lambda strike: abs(strike - spot))
+
+
+def _parse_manual_strike(raw: str) -> float | None:
+    text = raw.strip().replace(",", "")
+    if not text:
+        return None
+    try:
+        value = float(text)
+    except ValueError:
+        return None
+    return value if value > 0 else None
+
+
+@st.cache_data(show_spinner=False)
+def cached_greek_curve(
+    ticker: str,
+    strike: float,
+    expiry: str,
+    prices: tuple[float, ...],
+    option_type: str,
+    sigma: float,
+    model: str,
+    v0: float,
+    kappa: float,
+    theta: float,
+    heston_sigma: float,
+    rho: float,
+) -> pd.DataFrame:
+    """Cached Price vs Greeks. Ticker/strike persist independently of model."""
+    return generate_greek_curve(
+        ticker,
+        strike,
+        expiry,
+        prices,
+        r=DEFAULT_RATE,
+        sigma=sigma,
+        option_type=option_type,
+        model=model,
+        v0=v0,
+        kappa=kappa,
+        theta=theta,
+        heston_sigma=heston_sigma,
+        rho=rho,
+    )
+
+
+@st.cache_data(show_spinner=False)
+def cached_vanna_volga(
+    prices: tuple[float, ...],
+    strike: float,
+    expiry: str,
+    sigma: float,
+    option_type: str,
+    v0: float,
+    kappa: float,
+    theta: float,
+    heston_sigma: float,
+    rho: float,
+) -> pd.DataFrame:
+    spots = np.asarray(prices, dtype="float64")
+    time_years = max((date.fromisoformat(expiry) - date.today()).days, 0) / DAYS_PER_YEAR
+    kwargs = {
+        "q": 0.0,
+        "option_type": option_type,
+        "v0": v0,
+        "kappa": kappa,
+        "theta": theta,
+        "heston_sigma": heston_sigma,
+        "rho": rho,
+    }
+    return pd.DataFrame(
+        {
+            "Price": spots,
+            "Vanna_BS": calculate_vanna(spots, strike, time_years, DEFAULT_RATE, sigma, MODEL_BLACK_SCHOLES, **kwargs),
+            "Vanna_Heston": calculate_vanna(spots, strike, time_years, DEFAULT_RATE, sigma, MODEL_HESTON, **kwargs),
+            "Volga_BS": calculate_volga(spots, strike, time_years, DEFAULT_RATE, sigma, MODEL_BLACK_SCHOLES, **kwargs),
+            "Volga_Heston": calculate_volga(spots, strike, time_years, DEFAULT_RATE, sigma, MODEL_HESTON, **kwargs),
+        }
+    )
+
+
+def _remember_ticker(ticker: str) -> None:
+    symbol = ticker.strip().upper()
+    if not symbol:
+        return
+    recent: list[str] = list(st.session_state.recent_tickers)
+    if symbol in recent:
+        recent.remove(symbol)
+    recent.insert(0, symbol)
+    st.session_state.recent_tickers = recent[:12]
+    st.session_state.recent_pick = symbol
+
+
+def _on_ticker_commit() -> None:
+    symbol = str(st.session_state.get("ticker", "")).strip().upper()
+    st.session_state.ticker = symbol
+    _remember_ticker(symbol)
+
+
+def _on_recent_ticker() -> None:
+    picked = str(st.session_state.get("recent_pick") or "").strip().upper()
+    if not picked:
+        return
+    st.session_state.ticker = picked
+    _remember_ticker(picked)
+
+
+def _sync_current_price(ticker: str) -> None:
+    symbol = ticker.strip().upper()
+    if not symbol or st.session_state.get("price_ticker") == symbol:
+        return
+    try:
+        price = cached_current_price(symbol)
+    except Exception:
+        price = None
+    if price is not None and price > 0:
+        st.session_state.current_price = float(price)
+    st.session_state.price_ticker = symbol
+
+
+def _format_iv(value: Any) -> str:
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return "N/A"
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return "N/A"
+    if not np_isfinite(number) or number <= 0:
+        return "N/A"
+    return f"{number:.2%}"
+
+
+def np_isfinite(number: float) -> bool:
+    return number == number and number not in (float("inf"), float("-inf"))
+
+
+def _format_greek(name: str, value: Any) -> str:
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return "N/A"
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return "N/A"
+    if not np_isfinite(number):
+        return "N/A"
+    if name == "Gamma":
+        return f"{number:.6f}"
+    return f"{number:.4f}"
+
+
+def _spot_greeks(frame: pd.DataFrame, spot: float, use_heston: bool = False) -> dict[str, Any]:
+    names = GREEK_COLUMNS
+    if frame.empty or "Price" not in frame.columns:
+        return {name: None for name in names}
+    prices = pd.to_numeric(frame["Price"], errors="coerce")
+    valid = prices.notna()
+    if not valid.any():
+        return {name: None for name in names}
+    idx = (prices[valid] - spot).abs().idxmin()
+    row = frame.loc[idx]
+    out: dict[str, Any] = {}
+    for name in names:
+        column = f"{name}_Heston" if use_heston and f"{name}_Heston" in frame.columns else name
+        out[name] = row[column] if column in frame.columns else None
+    return out
+
+
+def render_greek_chart(frame: pd.DataFrame, y_column: str, container: Any, revision: str = "greeks") -> None:
+    """Plot one Greek vs Price from a caller-supplied DataFrame."""
+    if y_column not in frame.columns or "Price" not in frame.columns:
+        container.warning(f"Column '{y_column}' is missing from the Greeks frame.")
+        return
+
+    plot_df = frame[["Price", y_column]].copy()
+    plot_df[y_column] = pd.to_numeric(plot_df[y_column], errors="coerce")
+    plot_df["Price"] = pd.to_numeric(plot_df["Price"], errors="coerce")
+    plot_df = plot_df.dropna(subset=["Price", y_column])
+    heston_col = f"{y_column}_Heston"
+    has_heston = heston_col in frame.columns
+    if plot_df.empty and not has_heston:
+        container.info(f"No valid {y_column} points to plot.")
+        return
+
+    yaxis_title = "Theta (per day)" if y_column == "Theta" else y_column
+    color = GREEK_COLORS.get(y_column, "#58a6ff")
+    traces = []
+    if not plot_df.empty:
+        traces.append(
+            go.Scatter(
+                x=plot_df["Price"],
+                y=plot_df[y_column],
+                mode="lines",
+                name="Black-Scholes",
+                line={"color": color, "width": 2, "dash": "solid"},
+                hovertemplate="Price=%{x:.4f}<br>BS " + y_column + "=%{y:.6f}<extra></extra>",
+            )
+        )
+    if has_heston:
+        heston_df = frame[["Price", heston_col]].copy()
+        heston_df[heston_col] = pd.to_numeric(heston_df[heston_col], errors="coerce")
+        heston_df["Price"] = pd.to_numeric(heston_df["Price"], errors="coerce")
+        heston_df = heston_df.dropna(subset=["Price", heston_col])
+        if not heston_df.empty:
+            traces.append(
+                go.Scatter(
+                    x=heston_df["Price"],
+                    y=heston_df[heston_col],
+                    mode="lines",
+                    name="Heston",
+                    line={"color": color, "width": 2, "dash": "dot"},
+                    hovertemplate="Price=%{x:.4f}<br>Heston " + y_column + "=%{y:.6f}<extra></extra>",
+                )
+            )
+    layout_extra: dict[str, Any] = {}
+    iv_series = None
+    if "IV" in frame.columns:
+        iv_plot = frame[["Price", "IV"]].copy()
+        iv_plot["IV"] = pd.to_numeric(iv_plot["IV"], errors="coerce")
+        iv_plot["Price"] = pd.to_numeric(iv_plot["Price"], errors="coerce")
+        iv_plot = iv_plot.dropna(subset=["Price", "IV"])
+        if not iv_plot.empty:
+            iv_series = iv_plot
+            traces.append(
+                go.Scatter(
+                    x=iv_plot["Price"],
+                    y=iv_plot["IV"],
+                    mode="lines",
+                    name="IV",
+                    yaxis="y2",
+                    line={"color": GREEK_COLORS["IV"], "width": 1.5, "dash": "dash"},
+                    hovertemplate="Price=%{x:.4f}<br>IV=%{y:.2%}<extra></extra>",
+                )
+            )
+            layout_extra["yaxis2"] = {
+                "title": "IV",
+                "overlaying": "y",
+                "side": "right",
+                "gridcolor": GRID,
+                "zeroline": False,
+                "tickformat": ".0%",
+            }
+    if not traces:
+        container.info(f"No valid {y_column} points to plot.")
+        return
+    fig = go.Figure(data=traces)
+    fig.update_layout(
+        template="plotly_dark",
+        paper_bgcolor=DARK_BG,
+        plot_bgcolor=PANEL_BG,
+        font={"color": TEXT},
+        margin={"l": 48, "r": 56 if iv_series is not None else 16, "t": 40, "b": 48},
+        height=340,
+        title={"text": y_column, "x": 0.0, "xanchor": "left"},
+        xaxis={
+            "title": "Underlying price",
+            "gridcolor": GRID,
+            "zeroline": False,
+        },
+        yaxis={
+            "title": yaxis_title,
+            "gridcolor": GRID,
+            "zeroline": False,
+        },
+        hovermode="x unified",
+        showlegend=True,
+        legend={"orientation": "h", "y": 1.12, "x": 1, "xanchor": "right"},
+        uirevision=revision,
+        **layout_extra,
+    )
+    container.plotly_chart(
+        fig,
+        use_container_width=True,
+        config={"displayModeBar": True},
+        key=f"greek-chart-{y_column}",
+    )
+
+
+def _listed_strikes(ticker: str, expiry: date) -> list[float]:
+    try:
+        listed = list(cached_available_strikes(ticker, expiry.isoformat()))
+    except Exception:
+        listed = []
+    return sorted({float(strike) for strike in listed if float(strike) > 0})
+
+
+def _active_expiry(ticker: str) -> date:
+    listed: list[str] = []
+    try:
+        listed = list(cached_available_expirations(ticker))
+    except Exception:
+        listed = []
+    if listed:
+        current = st.session_state.get("expiry_iso")
+        if current not in listed:
+            target = date.today() + timedelta(days=30)
+            st.session_state.expiry_iso = min(
+                listed,
+                key=lambda iso: abs((date.fromisoformat(iso) - target).days),
+            )
+        chosen = st.selectbox("Expiry", options=listed, key="expiry_iso")
+        return date.fromisoformat(str(chosen))
+    picked = st.date_input("Expiry", key="expiry")
+    if isinstance(picked, date):
+        return picked
+    return date.today() + timedelta(days=30)
+
+
+def _active_strike(ticker: str, expiry: date, current_price: float) -> float:
+    listed = _listed_strikes(ticker, expiry)
+    manual = st.checkbox("Manual Strike", key="manual_strike")
+    if manual:
+        raw = st.text_input(
+            "Manual Strike",
+            key="manual_strike_text",
+            placeholder="Enter strike",
+        )
+        parsed = _parse_manual_strike(raw)
+        if parsed is not None:
+            return parsed
+        if listed:
+            return listed[0]
+        return 0.0
+
+    if not listed:
+        st.warning("No listed strikes returned for this ticker and expiry.")
+        st.selectbox("Select Strike", options=["—"], disabled=True, key="listed_strike_empty")
+        return 0.0
+
+    previous = st.session_state.get("listed_strike")
+    if previous not in listed:
+        anchor = current_price if current_price > 0 else listed[len(listed) // 2]
+        st.session_state.listed_strike = _nearest_strike(listed, anchor)
+    return float(
+        st.selectbox(
+            "Select Strike",
+            options=listed,
+            key="listed_strike",
+            format_func=lambda value: f"{value:g}",
+        )
+    )
+
+
+def _sidebar_inputs() -> tuple[str, float, date, float, str, bool, Any]:
+    with st.sidebar:
+        st.header("Contract")
+        ticker = st.text_input(
+            "Ticker",
+            key="ticker",
+            placeholder="Underlying symbol",
+            help="Any listed underlying. Defaults to SPY.",
+            on_change=_on_ticker_commit,
+        ).strip()
+
+        ticker_norm = ticker.strip().upper() or DEFAULT_TICKER
+        recent = [item for item in st.session_state.recent_tickers if str(item).strip()]
+        if ticker_norm not in recent:
+            _remember_ticker(ticker_norm)
+            recent = [item for item in st.session_state.recent_tickers if str(item).strip()]
+        if st.session_state.get("recent_pick") not in recent:
+            st.session_state.recent_pick = ticker_norm if ticker_norm in recent else recent[0]
+        st.selectbox(
+            "Recent Tickers",
+            options=recent,
+            key="recent_pick",
+            on_change=_on_recent_ticker,
+        )
+        ticker = str(st.session_state.ticker).strip()
+        ticker_norm = ticker.strip().upper() or DEFAULT_TICKER
+        _sync_current_price(ticker_norm)
+
+        expiry = _active_expiry(ticker_norm)
+        current_price = st.number_input(
+            "Current Price",
+            min_value=0.0,
+            step=0.01,
+            format="%.4f",
+            key="current_price",
+        )
+        option_type = st.selectbox(
+            "Type",
+            options=("call", "put"),
+            key="option_type",
+        )
+        strike = _active_strike(ticker_norm, expiry, float(current_price))
+
+        st.radio(
+            "Model",
+            options=("Black-Scholes", "Heston"),
+            key="pricing_model",
+            horizontal=True,
+        )
+        st.caption("Model and Heston parameters stay in session until you change them.")
+        st.number_input("kappa", min_value=0.01, max_value=20.0, step=0.05, format="%.4f", key="heston_kappa")
+        st.number_input("theta", min_value=0.0001, max_value=1.0, step=0.005, format="%.4f", key="heston_theta")
+        st.number_input("sigma", min_value=0.01, max_value=2.0, step=0.01, format="%.4f", key="heston_sigma")
+        st.number_input("rho", min_value=-0.999, max_value=0.999, step=0.01, format="%.3f", key="heston_rho")
+        st.number_input("v0", min_value=0.0001, max_value=1.0, step=0.005, format="%.4f", key="heston_v0")
+
+        st.toggle("Second-Order Greeks", key="show_second_order")
+
+        refresh = st.button("Refresh", use_container_width=True, type="primary")
+        if refresh:
+            _clear_persisted_results()
+            cached_greek_curve.clear()
+            cached_available_strikes.clear()
+            cached_available_expirations.clear()
+            cached_current_price.clear()
+            cached_contract_iv.clear()
+            cached_gamma_surface.clear()
+            cached_greek_surface.clear()
+            cached_delta_term_structure.clear()
+            cached_vanna_volga.clear()
+            st.session_state.price_ticker = ""
+            st.session_state.iv_fingerprint = None
+            st.session_state.persisted_iv = None
+            st.rerun()
+
+        download_slot = st.empty()
+
+        latency = st.session_state.last_latency_ms
+        st.metric(
+            "Calc latency",
+            "—" if latency is None else f"{latency:.1f} ms",
+            help="Wall time of the last Greek curve call (cache hits are typically sub-ms).",
+        )
+        st.caption(
+            f"Model: {st.session_state.get('pricing_model', 'Black-Scholes')} · MarketData · r={DEFAULT_RATE:.1%} · q=0 · 365-day"
+        )
+    return ticker, strike, expiry, float(current_price), str(option_type), refresh, download_slot
+
+
+def greeks_csv_bytes(frame: pd.DataFrame) -> bytes:
+    """Serialize Price, Delta, Gamma, Theta from a generate_greek_curve DataFrame."""
+    present = [col for col in list(CSV_COLUMNS) + [f"{n}_Heston" for n in GREEK_COLUMNS] if col in frame.columns]
+    return frame.loc[:, present].to_csv(index=False).encode("utf-8")
+
+
+def render_sidebar_download(
+    slot: Any,
+    frame: pd.DataFrame,
+    ticker: str,
+    strike: float,
+    expiry: date,
+) -> None:
+    stamp = expiry.isoformat() if isinstance(expiry, date) else str(expiry)
+    file_name = f"{ticker}_{strike:g}_{stamp}_greeks.csv"
+    slot.download_button(
+        "Download CSV",
+        data=greeks_csv_bytes(frame),
+        file_name=file_name,
+        mime="text/csv",
+        use_container_width=True,
+        key="download_greeks_csv",
+    )
+
+
+def _contract_iv(ticker: str, expiry: date, strike: float, option_type: str) -> float | None:
+    key = (ticker, expiry.isoformat(), round(float(strike), 8), str(option_type))
+    if st.session_state.get("iv_fingerprint") == key:
+        return st.session_state.get("persisted_iv")
+    try:
+        iv = cached_contract_iv(ticker, expiry.isoformat(), float(strike), option_type)
+    except Exception:
+        iv = None
+    st.session_state.iv_fingerprint = key
+    st.session_state.persisted_iv = iv
+    return iv
+
+
+def _load_curve(
+    ticker: str,
+    strike: float,
+    expiry: date,
+    current_price: float,
+    option_type: str,
+    sigma: float,
+    model: str,
+    v0: float,
+    kappa: float,
+    theta: float,
+    heston_sigma: float,
+    rho: float,
+) -> pd.DataFrame | None:
+    fingerprint = _sim_fingerprint(
+        ticker, strike, expiry, option_type, current_price, sigma, model, v0, kappa, theta, heston_sigma, rho
+    )
+    existing = st.session_state.get("greeks_frame")
+    if fingerprint == st.session_state.get("sim_fingerprint") and isinstance(existing, pd.DataFrame) and not existing.empty:
+        st.session_state.last_ok = True
+        return existing
+
+    prices = _price_range(current_price)
+    expiry_iso = expiry.isoformat()
+    started = time.perf_counter()
+    try:
+        frame = cached_greek_curve(
+            ticker,
+            strike,
+            expiry_iso,
+            prices,
+            option_type,
+            sigma,
+            model,
+            v0,
+            kappa,
+            theta,
+            heston_sigma,
+            rho,
+        )
+    except Exception:
+        st.session_state.last_latency_ms = (time.perf_counter() - started) * 1000.0
+        st.session_state.last_ok = False
+        st.session_state.greeks_frame = None
+        st.session_state.sim_fingerprint = None
+        st.error(
+            "Could not generate Greek charts. Check ticker, strike, expiry, and current price, then try Refresh."
+        )
+        return None
+    st.session_state.last_latency_ms = (time.perf_counter() - started) * 1000.0
+    if not isinstance(frame, pd.DataFrame) or frame.empty:
+        st.session_state.last_ok = False
+        st.session_state.greeks_frame = None
+        st.session_state.sim_fingerprint = None
+        st.warning("The engine returned an empty Greeks table for these inputs.")
+        return None
+    st.session_state.last_ok = True
+    st.session_state.greeks_frame = frame
+    st.session_state.sim_fingerprint = fingerprint
+    return frame
+
+
+def render_vanna_volga_chart(
+    frame: pd.DataFrame,
+    strike: float,
+    expiry: date,
+    sigma: float,
+    option_type: str,
+    heston_v0: float,
+    heston_kappa: float,
+    heston_theta: float,
+    heston_sigma: float,
+    heston_rho: float,
+    revision: str = "vanna-volga",
+) -> None:
+    if "Price" not in frame.columns:
+        st.warning("Price column missing.")
+        return
+    price_tuple = tuple(
+        float(p) for p in pd.to_numeric(frame["Price"], errors="coerce").to_numpy(dtype="float64") if np.isfinite(p)
+    )
+    fingerprint = (
+        price_tuple,
+        round(float(strike), 8),
+        expiry.isoformat(),
+        round(float(sigma), 8),
+        str(option_type),
+        round(float(heston_v0), 8),
+        round(float(heston_kappa), 8),
+        round(float(heston_theta), 8),
+        round(float(heston_sigma), 8),
+        round(float(heston_rho), 8),
+    )
+    vv = st.session_state.get("vanna_volga_frame")
+    if fingerprint != st.session_state.get("vanna_volga_fp") or not isinstance(vv, pd.DataFrame) or vv.empty:
+        vv = cached_vanna_volga(
+            price_tuple,
+            float(strike),
+            expiry.isoformat(),
+            float(sigma),
+            option_type,
+            float(heston_v0),
+            float(heston_kappa),
+            float(heston_theta),
+            float(heston_sigma),
+            float(heston_rho),
+        )
+        st.session_state.vanna_volga_frame = vv
+        st.session_state.vanna_volga_fp = fingerprint
+    prices = pd.to_numeric(vv["Price"], errors="coerce")
+    series_map = {
+        "Vanna (Black-Scholes)": ("Vanna_BS", GREEK_COLORS["Vanna"], "solid"),
+        "Vanna (Heston)": ("Vanna_Heston", GREEK_COLORS["Vanna"], "dot"),
+        "Volga (Black-Scholes)": ("Volga_BS", GREEK_COLORS["Volga"], "solid"),
+        "Volga (Heston)": ("Volga_Heston", GREEK_COLORS["Volga"], "dot"),
+    }
+    traces = []
+    for name, (column, color, dash) in series_map.items():
+        series = pd.to_numeric(vv[column], errors="coerce")
+        valid = prices.notna() & series.notna()
+        if not valid.any():
+            continue
+        traces.append(
+            go.Scatter(
+                x=prices.loc[valid],
+                y=series.loc[valid],
+                mode="lines",
+                name=name,
+                line={"color": color, "width": 2, "dash": dash},
+                hovertemplate="Price=%{x:.4f}<br>" + name + "=%{y:.6f}<extra></extra>",
+            )
+        )
+    if not traces:
+        st.info("No valid Vanna/Volga points to plot.")
+        return
+    fig = go.Figure(data=traces)
+    fig.update_layout(
+        template="plotly_dark",
+        paper_bgcolor=DARK_BG,
+        plot_bgcolor=PANEL_BG,
+        font={"color": TEXT},
+        height=380,
+        title={"text": "Vanna and Volga vs Price", "x": 0.0, "xanchor": "left"},
+        xaxis={"title": "Price", "gridcolor": GRID, "zeroline": False},
+        yaxis={"title": "Second-order Greek", "gridcolor": GRID, "zeroline": False},
+        hovermode="x unified",
+        legend={"orientation": "h", "y": 1.12, "x": 1, "xanchor": "right"},
+        margin={"l": 48, "r": 16, "t": 48, "b": 48},
+        uirevision=revision,
+    )
+    st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": True}, key="vanna-volga-chart")
+
+
+def render_gamma_theta_ratio_chart(frame: pd.DataFrame) -> None:
+    if "Price" not in frame.columns:
+        st.warning("Price column missing.")
+        return
+    plot_df = frame.copy()
+    plot_df["Price"] = pd.to_numeric(plot_df["Price"], errors="coerce")
+    ratio = pd.Series(
+        calculate_gamma_theta_ratio(
+            pd.to_numeric(plot_df.get("Gamma"), errors="coerce"),
+            pd.to_numeric(plot_df.get("Theta"), errors="coerce"),
+        ),
+        index=plot_df.index,
+    )
+    valid = plot_df["Price"].notna() & ratio.notna()
+    if not valid.any():
+        st.info("No valid Gamma/Theta ratio points to plot.")
+        return
+    x = plot_df.loc[valid, "Price"].to_numpy(dtype=float)
+    y = ratio.loc[valid].to_numpy(dtype=float)
+    exceeds = bool((y > RATIO_THRESHOLD).any())
+    ratio_color = "#f85149" if exceeds else "#58a6ff"
+    fig = go.Figure(
+        data=[
+            go.Scatter(
+                x=x,
+                y=y,
+                mode="lines",
+                name="Gamma/Theta Ratio",
+                line={"color": ratio_color, "width": 2.5},
+                hovertemplate="Price=%{x:.4f}<br>Gamma/Theta Ratio=%{y:.4f}<extra></extra>",
+            )
+        ]
+    )
+    fig.add_hline(
+        y=RATIO_THRESHOLD,
+        line_dash="dash",
+        line_color="#f85149" if exceeds else "#8b949e",
+        line_width=2,
+        annotation_text="0.5",
+        annotation_position="top left",
+        annotation_font_color="#f85149" if exceeds else "#8b949e",
+    )
+    fig.update_layout(
+        template="plotly_dark",
+        paper_bgcolor=DARK_BG,
+        plot_bgcolor=PANEL_BG,
+        font={"color": TEXT},
+        height=400,
+        title={"text": "Gamma/Theta Ratio vs Price", "x": 0.0, "xanchor": "left"},
+        xaxis={"title": "Price", "gridcolor": GRID, "zeroline": False},
+        yaxis={"title": "Gamma/Theta Ratio", "gridcolor": GRID, "zeroline": True},
+        hovermode="x unified",
+        showlegend=True,
+        legend={"orientation": "h", "y": 1.12, "x": 1, "xanchor": "right"},
+        margin={"l": 48, "r": 16, "t": 48, "b": 48},
+        uirevision="gamma-theta-ratio",
+    )
+    st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": True}, key="gamma-theta-ratio-chart")
+
+
+def _price_greek_chart(
+    frame: pd.DataFrame,
+    y_column: str,
+    title: str,
+    y_title: str,
+) -> None:
+    if "Price" not in frame.columns:
+        st.warning("Price column missing.")
+        return
+    prices = pd.to_numeric(frame["Price"], errors="coerce")
+    traces = []
+    if y_column in frame.columns:
+        series = pd.to_numeric(frame[y_column], errors="coerce")
+        valid = prices.notna() & series.notna()
+        if valid.any():
+            traces.append(
+                go.Scatter(
+                    x=prices.loc[valid],
+                    y=series.loc[valid],
+                    mode="lines",
+                    name=y_column,
+                    line={"color": GREEK_COLORS.get(y_column, "#58a6ff"), "width": 2.5},
+                    hovertemplate="Price=%{x:.4f}<br>" + y_column + "=%{y:.6f}<extra></extra>",
+                )
+            )
+    heston_col = f"{y_column}_Heston"
+    if heston_col in frame.columns:
+        series = pd.to_numeric(frame[heston_col], errors="coerce")
+        valid = prices.notna() & series.notna()
+        if valid.any():
+            traces.append(
+                go.Scatter(
+                    x=prices.loc[valid],
+                    y=series.loc[valid],
+                    mode="lines",
+                    name=f"{y_column} (Heston)",
+                    line={"color": GREEK_COLORS.get(y_column, "#58a6ff"), "width": 2, "dash": "dot"},
+                    hovertemplate="Price=%{x:.4f}<br>Heston " + y_column + "=%{y:.6f}<extra></extra>",
+                )
+            )
+    if not traces:
+        st.info(f"No valid {y_column} points to plot.")
+        return
+    fig = go.Figure(data=traces)
+    fig.update_layout(
+        template="plotly_dark",
+        paper_bgcolor=DARK_BG,
+        plot_bgcolor=PANEL_BG,
+        font={"color": TEXT},
+        height=380,
+        title={"text": title, "x": 0.0, "xanchor": "left"},
+        xaxis={"title": "Price", "gridcolor": GRID, "zeroline": False},
+        yaxis={"title": y_title, "gridcolor": GRID, "zeroline": True},
+        hovermode="x unified",
+        showlegend=True,
+        legend={"orientation": "h", "y": 1.12, "x": 1, "xanchor": "right"},
+        margin={"l": 48, "r": 16, "t": 48, "b": 48},
+        uirevision=y_column,
+    )
+    st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": True}, key=f"price-greek-{y_column}")
+
+
+def render_speed_chart(frame: pd.DataFrame) -> None:
+    _price_greek_chart(frame, "Speed", "Risk Acceleration (Speed vs Price)", "Speed (∂Γ/∂S)")
+
+
+def render_color_chart(frame: pd.DataFrame) -> None:
+    _price_greek_chart(frame, "Color", "Gamma Decay (Color vs Price)", "Color (∂Γ/∂t per day)")
+
+
+@st.cache_data(show_spinner="Building gamma surface…")
+def cached_gamma_surface(
+    ticker: str,
+    strike: float,
+    expiry_range: tuple[float, ...],
+    prices: tuple[float, ...],
+    sigma: float,
+    option_type: str,
+    model: str,
+    v0: float,
+    kappa: float,
+    theta: float,
+    heston_sigma: float,
+    rho: float,
+) -> pd.DataFrame:
+    return generate_3d_gamma_surface(
+        ticker,
+        strike,
+        expiry_range,
+        price_range=prices if prices else None,
+        r=DEFAULT_RATE,
+        sigma=sigma,
+        option_type=option_type,
+        model=model,
+        v0=v0,
+        kappa=kappa,
+        theta=theta,
+        heston_sigma=heston_sigma,
+        rho=rho,
+    )
+
+
+@st.cache_data(show_spinner="Building advanced Greek surface…")
+def cached_greek_surface(
+    ticker: str,
+    strike: float,
+    expiry_range: tuple[float, ...],
+    prices: tuple[float, ...],
+    sigma: float,
+    option_type: str,
+    model: str,
+    v0: float,
+    kappa: float,
+    theta: float,
+    heston_sigma: float,
+    rho: float,
+    greek: str,
+) -> pd.DataFrame:
+    return generate_3d_greek_surface(
+        ticker,
+        strike,
+        expiry_range,
+        greek=greek,
+        price_range=prices if prices else None,
+        r=DEFAULT_RATE,
+        sigma=sigma,
+        option_type=option_type,
+        model=model,
+        v0=v0,
+        kappa=kappa,
+        theta=theta,
+        heston_sigma=heston_sigma,
+        rho=rho,
+    )
+
+
+@st.cache_data(show_spinner="Building delta term structure…")
+def cached_delta_term_structure(
+    ticker: str,
+    strike: float,
+    spot: float,
+    expiry_range: tuple[float, ...],
+    sigma: float,
+    option_type: str,
+    model: str,
+    v0: float,
+    kappa: float,
+    theta: float,
+    heston_sigma: float,
+    rho: float,
+) -> pd.DataFrame:
+    return generate_delta_term_structure(
+        ticker,
+        strike,
+        spot,
+        expiry_range,
+        r=DEFAULT_RATE,
+        sigma=sigma,
+        option_type=option_type,
+        model=model,
+        v0=v0,
+        kappa=kappa,
+        theta=theta,
+        heston_sigma=heston_sigma,
+        rho=rho,
+    )
+
+
+def render_delta_term_structure(frame: pd.DataFrame) -> None:
+    required = {"DaysToExpiry", "Delta"}
+    if frame.empty or not required.issubset(frame.columns):
+        st.info("No delta term-structure data to plot.")
+        return
+    plot_df = frame.copy()
+    plot_df["DaysToExpiry"] = pd.to_numeric(plot_df["DaysToExpiry"], errors="coerce")
+    plot_df["Delta"] = pd.to_numeric(plot_df["Delta"], errors="coerce")
+    valid = plot_df["DaysToExpiry"].notna() & plot_df["Delta"].notna()
+    if not valid.any():
+        st.info("No valid Delta vs DTE points to plot.")
+        return
+    traces = [
+        go.Scatter(
+            x=plot_df.loc[valid, "DaysToExpiry"],
+            y=plot_df.loc[valid, "Delta"],
+            mode="lines",
+            name="Delta",
+            line={"color": GREEK_COLORS["Delta"], "width": 2.5},
+            hovertemplate="DTE=%{x:.1f}<br>Delta=%{y:.6f}<extra></extra>",
+        )
+    ]
+    layout_extra: dict[str, Any] = {}
+    if "Charm" in plot_df.columns:
+        charm = pd.to_numeric(plot_df["Charm"], errors="coerce")
+        charm_ok = valid & charm.notna()
+        if charm_ok.any():
+            traces.append(
+                go.Scatter(
+                    x=plot_df.loc[charm_ok, "DaysToExpiry"],
+                    y=charm.loc[charm_ok],
+                    mode="lines",
+                    name="Charm (Δ per day)",
+                    yaxis="y2",
+                    line={"color": GREEK_COLORS["Charm"], "width": 2, "dash": "dot"},
+                    hovertemplate="DTE=%{x:.1f}<br>Charm=%{y:.6f}<extra></extra>",
+                )
+            )
+            layout_extra["yaxis2"] = {
+                "title": "Charm (per day)",
+                "overlaying": "y",
+                "side": "right",
+                "gridcolor": GRID,
+                "zeroline": False,
+            }
+    fig = go.Figure(data=traces)
+    fig.update_layout(
+        template="plotly_dark",
+        paper_bgcolor=DARK_BG,
+        plot_bgcolor=PANEL_BG,
+        font={"color": TEXT},
+        height=420,
+        title={"text": "Delta vs Days to Expiry", "x": 0.0, "xanchor": "left"},
+        xaxis={"title": "Days to Expiry", "gridcolor": GRID, "zeroline": False, "autorange": "reversed"},
+        yaxis={"title": "Delta", "gridcolor": GRID, "zeroline": True},
+        hovermode="x unified",
+        showlegend=True,
+        legend={"orientation": "h", "y": 1.12, "x": 1, "xanchor": "right"},
+        margin={"l": 48, "r": 64, "t": 48, "b": 48},
+        uirevision="delta-term-structure",
+        **layout_extra,
+    )
+    st.caption("As DTE falls (right to left), Delta leaks toward 0 or ±1. Charm is that daily leak.")
+    st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": True}, key="delta-term-structure-chart")
+
+
+def render_gamma_surface(frame: pd.DataFrame) -> None:
+    required = {"Price", "DaysToExpiry", "Gamma"}
+    if frame.empty or not required.issubset(frame.columns):
+        st.info("No gamma surface data to plot.")
+        return
+    pivot = frame.pivot_table(index="DaysToExpiry", columns="Price", values="Gamma", aggfunc="mean")
+    pivot = pivot.sort_index().sort_index(axis=1)
+    fig = go.Figure(
+        data=[
+            go.Surface(
+                x=pivot.columns.to_numpy(dtype=float),
+                y=pivot.index.to_numpy(dtype=float),
+                z=pivot.to_numpy(dtype=float),
+                colorscale="Viridis",
+                colorbar={"title": "Gamma"},
+            )
+        ]
+    )
+    fig.update_layout(
+        template="plotly_dark",
+        paper_bgcolor=DARK_BG,
+        font={"color": TEXT},
+        height=560,
+        title={"text": "Gamma surface", "x": 0.0, "xanchor": "left"},
+        scene={
+            "xaxis_title": "Price",
+            "yaxis_title": "Days to Expiry",
+            "zaxis_title": "Gamma",
+            "bgcolor": PANEL_BG,
+        },
+        margin={"l": 8, "r": 8, "t": 48, "b": 8},
+        uirevision="gamma-surface",
+    )
+    st.plotly_chart(
+        fig,
+        use_container_width=True,
+        config={"displayModeBar": True, "scrollZoom": True},
+        key="gamma-surface-chart",
+    )
+
+
+def render_advanced_greek_surface(frame: pd.DataFrame, greek: str) -> None:
+    required = {"Price", "DaysToExpiry", "Value"}
+    if frame.empty or not required.issubset(frame.columns):
+        st.info(f"No {greek} surface data to plot.")
+        return
+    pivot = frame.pivot_table(index="DaysToExpiry", columns="Price", values="Value", aggfunc="mean")
+    pivot = pivot.sort_index().sort_index(axis=1)
+    fig = go.Figure(
+        data=[
+            go.Surface(
+                x=pivot.columns.to_numpy(dtype=float),
+                y=pivot.index.to_numpy(dtype=float),
+                z=pivot.to_numpy(dtype=float),
+                colorscale="Viridis",
+                colorbar={"title": greek},
+                hovertemplate="Price=%{x:.2f}<br>DTE=%{y:.1f}<br>" + greek + "=%{z:.6f}<extra></extra>",
+            )
+        ]
+    )
+    fig.update_layout(
+        template="plotly_dark",
+        paper_bgcolor=DARK_BG,
+        font={"color": TEXT},
+        height=560,
+        title={"text": f"{greek} surface", "x": 0.0, "xanchor": "left"},
+        scene={
+            "xaxis_title": "Price",
+            "yaxis_title": "Days to Expiry",
+            "zaxis_title": greek,
+            "bgcolor": PANEL_BG,
+        },
+        margin={"l": 8, "r": 8, "t": 48, "b": 8},
+        uirevision=f"advanced-{greek}",
+    )
+    st.plotly_chart(
+        fig,
+        use_container_width=True,
+        config={"displayModeBar": True, "scrollZoom": True},
+        key=f"advanced-surface-{greek}",
+    )
+
+
+def render_metric_header(
+    frame: pd.DataFrame,
+    spot: float,
+    ticker: str,
+    strike: float,
+    expiry: date,
+    current_iv: float | None,
+    use_heston: bool,
+) -> None:
+    iv_row = st.columns(1)
+    iv_row[0].metric("Current IV", _format_iv(current_iv))
+    values = _spot_greeks(frame, spot, use_heston=use_heston)
+    cards = st.columns(len(GREEK_COLUMNS), gap="medium")
+    for name, col in zip(GREEK_COLUMNS, cards):
+        col.metric(name, _format_greek(name, values[name]))
+    context = st.columns(4)
+    context[0].metric("Ticker", ticker)
+    context[1].metric("Strike", f"{strike:g}")
+    context[2].metric("Expiry", expiry.isoformat())
+    context[3].metric("Spot", f"{spot:g}")
+
+
+def _load_gamma_surface(
+    ticker: str,
+    strike: float,
+    expiry_range: tuple[float, ...],
+    prices: tuple[float, ...],
+    sigma: float,
+    option_type: str,
+    model: str,
+    v0: float,
+    kappa: float,
+    theta: float,
+    heston_sigma: float,
+    rho: float,
+) -> pd.DataFrame:
+    fingerprint = (
+        ticker,
+        round(float(strike), 8),
+        expiry_range,
+        prices,
+        round(float(sigma), 8),
+        option_type,
+        model,
+        round(float(v0), 8),
+        round(float(kappa), 8),
+        round(float(theta), 8),
+        round(float(heston_sigma), 8),
+        round(float(rho), 8),
+    )
+    stored = st.session_state.get("gamma_surface_frame")
+    if fingerprint == st.session_state.get("gamma_surface_fp") and isinstance(stored, pd.DataFrame) and not stored.empty:
+        return stored
+    surface = cached_gamma_surface(
+        ticker, float(strike), expiry_range, prices, float(sigma), option_type, model, v0, kappa, theta, heston_sigma, rho
+    )
+    st.session_state.gamma_surface_frame = surface
+    st.session_state.gamma_surface_fp = fingerprint
+    return surface
+
+
+def _load_greek_surface(
+    ticker: str,
+    strike: float,
+    expiry_range: tuple[float, ...],
+    prices: tuple[float, ...],
+    sigma: float,
+    option_type: str,
+    model: str,
+    v0: float,
+    kappa: float,
+    theta: float,
+    heston_sigma: float,
+    rho: float,
+    greek: str,
+) -> pd.DataFrame:
+    fingerprint = (
+        ticker,
+        round(float(strike), 8),
+        expiry_range,
+        prices,
+        round(float(sigma), 8),
+        option_type,
+        model,
+        round(float(v0), 8),
+        round(float(kappa), 8),
+        round(float(theta), 8),
+        round(float(heston_sigma), 8),
+        round(float(rho), 8),
+        str(greek),
+    )
+    stored = st.session_state.get("greek_surface_frame")
+    if fingerprint == st.session_state.get("greek_surface_fp") and isinstance(stored, pd.DataFrame) and not stored.empty:
+        return stored
+    surface = cached_greek_surface(
+        ticker,
+        float(strike),
+        expiry_range,
+        prices,
+        float(sigma),
+        option_type,
+        model,
+        v0,
+        kappa,
+        theta,
+        heston_sigma,
+        rho,
+        str(greek),
+    )
+    st.session_state.greek_surface_frame = surface
+    st.session_state.greek_surface_fp = fingerprint
+    return surface
+
+
+def _load_term_structure(
+    ticker: str,
+    strike: float,
+    spot: float,
+    expiry_range: tuple[float, ...],
+    sigma: float,
+    option_type: str,
+    model: str,
+    v0: float,
+    kappa: float,
+    theta: float,
+    heston_sigma: float,
+    rho: float,
+) -> pd.DataFrame:
+    fingerprint = (
+        ticker,
+        round(float(strike), 8),
+        round(float(spot), 6),
+        expiry_range,
+        round(float(sigma), 8),
+        option_type,
+        model,
+        round(float(v0), 8),
+        round(float(kappa), 8),
+        round(float(theta), 8),
+        round(float(heston_sigma), 8),
+        round(float(rho), 8),
+    )
+    stored = st.session_state.get("term_structure_frame")
+    if fingerprint == st.session_state.get("term_structure_fp") and isinstance(stored, pd.DataFrame) and not stored.empty:
+        return stored
+    term = cached_delta_term_structure(
+        ticker, float(strike), float(spot), expiry_range, float(sigma), option_type, model, v0, kappa, theta, heston_sigma, rho
+    )
+    st.session_state.term_structure_frame = term
+    st.session_state.term_structure_fp = fingerprint
+    return term
+
+
+def main() -> None:
+    st.set_page_config(
+        page_title=PAGE_TITLE,
+        layout="wide",
+        initial_sidebar_state="expanded",
+    )
+    _init_state()
+    _apply_theme()
+
+    ticker, strike, expiry, current_price, option_type, _refresh, download_slot = _sidebar_inputs()
+    ticker = ticker.strip().upper() or DEFAULT_TICKER
+
+    st.title("Contract Greeks")
+    st.caption("Price-domain Delta, Gamma, Theta, Vega, and Rho from `generate_greek_curve`.")
+
+    if current_price <= 0:
+        st.info("Waiting for a live Current Price for this ticker.")
+        return
+    if strike <= 0:
+        st.info("Select or enter a strike to draw the curves.")
+        return
+
+    current_iv = _contract_iv(ticker, expiry, float(strike), option_type)
+    sigma = current_iv if current_iv is not None and current_iv > 0 else DEFAULT_SIGMA
+    heston_selected = str(st.session_state.get("pricing_model")) == "Heston"
+    model = _model_from_state()
+    v0, kappa, theta, heston_sigma, rho = _heston_from_state()
+    revision = str(
+        _sim_fingerprint(
+            ticker, float(strike), expiry, option_type, current_price, sigma, model, v0, kappa, theta, heston_sigma, rho
+        )
+    )
+    frame = _load_curve(
+        ticker,
+        float(strike),
+        expiry,
+        current_price,
+        option_type,
+        sigma,
+        model,
+        v0,
+        kappa,
+        theta,
+        heston_sigma,
+        rho,
+    )
+
+    if frame is None:
+        return
+
+    if current_iv is None:
+        frame = frame.copy()
+        frame["IV"] = pd.NA
+    else:
+        frame = frame.copy()
+        frame["IV"] = current_iv
+
+    render_sidebar_download(download_slot, frame, ticker, strike, expiry)
+
+    header = st.container()
+    with header:
+        render_metric_header(frame, current_price, ticker, strike, expiry, current_iv, heston_selected)
+
+    if st.session_state.get("show_second_order"):
+        try:
+            render_vanna_volga_chart(
+                frame,
+                float(strike),
+                expiry,
+                float(sigma),
+                option_type,
+                v0,
+                kappa,
+                theta,
+                heston_sigma,
+                rho,
+                revision=revision,
+            )
+        except Exception:
+            st.error("Could not render the Vanna/Volga chart.")
+
+    greeks_tab, advanced_tab, surface_tab, time_tab = st.tabs(
+        ["Greeks", "Advanced Metrics", "3D Surface", "Time-Sensitivity"]
+    )
+    with greeks_tab:
+        for pair in CHART_ROWS:
+            cols = st.columns(len(pair), gap="medium")
+            for column_name, col in zip(pair, cols):
+                try:
+                    render_greek_chart(frame, column_name, col, revision=revision)
+                except Exception:
+                    col.error(f"Could not render the {column_name} chart.")
+        with st.expander("Greeks table"):
+            st.dataframe(frame, use_container_width=True, hide_index=True)
+
+    with advanced_tab:
+        view_3d = st.checkbox("View 3D Surface", key="advanced_view_3d")
+        if view_3d:
+            greek = st.radio(
+                "Surface Greek",
+                options=("Charm", "Speed", "Color"),
+                horizontal=True,
+                key="advanced_surface_greek",
+            )
+            dte = max((expiry - date.today()).days, 1)
+            expiry_range = tuple(sorted({float(d) for d in range(7, 91, 7)} | {float(dte)}))
+            prices = tuple(
+                float(p)
+                for p in pd.to_numeric(frame["Price"], errors="coerce").dropna().tolist()[::4]
+            )
+            try:
+                surface = _load_greek_surface(
+                    ticker,
+                    float(strike),
+                    expiry_range,
+                    prices,
+                    float(sigma),
+                    option_type,
+                    model,
+                    v0,
+                    kappa,
+                    theta,
+                    heston_sigma,
+                    rho,
+                    str(greek),
+                )
+                render_advanced_greek_surface(surface, str(greek))
+            except Exception:
+                st.error(f"Could not render the {greek} 3D surface.")
+        else:
+            try:
+                render_gamma_theta_ratio_chart(frame)
+            except Exception:
+                st.error("Could not render the Gamma/Theta Ratio chart.")
+            try:
+                render_speed_chart(frame)
+            except Exception:
+                st.error("Could not render the Risk Acceleration chart.")
+            try:
+                render_color_chart(frame)
+            except Exception:
+                st.error("Could not render the Gamma Decay chart.")
+
+    with surface_tab:
+        dte = max((expiry - date.today()).days, 1)
+        expiry_range = tuple(sorted({float(d) for d in range(7, 91, 7)} | {float(dte)}))
+        prices = tuple(
+            float(p)
+            for p in pd.to_numeric(frame["Price"], errors="coerce").dropna().tolist()
+        )
+        try:
+            surface = _load_gamma_surface(
+                ticker,
+                float(strike),
+                expiry_range,
+                prices,
+                float(sigma),
+                option_type,
+                model,
+                v0,
+                kappa,
+                theta,
+                heston_sigma,
+                rho,
+            )
+            render_gamma_surface(surface)
+        except Exception:
+            st.error("Could not render the 3D Gamma surface.")
+
+    with time_tab:
+        dte = max((expiry - date.today()).days, 1)
+        near = list(range(1, min(dte, 14) + 1))
+        far = list(range(21, dte + 1, 7))
+        expiry_range = tuple(sorted({float(x) for x in near + far + [dte] if x > 0}))
+        try:
+            term = _load_term_structure(
+                ticker,
+                float(strike),
+                float(current_price),
+                expiry_range,
+                float(sigma),
+                option_type,
+                model,
+                v0,
+                kappa,
+                theta,
+                heston_sigma,
+                rho,
+            )
+            render_delta_term_structure(term)
+        except Exception:
+            st.error("Could not render the Time-Sensitivity chart.")
+
+
+if __name__ == "__main__":
+    main()

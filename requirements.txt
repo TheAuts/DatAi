@@ -1,0 +1,13 @@
+pandas>=2.2.0
+pyarrow>=14.0.0
+python-dotenv>=1.0.0
+requests>=2.31.0
+loguru>=0.7.0
+pydantic>=2.0.0
+pytest>=8.0.0
+black>=24.0.0
+scipy>=1.11.0
+numpy>=1.24.0
+streamlit>=1.32.0
+plotly>=5.18.0
+yfinance>=0.2.40
