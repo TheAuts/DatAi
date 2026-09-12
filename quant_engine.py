@@ -8,6 +8,8 @@ from typing import Any, Iterable, Mapping
 
 import numpy as np
 import pandas as pd
+from scipy.interpolate import griddata
+from scipy.ndimage import gaussian_filter
 from scipy.stats import norm
 
 T_MIN = 1e-4
@@ -24,6 +26,11 @@ HESTON_PATHS = 10000
 HESTON_STEPS = 1000
 CURVE_RESOLUTION = 201
 SMOOTH_WINDOW = 5
+VOL_SURFACE_IV_MIN = 0.01
+VOL_SURFACE_IV_MAX = 3.00
+VOL_SURFACE_STRIKE_POINTS = 80
+VOL_SURFACE_DTE_POINTS = 60
+VOL_SURFACE_GAUSS_SIGMA = 1.0
 MODEL_BLACK_SCHOLES = "black-scholes"
 MODEL_HESTON = "heston"
 _EMPTY_GREEKS: dict[str, float | None] = {
@@ -1089,3 +1096,99 @@ def generate_delta_term_structure(
             }
         )
     return _smooth_curve_frame(pd.DataFrame(rows), "DaysToExpiry")
+
+
+def _zero_vol_surface() -> pd.DataFrame:
+    strike_axis = np.linspace(1.0, 2.0, 21, dtype=np.float64)
+    dte_axis = np.linspace(1.0, 30.0, 21, dtype=np.float64)
+    grid_x, grid_y = np.meshgrid(strike_axis, dte_axis)
+    return pd.DataFrame(
+        {
+            "Strike": grid_x.ravel(),
+            "DaysToExpiry": grid_y.ravel(),
+            "IV": np.zeros(grid_x.size, dtype=np.float64),
+        }
+    )
+
+
+def generate_vol_surface_data(ticker: str) -> pd.DataFrame | str:
+    """Implied-vol grid: Strike (X) × Days-to-Expiry (Y) × IV (Z) for Plotly."""
+    from data_ingestion import fetch_option_chain, get_available_expirations
+
+    def _finish(frame: pd.DataFrame) -> pd.DataFrame | str:
+        out = frame.replace([np.inf, -np.inf], np.nan).dropna(how="any")
+        if not out.empty:
+            out["Strike"] = out["Strike"].astype(float)
+            out["DaysToExpiry"] = out["DaysToExpiry"].astype(float)
+            out["IV"] = out["IV"].astype(float)
+        print("generate_vol_surface_data shape:", out.shape)
+        print(out.head())
+        if len(out) < 10:
+            return "Insufficient Data"
+        return out
+
+    try:
+        frames: list[pd.DataFrame] = []
+        try:
+            expiries = list(get_available_expirations(ticker) or [])
+        except Exception:
+            expiries = []
+        if not expiries:
+            frames.append(fetch_option_chain(ticker))
+        else:
+            for expiry in expiries[:16]:
+                frames.append(fetch_option_chain(ticker, expiry))
+        chain = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    except Exception:
+        return _finish(pd.DataFrame(columns=["Strike", "DaysToExpiry", "IV"]))
+    if chain.empty:
+        return _finish(pd.DataFrame(columns=["Strike", "DaysToExpiry", "IV"]))
+
+    strikes = pd.to_numeric(chain.get("strike", chain.get("K")), errors="coerce")
+    ivs = pd.to_numeric(chain.get("impliedVolatility", chain.get("sigma")), errors="coerce")
+    if "T" in chain.columns:
+        dtes = pd.to_numeric(chain["T"], errors="coerce") * DAYS_PER_YEAR
+    elif "expiration" in chain.columns:
+        dtes = pd.to_numeric(chain["expiration"].map(_time_to_expiry_years), errors="coerce") * DAYS_PER_YEAR
+    else:
+        dtes = pd.Series(np.nan, index=chain.index)
+    points = pd.DataFrame({"Strike": strikes, "DaysToExpiry": dtes, "IV": ivs})
+    points = points.replace([np.inf, -np.inf], np.nan).dropna(how="any")
+    points = points.loc[
+        (points["Strike"] > 0)
+        & (points["DaysToExpiry"] > 0)
+        & (points["IV"] >= VOL_SURFACE_IV_MIN)
+        & (points["IV"] <= VOL_SURFACE_IV_MAX)
+    ]
+    if points.empty:
+        return _finish(points)
+    points = points.groupby(["Strike", "DaysToExpiry"], as_index=False)["IV"].mean()
+    points = points.loc[(points["IV"] >= VOL_SURFACE_IV_MIN) & (points["IV"] <= VOL_SURFACE_IV_MAX)]
+    points = points.replace([np.inf, -np.inf], np.nan).dropna(how="any")
+    sample_xy = points[["Strike", "DaysToExpiry"]].to_numpy(dtype=float)
+    sample_z = points["IV"].to_numpy(dtype=float)
+    if sample_z.size < 10 or np.unique(sample_xy[:, 0]).size < 2 or np.unique(sample_xy[:, 1]).size < 2:
+        return _finish(points)
+
+    x_min, x_max = float(np.min(sample_xy[:, 0])), float(np.max(sample_xy[:, 0]))
+    y_min, y_max = float(np.min(sample_xy[:, 1])), float(np.max(sample_xy[:, 1]))
+    strike_axis = np.linspace(x_min, x_max, VOL_SURFACE_STRIKE_POINTS, dtype=float)
+    dte_axis = np.linspace(y_min, y_max, VOL_SURFACE_DTE_POINTS, dtype=float)
+    grid_x, grid_y = np.meshgrid(strike_axis, dte_axis)
+    try:
+        linear = griddata(sample_xy, sample_z, (grid_x, grid_y), method="linear")
+        nearest = griddata(sample_xy, sample_z, (grid_x, grid_y), method="nearest")
+        surface = np.where(np.isfinite(linear), linear, nearest)
+        surface = np.where(np.isfinite(surface), surface, np.nan)
+        surface = gaussian_filter(np.asarray(surface, dtype=float), sigma=VOL_SURFACE_GAUSS_SIGMA)
+    except Exception:
+        return _finish(points)
+
+    frame = pd.DataFrame(
+        {
+            "Strike": np.asarray(grid_x, dtype=float).ravel(),
+            "DaysToExpiry": np.asarray(grid_y, dtype=float).ravel(),
+            "IV": np.asarray(surface, dtype=float).ravel(),
+        }
+    )
+    return _finish(frame)

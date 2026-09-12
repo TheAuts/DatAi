@@ -8,6 +8,7 @@ from typing import Any
 
 import pandas as pd
 import numpy as np
+import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
@@ -33,6 +34,7 @@ from quant_engine import (
     generate_3d_greek_surface,
     generate_delta_term_structure,
     generate_greek_curve,
+    generate_vol_surface_data,
 )
 
 PAGE_TITLE = "DatAi"
@@ -100,6 +102,8 @@ def _init_state() -> None:
         "term_structure_fp": None,
         "vanna_volga_frame": None,
         "vanna_volga_fp": None,
+        "vol_surface_frame": None,
+        "vol_surface_fp": None,
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -195,6 +199,8 @@ def _clear_persisted_results() -> None:
     st.session_state.term_structure_fp = None
     st.session_state.vanna_volga_frame = None
     st.session_state.vanna_volga_fp = None
+    st.session_state.vol_surface_frame = None
+    st.session_state.vol_surface_fp = None
 
 
 def _price_range(spot: float, span: float = PRICE_SPAN, n: int = CURVE_POINTS) -> tuple[float, ...]:
@@ -651,6 +657,7 @@ def _sidebar_inputs() -> tuple[str, float, date, float, str, bool, Any]:
             cached_greek_surface.clear()
             cached_delta_term_structure.clear()
             cached_vanna_volga.clear()
+            cached_vol_surface.clear()
             st.session_state.price_ticker = ""
             st.session_state.iv_fingerprint = None
             st.session_state.persisted_iv = None
@@ -1089,6 +1096,11 @@ def cached_delta_term_structure(
     )
 
 
+@st.cache_data(ttl=300, show_spinner="Building implied volatility surface…")
+def cached_vol_surface(ticker: str) -> pd.DataFrame | str:
+    return generate_vol_surface_data(ticker)
+
+
 def render_delta_term_structure(frame: pd.DataFrame) -> None:
     required = {"DaysToExpiry", "Delta"}
     if frame.empty or not required.issubset(frame.columns):
@@ -1194,6 +1206,90 @@ def render_gamma_surface(frame: pd.DataFrame) -> None:
         config={"displayModeBar": True, "scrollZoom": True},
         key="gamma-surface-chart",
     )
+
+
+def render_vol_surface(frame: pd.DataFrame | str) -> None:
+    try:
+        if isinstance(frame, str):
+            st.info(frame)
+            return
+        x_col = "Price" if "Price" in frame.columns else "Strike"
+        required = {x_col, "DaysToExpiry", "IV"}
+        if frame.empty or not required.issubset(frame.columns):
+            st.info("No implied volatility surface data to plot.")
+            return
+        plot_df = frame.loc[:, [x_col, "DaysToExpiry", "IV"]].copy()
+        plot_df[x_col] = pd.to_numeric(plot_df[x_col], errors="coerce")
+        plot_df["DaysToExpiry"] = pd.to_numeric(plot_df["DaysToExpiry"], errors="coerce")
+        plot_df["IV"] = pd.to_numeric(plot_df["IV"], errors="coerce")
+        plot_df = plot_df.replace([np.inf, -np.inf], np.nan).dropna()
+        if plot_df.empty:
+            st.info("No implied volatility surface data to plot.")
+            return
+
+        scatter = px.scatter_3d(
+            plot_df,
+            x=x_col,
+            y="DaysToExpiry",
+            z="IV",
+            color="IV",
+            color_continuous_scale="Viridis",
+            title="Implied Volatility Surface",
+        )
+        scatter.update_traces(marker={"size": 3})
+        scatter.update_layout(
+            template="plotly_dark",
+            paper_bgcolor=DARK_BG,
+            font={"color": TEXT},
+            height=560,
+            scene={
+                "xaxis_title": "Price",
+                "yaxis_title": "Days to Expiry",
+                "zaxis_title": "IV",
+                "bgcolor": PANEL_BG,
+            },
+            margin={"l": 8, "r": 8, "t": 48, "b": 8},
+            uirevision="vol-surface-scatter",
+        )
+        st.plotly_chart(
+            scatter,
+            width="stretch",
+            config={"displayModeBar": True, "scrollZoom": True},
+            key="vol-surface-scatter",
+        )
+
+        try:
+            contour = px.density_contour(
+                plot_df,
+                x=x_col,
+                y="DaysToExpiry",
+                title="Implied Volatility Surface",
+            )
+            contour.update_traces(
+                contours_coloring="fill",
+                colorscale="Viridis",
+                colorbar={"title": "IV"},
+            )
+            contour.update_layout(
+                template="plotly_dark",
+                paper_bgcolor=DARK_BG,
+                font={"color": TEXT},
+                height=420,
+                xaxis_title="Price",
+                yaxis_title="Days to Expiry",
+                margin={"l": 48, "r": 16, "t": 48, "b": 48},
+                uirevision="vol-surface-contour",
+            )
+            st.plotly_chart(
+                contour,
+                width="stretch",
+                config={"displayModeBar": True, "scrollZoom": True},
+                key="vol-surface-contour",
+            )
+        except Exception as contour_error:
+            st.exception(contour_error)
+    except Exception as error:
+        st.exception(error)
 
 
 def render_advanced_greek_surface(frame: pd.DataFrame, greek: str) -> None:
@@ -1391,6 +1487,19 @@ def _load_term_structure(
     return term
 
 
+def _load_vol_surface(ticker: str) -> pd.DataFrame | str:
+    fingerprint = (str(ticker).strip().upper(),)
+    stored = st.session_state.get("vol_surface_frame")
+    if fingerprint == st.session_state.get("vol_surface_fp") and (
+        (isinstance(stored, pd.DataFrame) and not stored.empty) or stored == "Insufficient Data"
+    ):
+        return stored
+    surface = cached_vol_surface(ticker)
+    st.session_state.vol_surface_frame = surface
+    st.session_state.vol_surface_fp = fingerprint
+    return surface
+
+
 def main() -> None:
     st.set_page_config(
         page_title=PAGE_TITLE,
@@ -1472,8 +1581,8 @@ def main() -> None:
         except Exception:
             st.error("Could not render the Vanna/Volga chart.")
 
-    greeks_tab, advanced_tab, surface_tab, time_tab = st.tabs(
-        ["Greeks", "Advanced Metrics", "3D Surface", "Time-Sensitivity"]
+    greeks_tab, advanced_tab, surface_tab, time_tab, vol_tab = st.tabs(
+        ["Greeks", "Advanced Metrics", "3D Surface", "Time-Sensitivity", "Volatility Surface"]
     )
     with greeks_tab:
         for pair in CHART_ROWS:
@@ -1583,6 +1692,13 @@ def main() -> None:
             render_delta_term_structure(term)
         except Exception:
             st.error("Could not render the Time-Sensitivity chart.")
+
+    with vol_tab:
+        try:
+            vol_surface = _load_vol_surface(ticker)
+            render_vol_surface(vol_surface)
+        except Exception as error:
+            st.exception(error)
 
 
 if __name__ == "__main__":
