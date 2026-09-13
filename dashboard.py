@@ -253,6 +253,44 @@ def _api_status_ok(status: Any) -> bool:
     return bool(status)
 
 
+def _surface_ingest_alerts(repo: DataRepository | None = None, frame: Any = None) -> None:
+    """Show ``API Token Missing`` / ``API Error: [code]`` from repo or mock frame attrs."""
+    status: dict[str, Any] = {}
+    if repo is not None:
+        status = dict(getattr(repo, "last_ingest_status", None) or {})
+        ui_msg = None
+        try:
+            ui_msg = repo.ui_error_message()
+        except Exception:
+            ui_msg = None
+        if ui_msg:
+            if "Token Missing" in ui_msg:
+                st.error(ui_msg)
+            else:
+                st.warning(ui_msg)
+            return
+    if isinstance(frame, pd.DataFrame):
+        try:
+            if frame.attrs.get("token_missing"):
+                st.error("API Token Missing")
+                return
+            if frame.attrs.get("is_mock"):
+                code = frame.attrs.get("api_error")
+                if code is None or code == "":
+                    code = "RequestFailed"
+                st.warning(f"API Error: {code}")
+                return
+        except Exception:
+            pass
+    if status.get("token_missing"):
+        st.error("API Token Missing")
+    elif status and not status.get("ok"):
+        code = status.get("status_code")
+        if code is None or code == "":
+            code = "RequestFailed"
+        st.warning(f"API Error: {code}")
+
+
 def _apply_theme() -> None:
     st.markdown(
         f"""
@@ -366,11 +404,38 @@ def _repo_chain(ticker: str, expiry: Any = None) -> pd.DataFrame:
     repo = _get_repo()
     symbol = str(ticker or "").strip().upper()
     as_of = _historical_date_iso()
-    if as_of:
-        return repo.get_data(symbol, expiry, date=as_of)
-    if not repo.is_fresh(symbol):
-        return repo.get_data(symbol, expiry)
-    return repo.get_data(symbol, expiry)
+    try:
+        health = repo.verify_connection("SPY")
+        if isinstance(health, dict) and health.get("token_missing"):
+            from data_ingestion import mock_option_chain
+
+            frame = mock_option_chain(symbol, token_missing=True, message="API Token Missing")
+            st.session_state["ingest_alert"] = "API Token Missing"
+            return frame
+    except Exception:
+        pass
+    try:
+        if as_of:
+            frame = repo.get_data(symbol, expiry, date=as_of)
+        else:
+            frame = repo.get_data(symbol, expiry)
+    except Exception as exc:
+        from data_ingestion import mock_option_chain
+
+        frame = mock_option_chain(symbol, error_code="Exception", message=str(exc))
+    msg = None
+    try:
+        msg = repo.ui_error_message()
+    except Exception:
+        msg = None
+    if msg:
+        st.session_state["ingest_alert"] = msg
+    elif isinstance(frame, pd.DataFrame) and frame.attrs.get("is_mock"):
+        code = frame.attrs.get("api_error") or "RequestFailed"
+        st.session_state["ingest_alert"] = (
+            "API Token Missing" if frame.attrs.get("token_missing") else f"API Error: {code}"
+        )
+    return frame if isinstance(frame, pd.DataFrame) else pd.DataFrame()
 
 
 def _reset_time_machine_keys(ticker: str) -> None:
@@ -2341,6 +2406,13 @@ def render_time_machine_vol_surface(frame: pd.DataFrame | str, timestamp: str) -
 
 def add_time_machine_tab(tab: Any, ticker: str) -> None:
     with tab:
+        _surface_ingest_alerts(_get_repo())
+        alert = st.session_state.get("ingest_alert")
+        if alert and isinstance(alert, str):
+            if "Token Missing" in alert:
+                st.error(alert)
+            elif alert.startswith("API Error:"):
+                st.warning(alert)
         snapshots = _get_repo().get_available_snapshots(ticker)
         if not snapshots:
             st.info("No snapshots in data_history/ for this ticker.")
@@ -2623,11 +2695,44 @@ def main() -> None:
     )
     _init_state()
     _apply_theme()
-    if not _api_status_ok(_get_repo().get_api_status()):
+    repo = _get_repo()
+    shown_alerts: set[str] = set()
+    try:
+        health = repo.verify_connection("SPY")
+    except Exception as exc:
+        health = {"ok": False, "status_code": None, "message": str(exc), "token_missing": False}
+    if isinstance(health, dict) and health.get("token_missing"):
+        st.error("API Token Missing")
+        shown_alerts.add("API Token Missing")
+    elif not _api_status_ok(health):
+        code = None
+        if isinstance(health, dict):
+            code = health.get("status_code")
+        if code is None or code == "":
+            code = "RequestFailed"
+        msg = f"API Error: {code}"
+        st.warning(msg)
+        shown_alerts.add(msg)
         st.error("API Service Unavailable")
 
     ticker, strike, expiry, current_price, option_type, _refresh, download_slot = _sidebar_inputs()
     ticker = ticker.strip().upper() or DEFAULT_TICKER
+    try:
+        ui_msg = repo.ui_error_message()
+    except Exception:
+        ui_msg = None
+    if ui_msg and ui_msg not in shown_alerts:
+        if "Token Missing" in ui_msg:
+            st.error(ui_msg)
+        else:
+            st.warning(ui_msg)
+        shown_alerts.add(ui_msg)
+    alert = st.session_state.pop("ingest_alert", None)
+    if isinstance(alert, str) and alert and alert not in shown_alerts:
+        if "Token Missing" in alert:
+            st.error(alert)
+        else:
+            st.warning(alert)
 
     st.title("Contract Greeks")
     st.caption("Price-domain Delta, Gamma, Theta, Vega, and Rho from `generate_greek_curve`.")

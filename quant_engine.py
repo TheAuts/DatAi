@@ -609,6 +609,14 @@ class DataRepository:
         self.history_dir.mkdir(parents=True, exist_ok=True)
         self._fetcher = fetcher
         self._status_probe = status_probe
+        # Last ingest outcome for dashboard (token / API Error: [code]).
+        self.last_ingest_status: dict[str, Any] = {
+            "ok": True,
+            "status_code": None,
+            "message": "",
+            "token_missing": False,
+            "is_mock": False,
+        }
 
     def _safe_ticker(self, ticker: str) -> str:
         symbol = str(ticker or "").strip().upper() or "_"
@@ -1274,9 +1282,179 @@ class DataRepository:
             records = payload.get("data") or []
             return pd.DataFrame(records)
         frame = self._fetch(ticker, expiry)
-        if isinstance(frame, pd.DataFrame) and not frame.empty:
+        if isinstance(frame, pd.DataFrame) and not frame.empty and not self._frame_is_mock(frame):
             self.save_to_cache(ticker, frame)
         return frame if isinstance(frame, pd.DataFrame) else pd.DataFrame()
+
+    @staticmethod
+    def _frame_is_mock(frame: Any) -> bool:
+        if not isinstance(frame, pd.DataFrame):
+            return False
+        try:
+            return bool(frame.attrs.get("is_mock"))
+        except Exception:
+            return False
+
+    def _set_ingest_status(
+        self,
+        *,
+        ok: bool,
+        status_code: Any = None,
+        message: str = "",
+        token_missing: bool = False,
+        is_mock: bool = False,
+    ) -> None:
+        self.last_ingest_status = {
+            "ok": bool(ok),
+            "status_code": status_code,
+            "message": str(message or ""),
+            "token_missing": bool(token_missing),
+            "is_mock": bool(is_mock),
+        }
+
+    def ui_error_message(self) -> str | None:
+        """Human-facing status for Streamlit: ``API Token Missing`` or ``API Error: [code]``."""
+        status = self.last_ingest_status or {}
+        if status.get("token_missing"):
+            return "API Token Missing"
+        if status.get("ok"):
+            return None
+        code = status.get("status_code")
+        if code is None or code == "":
+            code = "RequestFailed"
+        return f"API Error: {code}"
+
+    def verify_connection(self, symbol: str = "SPY") -> dict[str, Any]:
+        """Lightweight GET for a stable symbol before complex chain fetches.
+
+        On failure, logs the exact status code and error message and updates
+        ``last_ingest_status`` for the dashboard.
+        """
+        from data_ingestion import (
+            API_BASE,
+            QUOTES_PATH,
+            _headers,
+            get_api_key,
+            get_last_api_error,
+            _normalize_ticker,
+        )
+
+        probe = _normalize_ticker(symbol) or "SPY"
+        if not get_api_key():
+            message = "API Token Missing"
+            _LOG.error("verify_connection failed symbol=%s status=%s error=%s", probe, None, message)
+            result = {
+                "ok": False,
+                "status_code": None,
+                "message": message,
+                "token_missing": True,
+                "symbol": probe,
+            }
+            self._set_ingest_status(ok=False, message=message, token_missing=True, is_mock=False)
+            return result
+        if self._status_probe is not None:
+            try:
+                probed = self._status_probe()
+            except Exception as exc:
+                _LOG.error(
+                    "verify_connection failed symbol=%s status=%s error=%s",
+                    probe,
+                    None,
+                    exc,
+                )
+                self._set_ingest_status(ok=False, message=str(exc), is_mock=False)
+                return {
+                    "ok": False,
+                    "status_code": None,
+                    "message": str(exc),
+                    "token_missing": False,
+                    "symbol": probe,
+                }
+            if isinstance(probed, dict):
+                ok = bool(probed.get("ok"))
+                status_code = probed.get("status_code")
+                message = str(probed.get("message") or ("reachable" if ok else "unreachable"))
+                self._set_ingest_status(
+                    ok=ok,
+                    status_code=status_code,
+                    message=message,
+                    token_missing=bool(probed.get("token_missing")),
+                )
+                if not ok:
+                    _LOG.error(
+                        "verify_connection failed symbol=%s status=%s error=%s",
+                        probe,
+                        status_code,
+                        message,
+                    )
+                return {
+                    "ok": ok,
+                    "status_code": status_code,
+                    "message": message,
+                    "token_missing": bool(probed.get("token_missing")),
+                    "symbol": probe,
+                }
+            ok = bool(probed)
+            self._set_ingest_status(ok=ok, message=str(probed))
+            return {
+                "ok": ok,
+                "status_code": None,
+                "message": str(probed),
+                "token_missing": False,
+                "symbol": probe,
+            }
+        try:
+            import requests
+
+            path = QUOTES_PATH.format(symbol=probe)
+            response = requests.get(
+                f"{API_BASE}{path}",
+                headers=_headers(),
+                timeout=8,
+            )
+            status_code = int(response.status_code)
+            if status_code >= 400:
+                message = f"HTTP {status_code}: {response.text[:300]}"
+                _LOG.error(
+                    "verify_connection failed symbol=%s status=%s error=%s",
+                    probe,
+                    status_code,
+                    message,
+                )
+                self._set_ingest_status(ok=False, status_code=status_code, message=message)
+                return {
+                    "ok": False,
+                    "status_code": status_code,
+                    "message": message,
+                    "token_missing": False,
+                    "symbol": probe,
+                }
+            self._set_ingest_status(ok=True, status_code=status_code, message="reachable")
+            return {
+                "ok": True,
+                "status_code": status_code,
+                "message": "reachable",
+                "token_missing": False,
+                "symbol": probe,
+            }
+        except Exception as exc:
+            err = get_last_api_error()
+            status_code = err.get("status_code")
+            message = str(exc)
+            _LOG.error(
+                "verify_connection failed symbol=%s status=%s error=%s",
+                probe,
+                status_code,
+                message,
+            )
+            self._set_ingest_status(ok=False, status_code=status_code, message=message)
+            return {
+                "ok": False,
+                "status_code": status_code,
+                "message": message,
+                "token_missing": False,
+                "symbol": probe,
+            }
 
     def get_api_status(self) -> dict[str, Any]:
         if self._status_probe is not None:
@@ -1288,35 +1466,93 @@ class DataRepository:
                 return result
             return {"ok": bool(result), "status_code": None, "message": str(result)}
         try:
-            import requests
-            from data_ingestion import API_BASE, _headers
+            from data_ingestion import get_api_key
 
-            response = requests.get(f"{API_BASE.rstrip('/')}/", headers=_headers(), timeout=8)
-            ok = int(response.status_code) < 500
-            return {
-                "ok": ok,
-                "status_code": int(response.status_code),
-                "message": "reachable" if ok else f"HTTP {response.status_code}",
-            }
+            if not get_api_key():
+                return {
+                    "ok": False,
+                    "status_code": None,
+                    "message": "API Token Missing",
+                    "token_missing": True,
+                }
+        except Exception:
+            pass
+        # Prefer the lightweight SPY probe when available.
+        try:
+            return self.verify_connection("SPY")
         except Exception as exc:
             return {"ok": False, "status_code": None, "message": str(exc)}
 
+    def _mock_on_failure(
+        self,
+        ticker: str,
+        *,
+        status_code: Any = None,
+        message: str = "",
+        token_missing: bool = False,
+    ) -> pd.DataFrame:
+        from data_ingestion import mock_option_chain
+
+        code = status_code if status_code is not None else "RequestFailed"
+        self._set_ingest_status(
+            ok=False,
+            status_code=status_code,
+            message=message,
+            token_missing=token_missing,
+            is_mock=True,
+        )
+        return mock_option_chain(
+            ticker,
+            error_code=code,
+            token_missing=token_missing,
+            message=message,
+        )
+
     def _fetch(self, ticker: str, expiry: Any, date: str | None = None) -> pd.DataFrame:
+        from data_ingestion import get_api_key, get_last_api_error, is_mock_frame
+
+        if self._fetcher is None and not get_api_key():
+            _LOG.error("DataRepository API token missing; returning mock data")
+            return self._mock_on_failure(ticker, message="API Token Missing", token_missing=True)
+
         if self._fetcher is not None:
             try:
                 # Only forward ``date`` when set so two-argument fetchers keep working.
-                return self._fetcher(ticker, expiry, date=date) if date else self._fetcher(ticker, expiry)
+                frame = self._fetcher(ticker, expiry, date=date) if date else self._fetcher(ticker, expiry)
             except Exception as exc:
                 _LOG.warning("DataRepository fetch failed ticker=%s expiry=%s error=%s", ticker, expiry, exc)
-                return pd.DataFrame()
+                return self._mock_on_failure(ticker, message=str(exc))
+            if is_mock_frame(frame):
+                err = get_last_api_error()
+                self._set_ingest_status(
+                    ok=False,
+                    status_code=err.get("status_code") or getattr(frame, "attrs", {}).get("api_error"),
+                    message=str(err.get("message") or frame.attrs.get("api_message") or ""),
+                    token_missing=bool(err.get("token_missing") or frame.attrs.get("token_missing")),
+                    is_mock=True,
+                )
+                return frame if isinstance(frame, pd.DataFrame) else self._mock_on_failure(ticker)
+            self._set_ingest_status(ok=True, message="ok", is_mock=False)
+            return frame if isinstance(frame, pd.DataFrame) else pd.DataFrame()
         try:
             from data_ingestion import fetch_option_chain
 
-            return fetch_option_chain(ticker, expiry, date=date) if date else fetch_option_chain(ticker, expiry)
+            frame = fetch_option_chain(ticker, expiry, date=date) if date else fetch_option_chain(ticker, expiry)
         except Exception as exc:
             _LOG.warning("DataRepository fetch failed ticker=%s expiry=%s error=%s", ticker, expiry, exc)
-            return pd.DataFrame()
-
+            return self._mock_on_failure(ticker, message=str(exc))
+        if is_mock_frame(frame):
+            err = get_last_api_error()
+            self._set_ingest_status(
+                ok=False,
+                status_code=err.get("status_code") or frame.attrs.get("api_error"),
+                message=str(err.get("message") or frame.attrs.get("api_message") or ""),
+                token_missing=bool(err.get("token_missing") or frame.attrs.get("token_missing")),
+                is_mock=True,
+            )
+            return frame
+        self._set_ingest_status(ok=True, message="ok", is_mock=False)
+        return frame if isinstance(frame, pd.DataFrame) else pd.DataFrame()
 
 def inspect_snapshot(filename: str) -> dict[str, Any]:
     raw = str(filename or "").strip()
