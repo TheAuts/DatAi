@@ -367,17 +367,57 @@ def _reset_time_machine_keys(ticker: str) -> None:
             del st.session_state[key]
 
 
+def _fresh_chain_for_snapshot(symbol: str, expiry: Any = None) -> pd.DataFrame:
+    """Bypass every cache layer (st.cache_data and the repo TTL cache) so a snapshot
+    captures live data. Falls back to the cached chain if the live fetch is empty."""
+    repo = _get_repo()
+    live_spot: float | None = None
+    try:
+        from data_ingestion import get_current_price as _uncached_price
+
+        live_spot = _uncached_price(symbol)
+    except Exception:
+        live_spot = None
+    for cached_fn in (cached_analyst_chain, cached_available_expirations, cached_vol_surface):
+        clear = getattr(cached_fn, "clear", None)
+        if callable(clear):
+            try:
+                clear()
+            except Exception:
+                pass
+    frame = pd.DataFrame()
+    try:
+        frame = repo._fetch(symbol, expiry)
+    except Exception:
+        frame = pd.DataFrame()
+    if not isinstance(frame, pd.DataFrame) or frame.empty:
+        frame = _repo_chain(symbol, expiry)
+    if live_spot is not None and isinstance(frame, pd.DataFrame) and not frame.empty:
+        frame = frame.copy()
+        frame["underlyingPrice"] = float(live_spot)
+        frame["S"] = float(live_spot)
+    st.session_state.snapshot_live_spot = live_spot
+    return frame
+
+
 def _capture_snapshot(ticker: str, expiry: Any = None) -> None:
     symbol = str(ticker or "").strip().upper() or DEFAULT_TICKER
-    data = _repo_chain(symbol, expiry)
-    _get_repo().save_to_cache(symbol, data)
+    repo = _get_repo()
+    data = _fresh_chain_for_snapshot(symbol, expiry)
+    before = len(repo.get_historical_snapshots(symbol))
+    repo.save_to_cache(symbol, data)
+    after = len(repo.get_historical_snapshots(symbol))
     _reset_time_machine_keys(symbol)
     try:
         cached_delta_drift.clear()
+        cached_delta_drift_grid.clear()
         cached_snapshot_vol_surface.clear()
     except Exception:
         pass
-    st.session_state.snapshot_saved = True
+    if after > before:
+        st.session_state.snapshot_saved = True
+    else:
+        st.session_state.snapshot_skipped = True
 
 
 def cached_current_price(ticker: str) -> float | None:
@@ -894,10 +934,11 @@ def _sidebar_inputs() -> tuple[str, float, date, float, str, bool, Any]:
 
         if st.button("Capture Snapshot", width="stretch"):
             _capture_snapshot(ticker_norm, expiry)
-            st.success("Snapshot saved!")
             st.rerun()
         if st.session_state.pop("snapshot_saved", False):
             st.success("Snapshot saved!")
+        if st.session_state.pop("snapshot_skipped", False):
+            st.warning("Snapshot identical to previous—not saving.")
 
         download_slot = st.empty()
 
@@ -2078,6 +2119,44 @@ def _surface_payload_is_empty(surface: Any, value_key: str) -> bool:
     return finite.size == 0 or bool(np.all(finite == 0.0))
 
 
+def _write_snapshot_delta_ranges(payload_a: dict, payload_b: dict, label_a: str, label_b: str) -> None:
+    """Show min/max of both compared delta surfaces so a flat drift can be diagnosed."""
+
+    def _range(payload: dict) -> tuple[float | None, float | None, int]:
+        values = (payload.get("delta_surface") or {}).get("Delta") or []
+        arr = np.asarray([np.nan if v is None else v for v in values], dtype=float) if values else np.empty(0)
+        finite = arr[np.isfinite(arr)]
+        if finite.size == 0:
+            return None, None, 0
+        return float(np.min(finite)), float(np.max(finite)), int(finite.size)
+
+    a_min, a_max, a_n = _range(payload_a)
+    b_min, b_max, b_n = _range(payload_b)
+    st.warning("Delta drift is flat; comparing the two snapshot delta surfaces:")
+    st.write(
+        {
+            "Start": {
+                "stamp": payload_a.get("stamp", label_a),
+                "snapshot_id": payload_a.get("snapshot_id"),
+                "spot": payload_a.get("spot"),
+                "delta_min": a_min,
+                "delta_max": a_max,
+                "points": a_n,
+            },
+            "End": {
+                "stamp": payload_b.get("stamp", label_b),
+                "snapshot_id": payload_b.get("snapshot_id"),
+                "spot": payload_b.get("spot"),
+                "delta_min": b_min,
+                "delta_max": b_max,
+                "points": b_n,
+            },
+        }
+    )
+    if a_min == b_min and a_max == b_max and a_n == b_n:
+        st.write("Both snapshots have identical delta surface ranges — the underlying data did not change.")
+
+
 def render_delta_drift_surface(
     frame: pd.DataFrame,
     grid: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None,
@@ -2260,6 +2339,10 @@ def add_time_machine_tab(tab: Any, ticker: str) -> None:
             try:
                 grid = cached_delta_drift_grid(str(ticker), str(start), str(end))
                 drift = cached_delta_drift(str(ticker), str(start), str(end))
+                z_grid = np.asarray(grid[2], dtype=float) if grid is not None and len(grid) == 3 else np.empty(0)
+                finite = z_grid[np.isfinite(z_grid)] if z_grid.size else z_grid
+                if finite.size == 0 or float(np.min(finite)) == float(np.max(finite)) or bool(np.all(finite == 0.0)):
+                    _write_snapshot_delta_ranges(payload_a, payload_b, str(start), str(end))
                 render_delta_drift_surface(drift, grid=grid)
             except Exception as error:
                 st.error("Could not render the Delta Drift surface.")
