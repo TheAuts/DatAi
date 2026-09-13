@@ -378,11 +378,13 @@ def _fresh_chain_for_snapshot(symbol: str, expiry: Any = None) -> pd.DataFrame:
         live_spot = _uncached_price(symbol)
     except Exception:
         live_spot = None
-    try:
-        for cached_fn in (cached_analyst_chain, cached_available_expirations):
-            cached_fn.clear()
-    except Exception:
-        pass
+    for cached_fn in (cached_analyst_chain, cached_available_expirations, cached_vol_surface):
+        clear = getattr(cached_fn, "clear", None)
+        if callable(clear):
+            try:
+                clear()
+            except Exception:
+                pass
     frame = pd.DataFrame()
     try:
         frame = repo._fetch(symbol, expiry)
