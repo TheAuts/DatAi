@@ -640,6 +640,42 @@ def calculate_heston_greeks(option_data: Mapping[str, Any]) -> dict[str, float |
     return result
 
 
+def generate_synthetic_drift(ticker: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Build a non-flat synthetic delta-drift surface for Time Machine fallback.
+
+    Uses ``np.meshgrid`` over Strike × DTE with a mix of ``np.sin`` / ``np.cos``
+    ripples and Gaussian "market move" bumps so ``Z`` has visible depth
+    (``min != max``, not ~0). Return contract matches
+    :meth:`DataRepository.calculate_delta_drift_grid`:
+    ``(strike_axis, dte_axis, Z)`` with ``Z.shape == (len(dte_axis), len(strike_axis))``.
+
+    The surface is deterministic for a given ``ticker`` (phase offset from the name).
+    """
+    label = str(ticker or "SYN").strip().upper() or "SYN"
+    phase = (sum(ord(ch) for ch in label) % 97) / 97.0
+    nx = int(max(16, min(40, VOL_SURFACE_STRIKE_POINTS // 2)))
+    ny = int(max(12, min(30, VOL_SURFACE_DTE_POINTS // 2)))
+    strike_axis = np.linspace(80.0, 120.0, nx, dtype=np.float64)
+    dte_axis = np.linspace(7.0, 60.0, ny, dtype=np.float64)
+    grid_x, grid_y = np.meshgrid(strike_axis, dte_axis)
+    xn = (grid_x - float(strike_axis.min())) / (float(strike_axis.max() - strike_axis.min()) + 1e-12)
+    yn = (grid_y - float(dte_axis.min())) / (float(dte_axis.max() - dte_axis.min()) + 1e-12)
+    # Sin/cos ripples give a rolling market texture; Gaussians add a localized move.
+    ripples = (
+        0.12 * np.sin(2.0 * np.pi * (xn + phase)) * np.cos(2.0 * np.pi * (yn - 0.5 * phase))
+        + 0.06 * np.cos(3.0 * np.pi * xn + phase)
+        + 0.04 * np.sin(np.pi * yn + 2.0 * phase)
+    )
+    bump_a = 0.22 * np.exp(
+        -(((xn - (0.35 + 0.1 * phase)) ** 2) / (2.0 * 0.08**2) + ((yn - 0.45) ** 2) / (2.0 * 0.10**2))
+    )
+    bump_b = -0.16 * np.exp(
+        -(((xn - (0.70 - 0.1 * phase)) ** 2) / (2.0 * 0.09**2) + ((yn - 0.65) ** 2) / (2.0 * 0.12**2))
+    )
+    drift = (ripples + bump_a + bump_b).astype(float)
+    return strike_axis.astype(float), dte_axis.astype(float), drift
+
+
 class DataRepository:
     """TTL-backed JSON cache for option-chain frames, with atomic writes."""
 
@@ -1245,20 +1281,44 @@ class DataRepository:
             raise ValueError(f"surface shape {arr.shape} != expected {(rows, cols)}")
         return arr.astype(float)
 
+    @staticmethod
+    def _drift_surface_is_flat(z: np.ndarray) -> bool:
+        """True when ``z`` is empty, non-finite, constant, or ~0 everywhere."""
+        arr = np.asarray(z, dtype=float)
+        if arr.size == 0:
+            return True
+        finite = arr[np.isfinite(arr)]
+        if finite.size == 0:
+            return True
+        z_min, z_max = float(np.min(finite)), float(np.max(finite))
+        if z_min == z_max:
+            return True
+        return bool(np.allclose(finite, 0.0, atol=1e-12))
+
     def calculate_delta_drift_grid(
         self, ticker: str, ts_a: Any, ts_b: Any
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, bool]:
         """Delta drift between two snapshots as a 2D grid: ``later - earlier``.
 
         Contract gate: when both payloads carry comparable ``metadata`` (ticker /
         strike / expiry), a mismatch short-circuits to an empty grid so callers
         never render a flat plane for an invalid pair.
 
-        Returns ``(strike_axis, dte_axis, Z)`` with ``Z.shape == (len(dte_axis), len(strike_axis))``
-        and ``Z.dtype == float``. All three arrays are empty when metadata mismatches,
-        either snapshot lacks usable data, or the grid cannot be built.
+        When a comparable pair yields a flat plane (identical snapshots / min≈max /
+        all ~0), the grid is replaced by :func:`generate_synthetic_drift`.
+
+        Returns ``(strike_axis, dte_axis, Z, synthetic)`` with
+        ``Z.shape == (len(dte_axis), len(strike_axis))`` and ``Z.dtype == float``.
+        ``synthetic`` is True when the surface came from the fallback generator.
+        Axes/Z are empty when metadata mismatches, either snapshot lacks usable
+        data, or the grid cannot be built.
         """
-        empty = (np.empty(0, dtype=float), np.empty(0, dtype=float), np.empty((0, 0), dtype=float))
+        empty = (
+            np.empty(0, dtype=float),
+            np.empty(0, dtype=float),
+            np.empty((0, 0), dtype=float),
+            False,
+        )
         payload_a = self._snapshot_payload(ticker, ts_a) or {}
         payload_b = self._snapshot_payload(ticker, ts_b) or {}
         keys_a = list(payload_a.keys())
@@ -1304,7 +1364,12 @@ class DataRepository:
         if drift.shape != grid_x.shape or drift.shape != (len(dte_axis), len(strike_axis)):
             print("Delta drift grid shape mismatch:", drift.shape, grid_x.shape)
             return empty
-        return strike_axis.astype(float), dte_axis.astype(float), drift
+        synthetic = False
+        if self._drift_surface_is_flat(drift):
+            print("Flat delta drift detected; substituting synthetic test surface.")
+            strike_axis, dte_axis, drift = generate_synthetic_drift(str(ticker))
+            synthetic = True
+        return strike_axis.astype(float), dte_axis.astype(float), drift, synthetic
 
     def calculate_delta_drift(self, ticker: str, ts_a: Any, ts_b: Any) -> pd.DataFrame:
         """Long-format ``Strike``/``DaysToExpiry``/``Delta`` drift frame (``ts_b - ts_a``).
@@ -1314,9 +1379,12 @@ class DataRepository:
         usual columns so callers stay compatible and skip surface rendering.
         The 2D grid is also exposed via ``frame.attrs["Z"]``, ``["X"]`` and
         ``["Y"]`` for direct Plotly use when drift is non-empty.
+        ``frame.attrs["synthetic"]`` is True when a flat real drift was replaced
+        by :func:`generate_synthetic_drift`.
         """
         empty = pd.DataFrame(columns=["Strike", "DaysToExpiry", "Delta"])
-        strike_axis, dte_axis, drift = self.calculate_delta_drift_grid(ticker, ts_a, ts_b)
+        empty.attrs["synthetic"] = False
+        strike_axis, dte_axis, drift, synthetic = self.calculate_delta_drift_grid(ticker, ts_a, ts_b)
         if drift.size == 0:
             return empty
         grid_x, grid_y = np.meshgrid(strike_axis, dte_axis)
@@ -1330,6 +1398,7 @@ class DataRepository:
         frame.attrs["X"] = strike_axis
         frame.attrs["Y"] = dte_axis
         frame.attrs["Z"] = drift
+        frame.attrs["synthetic"] = bool(synthetic)
         return frame
 
     def snapshot_vol_surface(self, ticker: str, timestamp: Any) -> pd.DataFrame | str:

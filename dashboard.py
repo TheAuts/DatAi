@@ -1574,7 +1574,9 @@ def cached_delta_drift(ticker: str, ts_a: str, ts_b: str) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=120, show_spinner="Calculating delta drift grid…")
-def cached_delta_drift_grid(ticker: str, ts_a: str, ts_b: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+def cached_delta_drift_grid(
+    ticker: str, ts_a: str, ts_b: str
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, bool]:
     return DATA_REPO.calculate_delta_drift_grid(ticker, ts_a, ts_b)
 
 
@@ -2289,16 +2291,19 @@ def _write_snapshot_delta_ranges(payload_a: dict, payload_b: dict, label_a: str,
 
 def render_delta_drift_surface(
     frame: pd.DataFrame,
-    grid: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None,
+    grid: tuple[np.ndarray, np.ndarray, np.ndarray] | tuple[np.ndarray, np.ndarray, np.ndarray, bool] | None = None,
 ) -> None:
     x_axis: np.ndarray
     y_axis: np.ndarray
     Z: np.ndarray
-    if grid is not None and len(grid) == 3 and np.asarray(grid[2]).size > 0:
+    synthetic = bool(getattr(frame, "attrs", {}).get("synthetic")) if frame is not None else False
+    if grid is not None and len(grid) >= 3 and np.asarray(grid[2]).size > 0:
         x_axis = np.asarray(grid[0], dtype=float)
         y_axis = np.asarray(grid[1], dtype=float)
-        # Grid contract: Z = surface_b - surface_a (later - earlier).
+        # Grid contract: Z = surface_b - surface_a (later - earlier), or synthetic.
         Z = np.array(grid[2], dtype=float, copy=True)
+        if len(grid) >= 4:
+            synthetic = bool(grid[3]) or synthetic
     else:
         required = {"Strike", "DaysToExpiry", "Delta"}
         if frame is None or frame.empty or not required.issubset(frame.columns):
@@ -2317,6 +2322,8 @@ def render_delta_drift_surface(
         x_axis = pivot.columns.to_numpy(dtype=float)
         y_axis = pivot.index.to_numpy(dtype=float)
         Z = np.array(pivot.to_numpy(dtype=float), copy=True)
+    if synthetic:
+        st.info("No real drift detected. Showing synthetic test surface.")
     Z = Z.astype(float)
     Z[~np.isfinite(Z)] = np.nan
     z2d, _, _, _ = prepare_plotly_surface_xyz(Z, x_axis, y_axis)
@@ -2326,8 +2333,9 @@ def render_delta_drift_surface(
         return
     z_min, z_max = float(np.nanmin(z2d)), float(np.nanmax(z2d))
     st.write(f"Z-matrix shape: {z2d.shape}, Min: {z_min}, Max: {z_max}")
+    st.write({"drift_min": z_min, "drift_max": z_max, "synthetic": synthetic})
     finite = z2d[np.isfinite(z2d)]
-    if z_min == z_max or (finite.size > 0 and bool(np.allclose(finite, 0.0, atol=1e-12))):
+    if not synthetic and (z_min == z_max or (finite.size > 0 and bool(np.allclose(finite, 0.0, atol=1e-12)))):
         st.write({"drift_min": z_min, "drift_max": z_max, "flat_plane": True})
     fig = go.Figure(
         data=[
@@ -2338,7 +2346,7 @@ def render_delta_drift_surface(
                 colorscale="RdBu",
                 reversescale=True,
                 cmid=0,
-                colorbar={"title": "Delta drift"},
+                colorbar={"title": "Delta drift" + (" (synthetic)" if synthetic else "")},
                 hovertemplate="Strike=%{x:.2f}<br>DTE=%{y:.1f}<br>Drift=%{z:.6f}<extra></extra>",
             )
         ]
@@ -2475,21 +2483,34 @@ def add_time_machine_tab(tab: Any, ticker: str) -> None:
             payload_b.get("delta_surface"), "Delta"
         ):
             st.error("Snapshot data is corrupt/empty.")
-        elif str(start) == str(end):
-            st.error("Start and End snapshots are identical; delta drift is zero everywhere. Pick two different snapshots.")
         elif not DataRepository.validate_snapshot_match(payload_a, payload_b)[0]:
             st.warning(
                 "Invalid Comparison: You must select snapshots of the same contract to calculate Delta Drift."
             )
         else:
-            st.success("Valid Contract Pair: Calculating Drift...")
+            if str(start) == str(end):
+                st.info("Identical snapshots selected — real drift is flat; synthetic fallback may apply.")
+            else:
+                st.success("Valid Contract Pair: Calculating Drift...")
             try:
                 grid = cached_delta_drift_grid(str(ticker), str(start), str(end))
                 drift = cached_delta_drift(str(ticker), str(start), str(end))
-                z_grid = np.asarray(grid[2], dtype=float) if grid is not None and len(grid) == 3 else np.empty(0)
+                synthetic = bool(getattr(drift, "attrs", {}).get("synthetic")) or (
+                    len(grid) >= 4 and bool(grid[3])
+                )
+                z_grid = np.asarray(grid[2], dtype=float) if grid is not None and len(grid) >= 3 else np.empty(0)
                 finite = z_grid[np.isfinite(z_grid)] if z_grid.size else z_grid
-                if finite.size == 0 or float(np.min(finite)) == float(np.max(finite)) or bool(np.all(np.isclose(finite, 0.0))):
-                    st.write({"drift_min": float(np.min(finite)) if finite.size else None, "drift_max": float(np.max(finite)) if finite.size else None})
+                if not synthetic and (
+                    finite.size == 0
+                    or float(np.min(finite)) == float(np.max(finite))
+                    or bool(np.all(np.isclose(finite, 0.0)))
+                ):
+                    st.write(
+                        {
+                            "drift_min": float(np.min(finite)) if finite.size else None,
+                            "drift_max": float(np.max(finite)) if finite.size else None,
+                        }
+                    )
                     _write_snapshot_delta_ranges(payload_a, payload_b, str(start), str(end))
                 render_delta_drift_surface(drift, grid=grid)
             except Exception as error:

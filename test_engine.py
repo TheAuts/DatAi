@@ -34,6 +34,7 @@ from quant_engine import (
     calculate_zomma,
     generate_pro_surface_data,
     generate_greek_curve,
+    generate_synthetic_drift,
     EVENT_INSUFFICIENT_COVERAGE,
     analyze_event_outlook,
     analyze_gex_outlook,
@@ -528,10 +529,53 @@ def test_calculate_delta_drift_mismatched_metadata_short_circuits(tmp_path) -> N
     drift = repo.calculate_delta_drift("SPY", ts_a, ts_b)
     assert drift.empty
     assert list(drift.columns) == ["Strike", "DaysToExpiry", "Delta"]
-    strike_axis, dte_axis, z = repo.calculate_delta_drift_grid("SPY", ts_a, ts_b)
+    strike_axis, dte_axis, z, synthetic = repo.calculate_delta_drift_grid("SPY", ts_a, ts_b)
     assert strike_axis.size == 0
     assert dte_axis.size == 0
     assert z.size == 0
+    assert synthetic is False
+
+
+def test_generate_synthetic_drift_non_flat() -> None:
+    strike_axis, dte_axis, z = generate_synthetic_drift("SPY")
+    assert z.ndim == 2
+    assert z.shape == (len(dte_axis), len(strike_axis))
+    finite = z[np.isfinite(z)]
+    assert finite.size > 0
+    assert float(np.min(finite)) != float(np.max(finite))
+    assert not np.allclose(finite, 0.0, atol=1e-12)
+    other = generate_synthetic_drift("QQQ")
+    assert other[2].shape == z.shape
+    assert not np.allclose(other[2], z)
+
+
+def test_identical_snapshots_trigger_synthetic_drift_fallback(tmp_path) -> None:
+    """Same timestamp / identical surface → flat real drift → synthetic fallback."""
+    repo = DataRepository(cache_dir=tmp_path, history_dir=tmp_path / "data_history", status_probe=lambda: {"ok": True})
+    frame = pd.DataFrame(
+        {
+            "Strike": [90.0, 100.0, 110.0, 90.0, 100.0, 110.0],
+            "DaysToExpiry": [7.0, 7.0, 7.0, 30.0, 30.0, 30.0],
+            "Delta": [0.80, 0.50, 0.20, 0.70, 0.50, 0.30],
+        }
+    )
+    repo.save_to_cache(
+        "IWM",
+        frame,
+        metadata={"ticker": "IWM", "strike": 100.0, "expiry": "2026-12-18"},
+    )
+    ts = repo.get_available_snapshots("IWM")[-1]
+    drift = repo.calculate_delta_drift("IWM", ts, ts)
+    assert not drift.empty
+    assert drift.attrs.get("synthetic") is True
+    finite = drift["Delta"].to_numpy(dtype=float)
+    finite = finite[np.isfinite(finite)]
+    assert finite.size > 0
+    assert float(np.min(finite)) != float(np.max(finite))
+    strike_axis, dte_axis, z, synthetic = repo.calculate_delta_drift_grid("IWM", ts, ts)
+    assert synthetic is True
+    assert z.shape == (len(dte_axis), len(strike_axis))
+    assert float(np.nanmin(z)) != float(np.nanmax(z))
 
 
 def test_snapshot_vol_surface_from_history(tmp_path) -> None:
