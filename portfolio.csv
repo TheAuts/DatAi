@@ -1,0 +1,5 @@
+Ticker,Strike,Expiry,Side,Quantity,EntryPrice
+SPY,580,2026-10-16,Call,10,5.50
+AAPL,230,2026-11-20,Put,5,3.20
+NVDA,140,2026-12-18,Call,20,4.10
+TSLA,250,2026-10-16,Call,15,6.75

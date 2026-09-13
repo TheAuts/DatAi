@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import math
+import time
+from typing import Any
 
 import pandas as pd
 import pytest
@@ -15,8 +18,11 @@ from quant_engine import (
     DEFAULT_HESTON_V0,
     MODEL_BLACK_SCHOLES,
     MODEL_HESTON,
+    DataRepository,
     calculate_greeks,
     calculate_heston_greeks,
+    calculate_portfolio_risk,
+    OPTIONS_CONTRACT_SIZE,
     calculate_ultima,
     calculate_vanna,
     calculate_veta,
@@ -24,6 +30,7 @@ from quant_engine import (
     calculate_vomma,
     calculate_zomma,
     generate_pro_surface_data,
+    generate_greek_curve,
     EVENT_INSUFFICIENT_COVERAGE,
     analyze_event_outlook,
     analyze_gex_outlook,
@@ -310,3 +317,93 @@ def test_analyze_event_outlook_catalyst_and_thin_chain(monkeypatch, caplog) -> N
     assert sparse["Outlook"] == EVENT_INSUFFICIENT_COVERAGE
     assert "THIN" in caplog.text
     assert "2026-12-18" in caplog.text
+
+
+def test_calculate_portfolio_risk_net_greeks_and_concentration() -> None:
+    empty = calculate_portfolio_risk(pd.DataFrame())
+    assert empty["Delta"] == 0.0
+    assert empty["LargestPosition"] is None
+    assert empty["DaysToExpiration"] is None
+    long_call = calculate_greeks(STANDARD)
+    short_put = calculate_greeks({**STANDARD, "option_type": "put"})
+    book = pd.DataFrame(
+        {
+            "Ticker": ["SPY", "QQQ"],
+            "Strike": [100.0, 100.0],
+            "Expiry": [1.0, 1.0],
+            "Side": ["long", "short"],
+            "Quantity": [2.0, 1.0],
+            "option_type": ["call", "put"],
+            "S": [100.0, 100.0],
+            "sigma": [0.2, 0.2],
+            "r": [0.05, 0.05],
+            "premium": [10.0, 5.0],
+            "DaysToExpiry": [30.0, 7.0],
+        }
+    )
+    out = calculate_portfolio_risk(book)
+    size = float(OPTIONS_CONTRACT_SIZE)
+    assert out["Delta"] == pytest.approx(float(long_call["Delta"]) * 2.0 * size - float(short_put["Delta"]) * size)
+    assert out["Gamma"] == pytest.approx(float(long_call["Gamma"]) * 2.0 * size - float(short_put["Gamma"]) * size)
+    assert out["Theta"] == pytest.approx(float(long_call["Theta"]) * 2.0 * size - float(short_put["Theta"]) * size)
+    assert out["Vega"] == pytest.approx(float(long_call["Vega"]) * 2.0 * size - float(short_put["Vega"]) * size)
+    assert out["LargestPosition"] == pytest.approx(80.0)
+    assert out["TickerConcentration"] == pytest.approx(80.0)
+    assert out["ConcentratedTicker"] == "SPY"
+    assert out["DaysToExpiration"] == pytest.approx(7.0)
+    by_ticker = {row["Ticker"]: row["Delta"] for row in out["DeltaByTicker"]}
+    assert by_ticker["SPY"] == pytest.approx(float(long_call["Delta"]) * 2.0 * size)
+    assert by_ticker["QQQ"] == pytest.approx(-float(short_put["Delta"]) * size)
+
+
+def test_data_repository_ttl_version_and_atomic_cache(tmp_path) -> None:
+    calls = {"n": 0}
+
+    def fetcher(ticker: str, expiry: Any) -> pd.DataFrame:
+        calls["n"] += 1
+        return pd.DataFrame({"ticker": [ticker], "expiration": [str(expiry)], "sigma": [0.2]})
+
+    repo = DataRepository(
+        cache_dir=tmp_path,
+        fetcher=fetcher,
+        status_probe=lambda: {"ok": True, "status_code": 200, "message": "reachable"},
+    )
+    assert repo.VERSION == "1.0"
+    assert repo.TTL_SECONDS == 15 * 60
+    assert repo.is_fresh("SPY") is False
+    first = repo.get_data("SPY", "2026-10-16")
+    assert calls["n"] == 1
+    assert list(first["ticker"]) == ["SPY"]
+    assert repo.is_fresh("SPY") is True
+    second = repo.get_data("SPY", "2026-10-16")
+    assert calls["n"] == 1
+    assert len(second.index) == 1
+    assert repo.get_api_status()["ok"] is True
+    path = tmp_path / "SPY.json"
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["version"] = "0.9"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    assert repo.is_fresh("SPY") is False
+    repo.save_to_cache("SPY", pd.DataFrame({"ticker": ["SPY"]}))
+    stale = json.loads(path.read_text(encoding="utf-8"))
+    stale["saved_at"] = time.time() - repo.TTL_SECONDS - 1
+    path.write_text(json.dumps(stale), encoding="utf-8")
+    assert repo.is_fresh("SPY") is False
+    curve = generate_greek_curve("SPY", 100.0, 1.0, [90.0, 110.0], repo=repo)
+    assert not curve.empty
+    assert "Delta" in curve.columns
+
+
+def test_generate_greek_curve_uses_injected_repo() -> None:
+    class _Repo:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, Any]] = []
+
+        def get_data(self, ticker: str, expiry: Any = None) -> pd.DataFrame:
+            self.calls.append((ticker, expiry))
+            return pd.DataFrame()
+
+    repo = _Repo()
+    frame = generate_greek_curve("QQQ", 100.0, 1.0, [100.0], repo=repo)
+    assert repo.calls == [("QQQ", 1.0)]
+    assert "Gamma" in frame.columns

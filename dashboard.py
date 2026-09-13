@@ -13,11 +13,7 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from data_ingestion import (
-    fetch_option_chain,
     get_available_expirations,
-    get_available_strikes,
-    get_contract_iv,
-    get_current_price,
 )
 from quant_engine import (
     DAYS_PER_YEAR,
@@ -28,10 +24,12 @@ from quant_engine import (
     DEFAULT_HESTON_V0,
     DEFAULT_RATE,
     DEFAULT_SIGMA,
+    CONCENTRATION_WARN_PCT,
     EVENT_INSUFFICIENT_COVERAGE,
     GAMMA_FLIP_NEAR_PCT,
     MODEL_BLACK_SCHOLES,
     MODEL_HESTON,
+    DataRepository,
     analyze_event_outlook,
     analyze_gex_outlook,
     analyze_market_sentiment,
@@ -39,6 +37,7 @@ from quant_engine import (
     calculate_charm,
     calculate_color,
     calculate_gamma_theta_ratio,
+    calculate_portfolio_risk,
     calculate_speed,
     calculate_ultima,
     calculate_vanna,
@@ -54,10 +53,83 @@ from quant_engine import (
     generate_vol_surface_data,
 )
 
+DATA_REPO = DataRepository()
+
 PAGE_TITLE = "DatAi"
 DEFAULT_TICKER = "SPY"
 GREEK_COLUMNS = ("Delta", "Gamma", "Theta", "Vega", "Rho")
 CHART_ROWS = (("Delta", "Gamma"), ("Theta", "Vega"), ("Rho",))
+PORTFOLIO_COLUMNS = (
+    "Ticker",
+    "Strike",
+    "Expiry",
+    "Side",
+    "Quantity",
+    "option_type",
+    "S",
+    "sigma",
+    "premium",
+)
+
+
+def _empty_portfolio_positions() -> pd.DataFrame:
+    return pd.DataFrame(
+        {
+            "Ticker": pd.Series([""], dtype="string"),
+            "Strike": pd.Series([np.nan], dtype="float64"),
+            "Expiry": pd.Series([""], dtype="string"),
+            "Side": pd.Series(["long"], dtype="string"),
+            "Quantity": pd.Series([1.0], dtype="float64"),
+            "option_type": pd.Series(["call"], dtype="string"),
+            "S": pd.Series([np.nan], dtype="float64"),
+            "sigma": pd.Series([float(DEFAULT_SIGMA)], dtype="float64"),
+            "premium": pd.Series([np.nan], dtype="float64"),
+        }
+    )
+
+
+def _normalize_portfolio_frame(frame: pd.DataFrame) -> pd.DataFrame:
+    if frame is None or not isinstance(frame, pd.DataFrame) or frame.empty:
+        return _empty_portfolio_positions()
+    out = frame.copy()
+    rename = {}
+    lookup = {str(col).strip().lower(): col for col in out.columns}
+    aliases = {
+        "ticker": "Ticker",
+        "symbol": "Ticker",
+        "underlying": "Ticker",
+        "strike": "Strike",
+        "k": "Strike",
+        "expiry": "Expiry",
+        "expiration": "Expiry",
+        "side": "Side",
+        "quantity": "Quantity",
+        "qty": "Quantity",
+        "contracts": "Quantity",
+        "option_type": "option_type",
+        "type": "option_type",
+        "s": "S",
+        "spot": "S",
+        "underlyingprice": "S",
+        "sigma": "sigma",
+        "iv": "sigma",
+        "impliedvolatility": "sigma",
+        "premium": "premium",
+        "lastprice": "premium",
+        "mark": "premium",
+    }
+    for key, dest in aliases.items():
+        if dest not in out.columns and key in lookup:
+            rename[lookup[key]] = dest
+    if rename:
+        out = out.rename(columns=rename)
+    for column in PORTFOLIO_COLUMNS:
+        if column not in out.columns:
+            template = _empty_portfolio_positions()[column]
+            out[column] = template.iloc[0]
+    return out.loc[:, list(PORTFOLIO_COLUMNS)]
+
+
 CSV_COLUMNS = ("Price", "Delta", "Gamma", "Theta", "Vega", "IV")
 GREEK_COLORS = {
     "Delta": "#58a6ff",
@@ -139,12 +211,31 @@ def _init_state() -> None:
         "run_heston_pro_surface": False,
         "pro_metric_choice": "Vanna",
         "pro_surface_smoothing": False,
+        "portfolio_csv_sig": None,
     }
     for key, value in defaults.items():
         if key not in st.session_state:
             st.session_state[key] = value
     if not str(st.session_state.ticker).strip():
         st.session_state.ticker = DEFAULT_TICKER
+    if "portfolio_positions" not in st.session_state or not isinstance(st.session_state.portfolio_positions, pd.DataFrame):
+        st.session_state.portfolio_positions = _empty_portfolio_positions()
+    if "data_repo" not in st.session_state:
+        st.session_state.data_repo = DATA_REPO
+
+
+def _get_repo() -> DataRepository:
+    if "data_repo" not in st.session_state or st.session_state.data_repo is None:
+        st.session_state.data_repo = DATA_REPO
+    return st.session_state.data_repo
+
+
+def _api_status_ok(status: Any) -> bool:
+    if status is False or status is None:
+        return False
+    if isinstance(status, dict):
+        return bool(status.get("ok"))
+    return bool(status)
 
 
 def _apply_theme() -> None:
@@ -246,10 +337,25 @@ def _price_range(spot: float, span: float = PRICE_SPAN, n: int = CURVE_POINTS) -
     return tuple(float(x) for x in np.linspace(lo, hi, max(int(n), 200)))
 
 
-@st.cache_data(ttl=60, show_spinner="Loading last price…")
+def _repo_chain(ticker: str, expiry: Any = None) -> pd.DataFrame:
+    repo = _get_repo()
+    symbol = str(ticker or "").strip().upper()
+    if not repo.is_fresh(symbol):
+        return repo.get_data(symbol, expiry)
+    return repo.get_data(symbol, expiry)
+
+
 def cached_current_price(ticker: str) -> float | None:
     try:
-        return get_current_price(ticker)
+        frame = _repo_chain(ticker)
+        for column in ("underlyingPrice", "S", "Price"):
+            if column not in frame.columns:
+                continue
+            spots = pd.to_numeric(frame[column], errors="coerce")
+            spots = spots.loc[spots > 0]
+            if not spots.empty:
+                return float(spots.iloc[0])
+        return None
     except Exception:
         return None
 
@@ -262,18 +368,46 @@ def cached_available_expirations(ticker: str) -> list[str]:
         return []
 
 
-@st.cache_data(ttl=300, show_spinner="Loading listed strikes…")
 def cached_available_strikes(ticker: str, expiry: str) -> list[float]:
     try:
-        return list(get_available_strikes(ticker, expiry) or [])
+        frame = _repo_chain(ticker, expiry)
+        for column in ("strike", "K", "Strike"):
+            if column not in frame.columns:
+                continue
+            strikes = pd.to_numeric(frame[column], errors="coerce").dropna()
+            strikes = strikes.loc[strikes > 0]
+            if not strikes.empty:
+                return sorted({float(value) for value in strikes.tolist()})
+        return []
     except Exception:
         return []
 
 
-@st.cache_data(ttl=60, show_spinner="Loading contract IV…")
 def cached_contract_iv(ticker: str, expiry: str, strike: float, option_type: str) -> float | None:
     try:
-        return get_contract_iv(ticker, expiry, strike, option_type)
+        frame = _repo_chain(ticker, expiry)
+        if frame.empty:
+            return None
+        k_col = next((c for c in ("strike", "K", "Strike") if c in frame.columns), None)
+        iv_col = next((c for c in ("impliedVolatility", "IV", "sigma", "iv") if c in frame.columns), None)
+        if k_col is None or iv_col is None:
+            return None
+        work = frame.copy()
+        work["_k"] = pd.to_numeric(work[k_col], errors="coerce")
+        work["_iv"] = pd.to_numeric(work[iv_col], errors="coerce")
+        work = work.dropna(subset=["_k", "_iv"])
+        work = work.loc[work["_iv"] > 0]
+        if work.empty:
+            return None
+        want = str(option_type).strip().lower()
+        type_col = next((c for c in ("option_type", "type") if c in work.columns), None)
+        if type_col is not None:
+            text = work[type_col].astype(str).str.strip().str.lower()
+            typed = work.loc[text.str.startswith(want[:1])]
+            if not typed.empty:
+                work = typed
+        idx = (work["_k"] - float(strike)).abs().idxmin()
+        return float(work.loc[idx, "_iv"])
     except Exception:
         return None
 
@@ -323,6 +457,7 @@ def cached_greek_curve(
         theta=theta,
         heston_sigma=heston_sigma,
         rho=rho,
+        repo=DATA_REPO,
     )
 
 
@@ -705,10 +840,7 @@ def _sidebar_inputs() -> tuple[str, float, date, float, str, bool, Any]:
         if refresh:
             _clear_persisted_results()
             cached_greek_curve.clear()
-            cached_available_strikes.clear()
             cached_available_expirations.clear()
-            cached_current_price.clear()
-            cached_contract_iv.clear()
             cached_gamma_surface.clear()
             cached_greek_surface.clear()
             cached_delta_term_structure.clear()
@@ -716,7 +848,6 @@ def _sidebar_inputs() -> tuple[str, float, date, float, str, bool, Any]:
             cached_vol_surface.clear()
             cached_pro_surface.clear()
             cached_pro_curve.clear()
-            cached_analyst_chain.clear()
             cached_market_sentiment.clear()
             cached_gex_outlook.clear()
             cached_vol_risk_outlook.clear()
@@ -1256,25 +1387,16 @@ def cached_vol_surface(ticker: str) -> pd.DataFrame | str:
     return generate_vol_surface_data(ticker)
 
 
-@st.cache_data(ttl=120, show_spinner="Loading option chain for analyst…")
 def cached_analyst_chain(ticker: str) -> pd.DataFrame:
-    frames: list[pd.DataFrame] = []
     try:
         expiries = list(get_available_expirations(ticker) or [])
     except Exception:
         expiries = []
+    expiry = expiries[0] if expiries else None
     try:
-        if not expiries:
-            frames.append(fetch_option_chain(ticker))
-        else:
-            for expiry in expiries[:8]:
-                frames.append(fetch_option_chain(ticker, expiry))
+        return _repo_chain(ticker, expiry)
     except Exception:
         return pd.DataFrame()
-    frames = [frame for frame in frames if isinstance(frame, pd.DataFrame) and not frame.empty]
-    if not frames:
-        return pd.DataFrame()
-    return pd.concat(frames, ignore_index=True)
 
 
 @st.cache_data(ttl=120, show_spinner="Scoring market sentiment…")
@@ -1299,6 +1421,11 @@ def cached_event_outlook(ticker: str, selected_expiry: str = "") -> dict[str, An
         ticker=ticker,
         selected_expiry=selected_expiry or None,
     )
+
+
+@st.cache_data(ttl=120, show_spinner="Scoring portfolio risk…")
+def cached_portfolio_risk(positions: pd.DataFrame) -> dict[str, Any]:
+    return calculate_portfolio_risk(positions)
 
 
 def _format_iv_metric(value: Any) -> str:
@@ -1699,6 +1826,98 @@ def add_market_analyst_tab(tab: Any, ticker: str, current_price: float = 0.0, ex
                 )
 
 
+def _format_greek_metric(value: Any) -> str:
+    if value is None:
+        return "—"
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return "—"
+    if not np.isfinite(number):
+        return "—"
+    return f"{number:,.2f}"
+
+
+def add_portfolio_risk_tab(tab: Any) -> None:
+    with tab:
+        st.subheader("Portfolio & Risk")
+        uploaded = st.file_uploader("Positions CSV", type="csv", key="portfolio_csv")
+        if uploaded is not None:
+            signature = (str(uploaded.name), int(getattr(uploaded, "size", 0) or 0))
+            if st.session_state.get("portfolio_csv_sig") != signature:
+                try:
+                    parsed = pd.read_csv(uploaded)
+                except Exception as error:
+                    st.exception(error)
+                    parsed = None
+                if parsed is not None:
+                    st.session_state.portfolio_positions = _normalize_portfolio_frame(parsed)
+                    st.session_state.portfolio_csv_sig = signature
+                    st.session_state.pop("portfolio_editor", None)
+        positions = _normalize_portfolio_frame(st.session_state.portfolio_positions)
+        edited = st.data_editor(
+            positions,
+            num_rows="dynamic",
+            hide_index=True,
+            width="stretch",
+            key="portfolio_editor",
+            column_config={
+                "Ticker": st.column_config.TextColumn("Ticker"),
+                "Strike": st.column_config.NumberColumn("Strike", format="%.2f"),
+                "Expiry": st.column_config.TextColumn("Expiry"),
+                "Side": st.column_config.SelectboxColumn("Side", options=["long", "short"]),
+                "Quantity": st.column_config.NumberColumn("Quantity", format="%.2f"),
+                "option_type": st.column_config.SelectboxColumn("Type", options=["call", "put"]),
+                "S": st.column_config.NumberColumn("Spot", format="%.2f"),
+                "sigma": st.column_config.NumberColumn("IV", format="%.4f"),
+                "premium": st.column_config.NumberColumn("Premium", format="%.2f"),
+            },
+        )
+        st.session_state.portfolio_positions = edited
+        book = edited.copy()
+        if "Ticker" in book.columns:
+            book = book[book["Ticker"].astype(str).str.strip().ne("")]
+        if "Strike" in book.columns:
+            strikes = pd.to_numeric(book["Strike"], errors="coerce")
+            book = book[strikes.notna() & (strikes > 0)]
+        if book.empty:
+            st.info("Add positions in the table or upload a CSV to score portfolio risk.")
+            return
+        try:
+            risk = cached_portfolio_risk(book)
+        except Exception as error:
+            st.exception(error)
+            return
+        with st.container(horizontal=True):
+            st.metric("Net Delta", _format_greek_metric(risk.get("Delta")), border=True)
+            st.metric("Net Gamma", _format_greek_metric(risk.get("Gamma")), border=True)
+            st.metric("Net Theta", _format_greek_metric(risk.get("Theta")), border=True)
+            st.metric("Net Vega", _format_greek_metric(risk.get("Vega")), border=True)
+        concentration = risk.get("TickerConcentration")
+        if concentration is None:
+            concentration = risk.get("LargestPosition")
+        try:
+            conc_pct = float(concentration) if concentration is not None else float("nan")
+        except (TypeError, ValueError):
+            conc_pct = float("nan")
+        if np.isfinite(conc_pct) and conc_pct > CONCENTRATION_WARN_PCT:
+            name = str(risk.get("ConcentratedTicker") or "one ticker")
+            st.warning(
+                f"Concentration risk: {name} is {conc_pct:.0f}% of your portfolio "
+                f"(above {CONCENTRATION_WARN_PCT:.0f}%)."
+            )
+        delta_rows = risk.get("DeltaByTicker") or []
+        delta_frame = pd.DataFrame(delta_rows)
+        if delta_frame.empty or "Ticker" not in delta_frame.columns or "Delta" not in delta_frame.columns:
+            st.info("No ticker-level delta exposure to chart.")
+            return
+        delta_frame["Delta"] = pd.to_numeric(delta_frame["Delta"], errors="coerce")
+        delta_frame = delta_frame.dropna(subset=["Ticker", "Delta"])
+        with st.container(border=True):
+            st.markdown("**Delta exposure by ticker**")
+            st.bar_chart(delta_frame, x="Ticker", y="Delta", color="#58a6ff", width="stretch")
+
+
 def render_vol_surface(frame: pd.DataFrame | str) -> None:
     try:
         if isinstance(frame, str):
@@ -1999,6 +2218,8 @@ def main() -> None:
     )
     _init_state()
     _apply_theme()
+    if not _api_status_ok(_get_repo().get_api_status()):
+        st.error("API Service Unavailable")
 
     ticker, strike, expiry, current_price, option_type, _refresh, download_slot = _sidebar_inputs()
     ticker = ticker.strip().upper() or DEFAULT_TICKER
@@ -2097,8 +2318,9 @@ def main() -> None:
         "Volatility Surface",
         "Pro Metrics",
         "Market Analyst",
+        "Portfolio & Risk",
     ]
-    greeks_tab, advanced_tab, surface_tab, time_tab, vol_tab, pro_tab, analyst_tab = st.tabs(
+    greeks_tab, advanced_tab, surface_tab, time_tab, vol_tab, pro_tab, analyst_tab, portfolio_tab = st.tabs(
         tab_labels,
         on_change="rerun",
         key="main_view_tabs",
@@ -2257,6 +2479,9 @@ def main() -> None:
 
     if analyst_tab.open:
         add_market_analyst_tab(analyst_tab, ticker, float(current_price), expiry)
+
+    if portfolio_tab.open:
+        add_portfolio_risk_tab(portfolio_tab)
 
 
 if __name__ == "__main__":

@@ -2,10 +2,15 @@
 
 from __future__ import annotations
 
+import json
 import logging
+import os
+import tempfile
+import time
 from datetime import date, datetime, timedelta, timezone
 from functools import lru_cache
-from typing import Any, Iterable, Mapping
+from pathlib import Path
+from typing import Any, Callable, Iterable, Mapping
 
 import numpy as np
 import pandas as pd
@@ -43,6 +48,7 @@ EVENT_MEDIUM_DTE = 60.0
 EVENT_LIQUID_DTE = 30.0
 EVENT_IV_RATIO = 1.2
 EVENT_INSUFFICIENT_COVERAGE = "Insufficient expiration coverage for term structure analysis"
+CONCENTRATION_WARN_PCT = 30.0
 _LOG = logging.getLogger("datiai.quant")
 MODEL_BLACK_SCHOLES = "black-scholes"
 MODEL_HESTON = "heston"
@@ -578,6 +584,131 @@ def calculate_heston_greeks(option_data: Mapping[str, Any]) -> dict[str, float |
     return result
 
 
+class DataRepository:
+    """TTL-backed JSON cache for option-chain frames, with atomic writes."""
+
+    VERSION = "1.0"
+    TTL_SECONDS = 15 * 60
+
+    def __init__(
+        self,
+        cache_dir: str | Path | None = None,
+        fetcher: Callable[[str, Any], pd.DataFrame] | None = None,
+        status_probe: Callable[[], dict[str, Any]] | None = None,
+    ) -> None:
+        root = Path(cache_dir) if cache_dir is not None else Path(__file__).resolve().parent / "cache" / "marketdata"
+        self.cache_dir = root
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self._fetcher = fetcher
+        self._status_probe = status_probe
+
+    def _cache_path(self, ticker: str) -> Path:
+        symbol = str(ticker or "").strip().upper() or "_"
+        safe = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in symbol)
+        return self.cache_dir / f"{safe}.json"
+
+    def _read_payload(self, ticker: str) -> dict[str, Any] | None:
+        path = self._cache_path(ticker)
+        if not path.is_file():
+            return None
+        try:
+            with path.open("r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+        except (OSError, ValueError, TypeError):
+            return None
+        if not isinstance(payload, dict):
+            return None
+        return payload
+
+    def is_fresh(self, ticker: str) -> bool:
+        payload = self._read_payload(ticker)
+        if not payload:
+            return False
+        if str(payload.get("version") or "") != self.VERSION:
+            return False
+        try:
+            saved_at = float(payload.get("saved_at"))
+        except (TypeError, ValueError):
+            return False
+        return (time.time() - saved_at) < float(self.TTL_SECONDS)
+
+    def save_to_cache(self, ticker: str, data: Any) -> Path:
+        path = self._cache_path(ticker)
+        if isinstance(data, pd.DataFrame):
+            records = json.loads(data.to_json(orient="records", date_format="iso"))
+        elif isinstance(data, dict) and "data" in data:
+            records = data.get("data")
+        else:
+            records = data
+        payload = {
+            "version": self.VERSION,
+            "ticker": str(ticker or "").strip().upper(),
+            "saved_at": time.time(),
+            "data": records,
+        }
+        fd, tmp_name = tempfile.mkstemp(suffix=".json", dir=str(self.cache_dir))
+        os.close(fd)
+        try:
+            with open(tmp_name, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle, allow_nan=True)
+            os.replace(tmp_name, path)
+        except Exception:
+            try:
+                os.remove(tmp_name)
+            except OSError:
+                pass
+            raise
+        return path
+
+    def get_data(self, ticker: str, expiry: Any = None) -> pd.DataFrame:
+        if self.is_fresh(ticker):
+            payload = self._read_payload(ticker) or {}
+            records = payload.get("data") or []
+            return pd.DataFrame(records)
+        frame = self._fetch(ticker, expiry)
+        if isinstance(frame, pd.DataFrame) and not frame.empty:
+            self.save_to_cache(ticker, frame)
+        return frame if isinstance(frame, pd.DataFrame) else pd.DataFrame()
+
+    def get_api_status(self) -> dict[str, Any]:
+        if self._status_probe is not None:
+            try:
+                result = self._status_probe()
+            except Exception as exc:
+                return {"ok": False, "status_code": None, "message": str(exc)}
+            if isinstance(result, dict):
+                return result
+            return {"ok": bool(result), "status_code": None, "message": str(result)}
+        try:
+            import requests
+            from data_ingestion import API_BASE, _headers
+
+            response = requests.get(f"{API_BASE.rstrip('/')}/", headers=_headers(), timeout=8)
+            ok = int(response.status_code) < 500
+            return {
+                "ok": ok,
+                "status_code": int(response.status_code),
+                "message": "reachable" if ok else f"HTTP {response.status_code}",
+            }
+        except Exception as exc:
+            return {"ok": False, "status_code": None, "message": str(exc)}
+
+    def _fetch(self, ticker: str, expiry: Any) -> pd.DataFrame:
+        if self._fetcher is not None:
+            try:
+                return self._fetcher(ticker, expiry)
+            except Exception as exc:
+                _LOG.warning("DataRepository fetch failed ticker=%s expiry=%s error=%s", ticker, expiry, exc)
+                return pd.DataFrame()
+        try:
+            from data_ingestion import fetch_option_chain
+
+            return fetch_option_chain(ticker, expiry)
+        except Exception as exc:
+            _LOG.warning("DataRepository fetch failed ticker=%s expiry=%s error=%s", ticker, expiry, exc)
+            return pd.DataFrame()
+
+
 def generate_greek_curve(
     ticker: str,
     strike: float,
@@ -594,12 +725,27 @@ def generate_greek_curve(
     theta: float = DEFAULT_HESTON_THETA,
     heston_sigma: float = DEFAULT_HESTON_SIGMA,
     rho: float = DEFAULT_HESTON_RHO,
+    repo: DataRepository | None = None,
 ) -> pd.DataFrame:
     """Build a vectorized Price vs Greeks curve for a Streamlit dashboard.
 
     ``model`` is ``black-scholes`` or ``heston``. Heston uses the same dense
     ``price_range`` grid as Black–Scholes (no down-sampling).
+    Market data is loaded through ``repo`` when provided; this function does
+    not fetch the chain itself.
     """
+    if repo is not None:
+        chain = repo.get_data(ticker, expiry)
+        if isinstance(chain, pd.DataFrame) and not chain.empty:
+            iv_series = None
+            for name in ("impliedVolatility", "IV", "sigma", "iv"):
+                if name in chain.columns:
+                    iv_series = pd.to_numeric(chain[name], errors="coerce")
+                    break
+            if iv_series is not None:
+                iv_mean = float(iv_series[np.isfinite(iv_series.to_numpy(dtype=np.float64))].mean()) if iv_series.notna().any() else float("nan")
+                if (sigma is None or not np.isfinite(float(sigma if sigma is not None else float("nan")))) and np.isfinite(iv_mean) and iv_mean > SIGMA_MIN:
+                    sigma = iv_mean
     del ticker
     raw = pd.to_numeric(pd.Series(list(price_range), dtype="object"), errors="coerce").to_numpy(dtype=np.float64)
     spots = _dense_grid(raw, CURVE_RESOLUTION)
@@ -2247,4 +2393,219 @@ def analyze_event_outlook(
         "ShortIV": short_iv,
         "MediumIV": medium_iv if np.isfinite(medium_iv) else None,
         "LongIV": long_iv if np.isfinite(long_iv) else None,
+    }
+
+
+def _portfolio_empty() -> dict[str, Any]:
+    return {
+        "Delta": 0.0,
+        "Gamma": 0.0,
+        "Theta": 0.0,
+        "Vega": 0.0,
+        "LargestPosition": None,
+        "TickerConcentration": None,
+        "ConcentratedTicker": None,
+        "DaysToExpiration": None,
+        "DeltaByTicker": [],
+    }
+
+
+def _black_scholes_price(
+    spot: float,
+    strike: float,
+    time_years: float,
+    rate: float,
+    sigma: float,
+    is_put: bool,
+    dividend: float = 0.0,
+) -> float:
+    if not (
+        np.isfinite(spot)
+        and spot > 0
+        and np.isfinite(strike)
+        and strike > 0
+        and np.isfinite(time_years)
+        and time_years >= T_MIN
+        and np.isfinite(rate)
+        and np.isfinite(sigma)
+        and sigma >= SIGMA_MIN
+    ):
+        return float("nan")
+    sqrt_t = np.sqrt(time_years)
+    d1 = (np.log(spot / strike) + (rate - dividend + 0.5 * sigma * sigma) * time_years) / (sigma * sqrt_t)
+    d2 = d1 - sigma * sqrt_t
+    disc_q = np.exp(-dividend * time_years)
+    disc_r = np.exp(-rate * time_years)
+    if is_put:
+        return float(strike * disc_r * norm.cdf(-d2) - spot * disc_q * norm.cdf(-d1))
+    return float(spot * disc_q * norm.cdf(d1) - strike * disc_r * norm.cdf(d2))
+
+
+def _position_signed_qty(side: Any, quantity: float) -> float:
+    qty = float(quantity) if np.isfinite(quantity) else 0.0
+    text = str(side or "").strip().lower()
+    if text in {"short", "sell", "written", "write", "s"} or (text.startswith("short") or text.startswith("sell")):
+        return -abs(qty)
+    if text in {"long", "buy", "bought", "l"} or text.startswith("long") or text.startswith("buy"):
+        return abs(qty)
+    return qty
+
+
+def _position_is_put(side: Any, option_type: Any) -> bool:
+    for raw in (option_type, side):
+        text = str(raw or "").strip().lower()
+        if text.startswith("p") and text not in {"premium"}:
+            return True
+        if text.startswith("c") and text not in {"contracts"}:
+            return False
+    return False
+
+
+def calculate_portfolio_risk(positions_df: pd.DataFrame | None) -> dict[str, Any]:
+    """Net Delta, Gamma, Theta, Vega, concentration, and nearest DTE for a book.
+
+    Each row is a position with strike, expiry, side, and quantity. Short/sell
+    sides flip the signed quantity. Greeks are per-share Black–Scholes values
+    times contracts times ``OPTIONS_CONTRACT_SIZE``. Concentration is the
+    largest |premium| share of total |premium|. Liquidity is the smallest
+    positive days-to-expiry in the book.
+
+    Args:
+        positions_df: Positions with Strike/Expiry/Side/Quantity and optional
+            S, sigma, premium, and option_type.
+
+    Returns:
+        Dict with ``Delta``, ``Gamma``, ``Theta``, ``Vega``, ``LargestPosition``
+        (percent), ``TickerConcentration`` (percent), ``DaysToExpiration``,
+        and ``DeltaByTicker``.
+    """
+    if positions_df is None or not isinstance(positions_df, pd.DataFrame) or positions_df.empty:
+        return _portfolio_empty()
+    n = len(positions_df.index)
+    strike_col = _sentiment_column(positions_df, "Strike", "strike", "K")
+    expiry_col = _sentiment_column(positions_df, "Expiry", "expiry", "expiration", "Expiration")
+    side_col = _sentiment_column(positions_df, "Side", "side")
+    qty_col = _sentiment_column(positions_df, "Quantity", "quantity", "qty", "contracts")
+    type_col = _sentiment_column(positions_df, "option_type", "type", "Type")
+    spot_col = _sentiment_column(positions_df, "S", "spot", "underlyingPrice", "Price")
+    sigma_col = _sentiment_column(positions_df, "sigma", "impliedVolatility", "IV")
+    rate_col = _sentiment_column(positions_df, "r", "rate")
+    prem_col = _sentiment_column(positions_df, "premium", "lastPrice", "mark", "mid", "option_price")
+    t_col = _sentiment_column(positions_df, "T")
+    dte_col = _sentiment_column(positions_df, "DaysToExpiry", "dte", "days_to_expiry")
+    size_col = _sentiment_column(positions_df, "contractSize", "multiplier", "contract_size")
+    ticker_col = _sentiment_column(positions_df, "Ticker", "ticker", "symbol", "underlying")
+
+    def _num(col: pd.Series | None, default: float = float("nan")) -> np.ndarray:
+        if col is None:
+            return np.full(n, default, dtype=np.float64)
+        return pd.to_numeric(col, errors="coerce").to_numpy(dtype=np.float64)
+
+    strikes = _num(strike_col)
+    spots = _num(spot_col)
+    sigmas = _num(sigma_col, DEFAULT_SIGMA)
+    rates = _num(rate_col, DEFAULT_RATE)
+    qtys = _num(qty_col, 0.0)
+    premiums = _num(prem_col)
+    sizes = _num(size_col, float(OPTIONS_CONTRACT_SIZE))
+    sizes = np.where(np.isfinite(sizes) & (sizes > 0), sizes, float(OPTIONS_CONTRACT_SIZE))
+    tenors = _num(t_col)
+    dtes = _num(dte_col)
+    sides = side_col.astype(str).tolist() if side_col is not None else [""] * n
+    types = type_col.astype(str).tolist() if type_col is not None else [None] * n
+    expiries = expiry_col.tolist() if expiry_col is not None else [None] * n
+    if ticker_col is None:
+        tickers = np.array(["?"] * n, dtype=object)
+    else:
+        tickers = ticker_col.astype(str).str.strip().str.upper().to_numpy(dtype=object)
+        tickers = np.where(pd.notna(ticker_col) & (tickers != "") & (tickers != "NAN"), tickers, "?")
+
+    missing_t = ~np.isfinite(tenors) | (tenors <= 0)
+    if np.any(missing_t) and expiry_col is not None:
+        for i in np.flatnonzero(missing_t):
+            years = _time_to_expiry_years(expiries[i])
+            if np.isfinite(years) and years > 0:
+                tenors[i] = years
+    missing_dte = ~np.isfinite(dtes) | (dtes <= 0)
+    dtes = np.where(missing_dte & np.isfinite(tenors) & (tenors > 0), tenors * DAYS_PER_YEAR, dtes)
+    if np.any(missing_dte) and expiry_col is not None:
+        for i in np.flatnonzero(~np.isfinite(dtes) | (dtes <= 0)):
+            iso = _normalize_expiry_iso(expiries[i])
+            if iso:
+                dtes[i] = _expiry_days_to_go(iso)
+
+    net_delta = 0.0
+    net_gamma = 0.0
+    net_theta = 0.0
+    net_vega = 0.0
+    notionals = np.zeros(n, dtype=np.float64)
+    delta_rows = np.zeros(n, dtype=np.float64)
+    for i in range(n):
+        signed = _position_signed_qty(sides[i], qtys[i])
+        is_put = _position_is_put(sides[i], types[i])
+        multiplier = float(sizes[i]) * signed
+        greeks = calculate_greeks(
+            {
+                "S": spots[i],
+                "K": strikes[i],
+                "T": tenors[i],
+                "r": rates[i],
+                "sigma": sigmas[i],
+                "option_type": "put" if is_put else "call",
+            }
+        )
+        if greeks.get("Delta") is not None:
+            contribution = float(greeks["Delta"]) * multiplier
+            net_delta += contribution
+            delta_rows[i] = contribution
+        if greeks.get("Gamma") is not None:
+            net_gamma += float(greeks["Gamma"]) * multiplier
+        if greeks.get("Theta") is not None:
+            net_theta += float(greeks["Theta"]) * multiplier
+        if greeks.get("Vega") is not None:
+            net_vega += float(greeks["Vega"]) * multiplier
+        prem = premiums[i]
+        if not np.isfinite(prem) or prem < 0:
+            prem = _black_scholes_price(
+                float(spots[i]),
+                float(strikes[i]),
+                float(tenors[i]),
+                float(rates[i]),
+                float(sigmas[i]),
+                is_put,
+            )
+        if np.isfinite(prem):
+            notionals[i] = abs(float(prem) * abs(signed) * float(sizes[i]))
+
+    total_prem = float(np.nansum(notionals))
+    largest = None
+    ticker_conc = None
+    concentrated_ticker = None
+    if total_prem > 1e-12:
+        largest = float(100.0 * np.nanmax(notionals) / total_prem)
+        ticker_prem = pd.Series(notionals, dtype=np.float64).groupby(tickers, dropna=False).sum()
+        if not ticker_prem.empty:
+            ticker_conc = float(100.0 * float(ticker_prem.max()) / total_prem)
+            concentrated_ticker = str(ticker_prem.idxmax())
+    delta_by_ticker = (
+        pd.Series(delta_rows, dtype=np.float64)
+        .groupby(tickers, dropna=False)
+        .sum()
+        .rename("Delta")
+        .rename_axis("Ticker")
+        .reset_index()
+    )
+    delta_by_ticker["Ticker"] = delta_by_ticker["Ticker"].astype(str)
+    finite_dte = dtes[np.isfinite(dtes) & (dtes >= 0)]
+    nearest = float(np.min(finite_dte)) if finite_dte.size else None
+    return {
+        "Delta": float(net_delta),
+        "Gamma": float(net_gamma),
+        "Theta": float(net_theta),
+        "Vega": float(net_vega),
+        "LargestPosition": largest,
+        "TickerConcentration": ticker_conc,
+        "ConcentratedTicker": concentrated_ticker,
+        "DaysToExpiration": nearest,
+        "DeltaByTicker": delta_by_ticker.to_dict(orient="records"),
     }
