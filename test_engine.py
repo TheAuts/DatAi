@@ -12,8 +12,17 @@ from quant_engine import (
     DEFAULT_HESTON_SIGMA,
     DEFAULT_HESTON_THETA,
     DEFAULT_HESTON_V0,
+    MODEL_BLACK_SCHOLES,
+    MODEL_HESTON,
     calculate_greeks,
     calculate_heston_greeks,
+    calculate_ultima,
+    calculate_vanna,
+    calculate_veta,
+    calculate_volga,
+    calculate_vomma,
+    calculate_zomma,
+    generate_pro_surface_data,
 )
 
 STANDARD = {"S": 100.0, "K": 100.0, "T": 1.0, "r": 0.05, "sigma": 0.2, "option_type": "call"}
@@ -95,3 +104,80 @@ def test_calculate_heston_greeks_near_black_scholes() -> None:
     assert heston["Vega"] == pytest.approx(float(bs["Vega"]), rel=0.6, abs=0.25)
     assert heston["Rho"] == pytest.approx(float(bs["Rho"]), rel=0.5, abs=0.2)
     assert math.copysign(1.0, float(heston["Theta"])) == math.copysign(1.0, float(bs["Theta"]))
+
+
+PRO_FN = (calculate_vanna, calculate_vomma, calculate_zomma, calculate_veta, calculate_ultima)
+PRO_ATM = dict(S=100.0, K=100.0, T=1.0, r=0.05, sigma=0.2, model=MODEL_BLACK_SCHOLES)
+
+
+def test_pro_metrics_known_atm_call() -> None:
+    kwargs = {k: v for k, v in PRO_ATM.items() if k != "S"}
+    s, k, t, r, sigma = 100.0, 100.0, 1.0, 0.05, 0.2
+    sqrt_t = math.sqrt(t)
+    d1 = (math.log(s / k) + (r + 0.5 * sigma * sigma) * t) / (sigma * sqrt_t)
+    d2 = d1 - sigma * sqrt_t
+    n_d1 = math.exp(-0.5 * d1 * d1) / math.sqrt(2.0 * math.pi)
+    vega_raw = s * n_d1 * sqrt_t
+    gamma = n_d1 / (s * sigma * sqrt_t)
+    veta_day = vega_raw * (r * d1 / (sigma * sqrt_t) - (1.0 + d1 * d2) / (2.0 * t)) / 365.0
+    ultima = -vega_raw * (d1 * d2 * (1.0 - d1 * d2) + d1 * d1 + d2 * d2) / (sigma * sigma)
+    assert calculate_vanna(s, **kwargs) == pytest.approx(-n_d1 * d2 / sigma, rel=1e-10)
+    assert calculate_vomma(s, **kwargs) == pytest.approx(vega_raw * d1 * d2 / sigma, rel=1e-10)
+    assert calculate_volga(s, **kwargs) == pytest.approx(calculate_vomma(s, **kwargs))
+    assert calculate_zomma(s, **kwargs) == pytest.approx(gamma * (d1 * d2 - 1.0) / sigma, rel=1e-10)
+    assert calculate_veta(s, **kwargs) == pytest.approx(veta_day, rel=1e-10)
+    assert calculate_ultima(s, **kwargs) == pytest.approx(ultima, rel=1e-10)
+
+
+@pytest.mark.parametrize("fn", PRO_FN)
+@pytest.mark.parametrize("field,value", [("T", 0.0), ("sigma", 0.0), ("S", 0.0)])
+def test_pro_metrics_boundaries_no_div_zero(fn, field: str, value: float) -> None:
+    payload = dict(PRO_ATM)
+    payload[field] = value
+    s = payload.pop("S")
+    out = fn(s, **payload)
+    assert out is None or (isinstance(out, float) and math.isfinite(out))
+
+
+def test_pro_metrics_accept_model_and_vectorized_spot() -> None:
+    spots = [90.0, 100.0, 110.0]
+    kwargs = {k: v for k, v in PRO_ATM.items() if k != "S"}
+    for fn in PRO_FN:
+        bs = fn(spots, **kwargs)
+        assert len(bs) == 3
+        assert all(math.isfinite(float(x)) for x in bs)
+    heston = calculate_vanna(spots, **{**kwargs, "model": MODEL_HESTON, "v0": 0.04})
+    assert len(heston) == 3
+    assert all(x is None or math.isfinite(float(x)) for x in heston)
+
+
+def test_generate_pro_surface_data_grid() -> None:
+    frame = generate_pro_surface_data(
+        "SPY",
+        "zomma",
+        strike=100.0,
+        expiry_range=(30.0, 60.0),
+        price_range=(95.0, 100.0, 105.0),
+        sigma=0.2,
+        model=MODEL_BLACK_SCHOLES,
+    )
+    assert list(frame.columns) == ["Price", "DaysToExpiry", "Value"]
+    assert len(frame) == 6
+    assert frame["Value"].apply(lambda x: math.isfinite(float(x)) or math.isnan(float(x))).all()
+    assert not frame["Value"].apply(lambda x: math.isinf(float(x))).any()
+    kwargs = dict(
+        ticker="SPY",
+        greek_name="zomma",
+        strike=100.0,
+        expiry_range=(30.0, 60.0),
+        price_range=(90.0, 95.0, 100.0, 105.0, 110.0),
+        sigma=0.2,
+        model=MODEL_BLACK_SCHOLES,
+    )
+    raw = generate_pro_surface_data(**kwargs, apply_smoothing=False)
+    smooth = generate_pro_surface_data(**kwargs, apply_smoothing=True)
+    assert raw["Value"].equals(generate_pro_surface_data(**kwargs)["Value"])
+    assert list(smooth.columns) == ["Price", "DaysToExpiry", "Value"]
+    assert not raw.sort_values(["DaysToExpiry", "Price"]).reset_index(drop=True)["Value"].equals(
+        smooth.sort_values(["DaysToExpiry", "Price"]).reset_index(drop=True)["Value"]
+    )

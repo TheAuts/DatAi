@@ -123,7 +123,9 @@ def _init_state() -> None:
         "vol_surface_fp": None,
         "run_heston_gamma_surface": False,
         "run_heston_term": False,
-        "pro_metric_name": "Vanna",
+        "run_heston_pro_surface": False,
+        "pro_metric_choice": "Vanna",
+        "pro_surface_smoothing": False,
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -679,6 +681,7 @@ def _sidebar_inputs() -> tuple[str, float, date, float, str, bool, Any]:
             cached_vanna_volga.clear()
             cached_vol_surface.clear()
             cached_pro_surface.clear()
+            cached_pro_curve.clear()
             st.session_state.price_ticker = ""
             st.session_state.iv_fingerprint = None
             st.session_state.persisted_iv = None
@@ -1118,6 +1121,7 @@ def cached_pro_surface(
     theta: float,
     heston_sigma: float,
     rho: float,
+    apply_smoothing: bool = False,
 ) -> pd.DataFrame:
     return generate_pro_surface_data(
         ticker,
@@ -1134,6 +1138,7 @@ def cached_pro_surface(
         theta=theta,
         heston_sigma=heston_sigma,
         rho=rho,
+        apply_smoothing=bool(apply_smoothing),
     )
 
 
@@ -1153,7 +1158,7 @@ def cached_pro_curve(
     rho: float,
 ) -> pd.DataFrame:
     spots = np.asarray(prices, dtype="float64")
-    time_years = max((date.fromisoformat(expiry) - date.today()).days, 0) / DAYS_PER_YEAR
+    time_years = max((date.fromisoformat(expiry) - date.today()).days, 1) / DAYS_PER_YEAR
     kwargs = {
         "q": 0.0,
         "option_type": option_type,
@@ -1319,14 +1324,22 @@ def render_gamma_surface(frame: pd.DataFrame) -> None:
     )
 
 
-def render_pro_surface(frame: pd.DataFrame, greek_name: str) -> None:
+def render_pro_surface(frame: pd.DataFrame, greek_name: str, *, apply_smoothing: bool = False) -> None:
     required = {"Price", "DaysToExpiry", "Value"}
     if frame.empty or not required.issubset(frame.columns):
         st.info(f"No {greek_name} surface data to plot.")
         return
-    pivot = frame.pivot_table(index="DaysToExpiry", columns="Price", values="Value", aggfunc="mean")
+    plot = frame.loc[:, ["Price", "DaysToExpiry", "Value"]].copy()
+    plot["Price"] = pd.to_numeric(plot["Price"], errors="coerce")
+    plot["DaysToExpiry"] = pd.to_numeric(plot["DaysToExpiry"], errors="coerce")
+    plot["Value"] = pd.to_numeric(plot["Value"], errors="coerce")
+    plot = plot.replace([np.inf, -np.inf], np.nan).dropna(subset=["Price", "DaysToExpiry"])
+    if plot.empty or not plot["Value"].notna().any():
+        st.info(f"No {greek_name} surface data to plot.")
+        return
+    pivot = plot.pivot_table(index="DaysToExpiry", columns="Price", values="Value", aggfunc="mean")
     pivot = pivot.sort_index().sort_index(axis=1)
-    z = pivot.to_numpy(dtype=float)
+    z = np.array(pivot.to_numpy(dtype=float), copy=True)
     z[~np.isfinite(z)] = np.nan
     fig = go.Figure(
         data=[
@@ -1355,13 +1368,15 @@ def render_pro_surface(frame: pd.DataFrame, greek_name: str) -> None:
             "dragmode": "orbit",
         },
         margin={"l": 8, "r": 8, "t": 48, "b": 8},
-        uirevision=f"pro-surface-{greek_name}",
+        uirevision=f"pro-surface-{greek_name}-{int(bool(apply_smoothing))}",
     )
     st.plotly_chart(
         fig,
         width="stretch",
+        height=560,
+        theme=None,
         config={"displayModeBar": True, "scrollZoom": True},
-        key=f"pro-surface-chart-{greek_name}",
+        key=f"pro-surface-chart-{greek_name}-{int(bool(apply_smoothing))}",
     )
 
 
@@ -1404,6 +1419,8 @@ def render_pro_line(frame: pd.DataFrame, greek_name: str) -> None:
     st.plotly_chart(
         fig,
         width="stretch",
+        height=340,
+        theme=None,
         config={"displayModeBar": True},
         key=f"pro-line-chart-{greek_name}",
     )
@@ -1425,26 +1442,45 @@ def add_pro_metrics_tab(
     rho: float,
 ) -> None:
     with tab:
-        greek_name = st.radio(
+        greek_name = st.segmented_control(
             "Pro metric",
-            options=("Vanna", "Vomma", "Zomma", "Veta", "Ultima"),
-            horizontal=True,
-            key="pro_metric_name",
-            help="Third-order and mixed Greeks on a price × days-to-expiry grid.",
+            options=PRO_METRICS,
+            key="pro_metric_choice",
+            required=True,
+            help=PRO_METRIC_HELP,
         )
+        if greek_name not in PRO_METRICS:
+            greek_name = "Vanna"
+        apply_smoothing = st.checkbox(
+            "Enable Surface Smoothing",
+            value=False,
+            key="pro_surface_smoothing",
+        )
+        st.caption(PRO_METRIC_HELP)
         dte = max((expiry - date.today()).days, 1)
         expiry_range = tuple(sorted({float(d) for d in range(7, 91, 7)} | {float(dte)}))
-        prices = tuple(
-            float(p)
-            for p in pd.to_numeric(frame["Price"], errors="coerce").dropna().tolist()[::4]
-        )
+        if frame is not None and not frame.empty and "Price" in frame.columns:
+            prices_all = tuple(
+                float(p) for p in pd.to_numeric(frame["Price"], errors="coerce").dropna().tolist()
+            )
+        else:
+            prices_all = ()
+        if len(prices_all) < 2:
+            prices_all = _price_range(float(strike))
+        prices_surface = prices_all[::4] if len(prices_all) > 12 else prices_all
+        surface_model = model
+        if model == MODEL_HESTON:
+            st.caption("Heston 3D is opt-in so the 2D curve can render first.")
+            if st.button("Build Heston pro surface", key="build_heston_pro_surface"):
+                st.session_state["run_heston_pro_surface"] = True
+            if not st.session_state.get("run_heston_pro_surface"):
+                surface_model = MODEL_BLACK_SCHOLES
         try:
-            pro_frame = cached_pro_surface(
-                ticker,
+            line_frame = cached_pro_curve(
+                prices_all,
                 str(greek_name),
                 float(strike),
-                expiry_range,
-                prices,
+                expiry.isoformat(),
                 float(sigma),
                 option_type,
                 model,
@@ -1454,9 +1490,29 @@ def add_pro_metrics_tab(
                 heston_sigma,
                 rho,
             )
-            render_pro_surface(pro_frame, str(greek_name))
-        except Exception:
-            st.error(f"Could not render the {greek_name} pro surface.")
+            render_pro_line(line_frame, str(greek_name))
+        except Exception as error:
+            st.exception(error)
+        try:
+            pro_frame = cached_pro_surface(
+                ticker,
+                str(greek_name),
+                float(strike),
+                expiry_range,
+                prices_surface,
+                float(sigma),
+                option_type,
+                surface_model,
+                v0,
+                kappa,
+                theta,
+                heston_sigma,
+                rho,
+                bool(apply_smoothing),
+            )
+            render_pro_surface(pro_frame, str(greek_name), apply_smoothing=bool(apply_smoothing))
+        except Exception as error:
+            st.exception(error)
 
 
 def render_vol_surface(frame: pd.DataFrame | str) -> None:
@@ -1844,9 +1900,14 @@ def main() -> None:
         "3D Surface",
         "Time-Sensitivity",
         "Volatility Surface",
+        "Pro Metrics",
     ]
-    tab_labels.append("Pro Metrics")
-    greeks_tab, advanced_tab, surface_tab, time_tab, vol_tab, pro_tab = st.tabs(tab_labels)
+    greeks_tab, advanced_tab, surface_tab, time_tab, vol_tab, pro_tab = st.tabs(
+        tab_labels,
+        on_change="rerun",
+        key="main_view_tabs",
+        default="Greeks",
+    )
     with greeks_tab:
         for pair in CHART_ROWS:
             cols = st.columns(len(pair), gap="medium")
@@ -1858,140 +1919,145 @@ def main() -> None:
         with st.expander("Greeks table"):
             st.dataframe(frame, use_container_width=True, hide_index=True)
 
-    with advanced_tab:
-        view_3d = st.checkbox("View 3D Surface", key="advanced_view_3d")
-        if view_3d:
-            greek = st.radio(
-                "Surface Greek",
-                options=("Charm", "Speed", "Color"),
-                horizontal=True,
-                key="advanced_surface_greek",
-            )
+    if advanced_tab.open:
+        with advanced_tab:
+            view_3d = st.checkbox("View 3D Surface", key="advanced_view_3d")
+            if view_3d:
+                greek = st.radio(
+                    "Surface Greek",
+                    options=("Charm", "Speed", "Color"),
+                    horizontal=True,
+                    key="advanced_surface_greek",
+                )
+                dte = max((expiry - date.today()).days, 1)
+                expiry_range = tuple(sorted({float(d) for d in range(7, 91, 7)} | {float(dte)}))
+                prices = tuple(
+                    float(p)
+                    for p in pd.to_numeric(frame["Price"], errors="coerce").dropna().tolist()[::4]
+                )
+                try:
+                    surface = _load_greek_surface(
+                        ticker,
+                        float(strike),
+                        expiry_range,
+                        prices,
+                        float(sigma),
+                        option_type,
+                        model,
+                        v0,
+                        kappa,
+                        theta,
+                        heston_sigma,
+                        rho,
+                        str(greek),
+                    )
+                    render_advanced_greek_surface(surface, str(greek))
+                except Exception:
+                    st.error(f"Could not render the {greek} 3D surface.")
+            else:
+                try:
+                    render_gamma_theta_ratio_chart(frame)
+                except Exception:
+                    st.error("Could not render the Gamma/Theta Ratio chart.")
+                try:
+                    render_speed_chart(frame)
+                except Exception:
+                    st.error("Could not render the Risk Acceleration chart.")
+                try:
+                    render_color_chart(frame)
+                except Exception:
+                    st.error("Could not render the Gamma Decay chart.")
+
+    if surface_tab.open:
+        with surface_tab:
             dte = max((expiry - date.today()).days, 1)
             expiry_range = tuple(sorted({float(d) for d in range(7, 91, 7)} | {float(dte)}))
             prices = tuple(
                 float(p)
-                for p in pd.to_numeric(frame["Price"], errors="coerce").dropna().tolist()[::4]
+                for p in pd.to_numeric(frame["Price"], errors="coerce").dropna().tolist()
             )
+            surface_model = model
+            if heston_selected:
+                st.caption("Heston 3D is opt-in so the 2D Heston curves on Greeks can render first.")
+                if st.button("Build Heston gamma surface", key="build_heston_gamma_surface"):
+                    st.session_state["run_heston_gamma_surface"] = True
+                if not st.session_state.get("run_heston_gamma_surface"):
+                    surface_model = MODEL_BLACK_SCHOLES
             try:
-                surface = _load_greek_surface(
+                surface = _load_gamma_surface(
                     ticker,
                     float(strike),
                     expiry_range,
                     prices,
                     float(sigma),
                     option_type,
-                    model,
+                    surface_model,
                     v0,
                     kappa,
                     theta,
                     heston_sigma,
                     rho,
-                    str(greek),
                 )
-                render_advanced_greek_surface(surface, str(greek))
+                render_gamma_surface(surface)
             except Exception:
-                st.error(f"Could not render the {greek} 3D surface.")
-        else:
-            try:
-                render_gamma_theta_ratio_chart(frame)
-            except Exception:
-                st.error("Could not render the Gamma/Theta Ratio chart.")
-            try:
-                render_speed_chart(frame)
-            except Exception:
-                st.error("Could not render the Risk Acceleration chart.")
-            try:
-                render_color_chart(frame)
-            except Exception:
-                st.error("Could not render the Gamma Decay chart.")
+                st.error("Could not render the 3D Gamma surface.")
 
-    with surface_tab:
-        dte = max((expiry - date.today()).days, 1)
-        expiry_range = tuple(sorted({float(d) for d in range(7, 91, 7)} | {float(dte)}))
-        prices = tuple(
-            float(p)
-            for p in pd.to_numeric(frame["Price"], errors="coerce").dropna().tolist()
+    if time_tab.open:
+        with time_tab:
+            dte = max((expiry - date.today()).days, 1)
+            near = list(range(1, min(dte, 14) + 1))
+            far = list(range(21, dte + 1, 7))
+            expiry_range = tuple(sorted({float(x) for x in near + far + [dte] if x > 0}))
+            term_model = model
+            if heston_selected:
+                st.caption("Heston term structure is opt-in so the 2D Heston curves on Greeks can render first.")
+                if st.button("Build Heston term structure", key="build_heston_term"):
+                    st.session_state["run_heston_term"] = True
+                if not st.session_state.get("run_heston_term"):
+                    term_model = MODEL_BLACK_SCHOLES
+            try:
+                term = _load_term_structure(
+                    ticker,
+                    float(strike),
+                    float(current_price),
+                    expiry_range,
+                    float(sigma),
+                    option_type,
+                    term_model,
+                    v0,
+                    kappa,
+                    theta,
+                    heston_sigma,
+                    rho,
+                )
+                render_delta_term_structure(term)
+            except Exception:
+                st.error("Could not render the Time-Sensitivity chart.")
+
+    if vol_tab.open:
+        with vol_tab:
+            try:
+                vol_surface = _load_vol_surface(ticker)
+                render_vol_surface(vol_surface)
+            except Exception as error:
+                st.exception(error)
+
+    if pro_tab.open:
+        add_pro_metrics_tab(
+            pro_tab,
+            ticker,
+            float(strike),
+            expiry,
+            frame,
+            float(sigma),
+            option_type,
+            model,
+            v0,
+            kappa,
+            theta,
+            heston_sigma,
+            rho,
         )
-        surface_model = model
-        if heston_selected:
-            st.caption("Heston 3D is opt-in so the 2D Heston curves on Greeks can render first.")
-            if st.button("Build Heston gamma surface", key="build_heston_gamma_surface"):
-                st.session_state["run_heston_gamma_surface"] = True
-            if not st.session_state.get("run_heston_gamma_surface"):
-                surface_model = MODEL_BLACK_SCHOLES
-        try:
-            surface = _load_gamma_surface(
-                ticker,
-                float(strike),
-                expiry_range,
-                prices,
-                float(sigma),
-                option_type,
-                surface_model,
-                v0,
-                kappa,
-                theta,
-                heston_sigma,
-                rho,
-            )
-            render_gamma_surface(surface)
-        except Exception:
-            st.error("Could not render the 3D Gamma surface.")
-
-    with time_tab:
-        dte = max((expiry - date.today()).days, 1)
-        near = list(range(1, min(dte, 14) + 1))
-        far = list(range(21, dte + 1, 7))
-        expiry_range = tuple(sorted({float(x) for x in near + far + [dte] if x > 0}))
-        term_model = model
-        if heston_selected:
-            st.caption("Heston term structure is opt-in so the 2D Heston curves on Greeks can render first.")
-            if st.button("Build Heston term structure", key="build_heston_term"):
-                st.session_state["run_heston_term"] = True
-            if not st.session_state.get("run_heston_term"):
-                term_model = MODEL_BLACK_SCHOLES
-        try:
-            term = _load_term_structure(
-                ticker,
-                float(strike),
-                float(current_price),
-                expiry_range,
-                float(sigma),
-                option_type,
-                term_model,
-                v0,
-                kappa,
-                theta,
-                heston_sigma,
-                rho,
-            )
-            render_delta_term_structure(term)
-        except Exception:
-            st.error("Could not render the Time-Sensitivity chart.")
-
-    with vol_tab:
-        try:
-            vol_surface = _load_vol_surface(ticker)
-            render_vol_surface(vol_surface)
-        except Exception as error:
-            st.exception(error)
-
-    add_pro_metrics_tab(
-        pro_tab,
-        ticker,
-        float(strike),
-        expiry,
-        frame,
-        float(sigma),
-        option_type,
-        model,
-        v0,
-        kappa,
-        theta,
-        heston_sigma,
-        rho,
-    )
 
 
 if __name__ == "__main__":

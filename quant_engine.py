@@ -741,6 +741,29 @@ def _second_order_cached(
     return tuple(float(x) for x in values["Vanna"]), tuple(float(x) for x in values["Volga"])
 
 
+def _pack_pro_metric(
+    metric: str,
+    S: Any,
+    K: float,
+    T: float,
+    r: float,
+    sigma: float,
+    model: str,
+    *,
+    q: float,
+    option_type: str,
+    v0: float | None,
+    kappa: float,
+    theta: float,
+    heston_sigma: float,
+    rho: float,
+) -> Any:
+    values = _pro_metrics_vector(
+        S, K, T, r, sigma, model, q=q, option_type=option_type, v0=v0, kappa=kappa, theta=theta, heston_sigma=heston_sigma, rho=rho
+    )
+    return _pack_second_order(S, values[metric])
+
+
 def calculate_vanna(
     S: Any,
     K: float,
@@ -757,13 +780,14 @@ def calculate_vanna(
     heston_sigma: float = DEFAULT_HESTON_SIGMA,
     rho: float = DEFAULT_HESTON_RHO,
 ) -> Any:
-    """Vanna ∂Δ/∂σ. ``model`` is ``black-scholes`` or ``heston``."""
-    spots = np.asarray(S, dtype=np.float64)
-    key = tuple(np.atleast_1d(spots).tolist())
-    vanna, _ = _second_order_cached(
-        key, float(K), float(T), float(r), float(sigma), str(model), float(q), str(option_type), v0, float(kappa), float(theta), float(heston_sigma), float(rho)
+    """Vanna ∂Δ/∂σ = -e^{-qT} n(d1) d2 / σ.
+
+    ``model`` is ``black-scholes`` or ``heston``. Returns None/NaN when T, sigma,
+    or S are non-positive, or when σ√T is near zero.
+    """
+    return _pack_pro_metric(
+        "Vanna", S, K, T, r, sigma, model, q=q, option_type=option_type, v0=v0, kappa=kappa, theta=theta, heston_sigma=heston_sigma, rho=rho
     )
-    return _pack_second_order(S, np.array(vanna, dtype=np.float64))
 
 
 def calculate_volga(
@@ -782,13 +806,10 @@ def calculate_volga(
     heston_sigma: float = DEFAULT_HESTON_SIGMA,
     rho: float = DEFAULT_HESTON_RHO,
 ) -> Any:
-    """Volga ∂²V/∂σ². ``model`` is ``black-scholes`` or ``heston``."""
-    spots = np.asarray(S, dtype=np.float64)
-    key = tuple(np.atleast_1d(spots).tolist())
-    _, volga = _second_order_cached(
-        key, float(K), float(T), float(r), float(sigma), str(model), float(q), str(option_type), v0, float(kappa), float(theta), float(heston_sigma), float(rho)
+    """Volga (Vomma) ∂²V/∂σ². ``model`` is ``black-scholes`` or ``heston``."""
+    return calculate_vomma(
+        S, K, T, r, sigma, model, q=q, option_type=option_type, v0=v0, kappa=kappa, theta=theta, heston_sigma=heston_sigma, rho=rho
     )
-    return _pack_second_order(S, np.array(volga, dtype=np.float64))
 
 
 def calculate_gamma_theta_ratio(gamma: Any, theta: Any) -> Any:
@@ -1268,7 +1289,8 @@ def _pro_metrics_vector(
             earlier = _heston_greeks_vector(
                 spots, strike, t_down, rate, dividend, var0, mean_rev, long_var, eta, corr, is_put
             )
-            empty["Veta"] = earlier["Vega"] - base["Vega"]
+            # Vega is stored per vol point (/100); Veta matches raw BS vega wrt calendar time.
+            empty["Veta"] = (earlier["Vega"] - base["Vega"]) * 100.0
         return empty
 
     if not np.isfinite(vol) or vol < SIGMA_MIN:
@@ -1323,14 +1345,14 @@ def calculate_vomma(
     heston_sigma: float = DEFAULT_HESTON_SIGMA,
     rho: float = DEFAULT_HESTON_RHO,
 ) -> Any:
-    """Vomma (Volga) ∂²V/∂σ². ``model`` is ``black-scholes`` or ``heston``.
+    """Vomma (Volga) ∂²V/∂σ² = Vega_raw · d1 · d2 / σ.
 
-    Returns None/NaN when T, sigma, or S are non-positive or the divide is undefined.
+    ``model`` is ``black-scholes`` or ``heston``. Returns None/NaN when T, sigma,
+    or S are non-positive or the divide is undefined.
     """
-    values = _pro_metrics_vector(
-        S, K, T, r, sigma, model, q=q, option_type=option_type, v0=v0, kappa=kappa, theta=theta, heston_sigma=heston_sigma, rho=rho
+    return _pack_pro_metric(
+        "Vomma", S, K, T, r, sigma, model, q=q, option_type=option_type, v0=v0, kappa=kappa, theta=theta, heston_sigma=heston_sigma, rho=rho
     )
-    return _pack_second_order(S, values["Vomma"])
 
 
 def calculate_zomma(
@@ -1349,14 +1371,14 @@ def calculate_zomma(
     heston_sigma: float = DEFAULT_HESTON_SIGMA,
     rho: float = DEFAULT_HESTON_RHO,
 ) -> Any:
-    """Zomma ∂Γ/∂σ. ``model`` is ``black-scholes`` or ``heston``.
+    """Zomma ∂Γ/∂σ = Γ (d1 d2 − 1) / σ.
 
-    Returns None/NaN when T, sigma, or S are non-positive or sigma is near zero.
+    ``model`` is ``black-scholes`` or ``heston``. Returns None/NaN when T, sigma,
+    or S are non-positive or sigma is near zero.
     """
-    values = _pro_metrics_vector(
-        S, K, T, r, sigma, model, q=q, option_type=option_type, v0=v0, kappa=kappa, theta=theta, heston_sigma=heston_sigma, rho=rho
+    return _pack_pro_metric(
+        "Zomma", S, K, T, r, sigma, model, q=q, option_type=option_type, v0=v0, kappa=kappa, theta=theta, heston_sigma=heston_sigma, rho=rho
     )
-    return _pack_second_order(S, values["Zomma"])
 
 
 def calculate_veta(
@@ -1375,14 +1397,15 @@ def calculate_veta(
     heston_sigma: float = DEFAULT_HESTON_SIGMA,
     rho: float = DEFAULT_HESTON_RHO,
 ) -> Any:
-    """Veta ∂Vega/∂t per calendar day. ``model`` is ``black-scholes`` or ``heston``.
+    """Veta ∂Vega_raw/∂t per calendar day.
 
-    Returns None/NaN when T, sigma, or S are non-positive.
+    Closed form: Vega (q + (r−q) d1 /(σ√T) − (1 + d1 d2)/(2T)) / 365.
+    ``model`` is ``black-scholes`` or ``heston``. Returns None/NaN when T, sigma,
+    or S are non-positive.
     """
-    values = _pro_metrics_vector(
-        S, K, T, r, sigma, model, q=q, option_type=option_type, v0=v0, kappa=kappa, theta=theta, heston_sigma=heston_sigma, rho=rho
+    return _pack_pro_metric(
+        "Veta", S, K, T, r, sigma, model, q=q, option_type=option_type, v0=v0, kappa=kappa, theta=theta, heston_sigma=heston_sigma, rho=rho
     )
-    return _pack_second_order(S, values["Veta"])
 
 
 def calculate_ultima(
@@ -1401,14 +1424,50 @@ def calculate_ultima(
     heston_sigma: float = DEFAULT_HESTON_SIGMA,
     rho: float = DEFAULT_HESTON_RHO,
 ) -> Any:
-    """Ultima ∂Vomma/∂σ. ``model`` is ``black-scholes`` or ``heston``.
+    """Ultima ∂Vomma/∂σ = −Vega_raw (d1 d2 (1 − d1 d2) + d1² + d2²) / σ².
 
-    Returns None/NaN when T, sigma, or S are non-positive or sigma is near zero.
+    ``model`` is ``black-scholes`` or ``heston``. Returns None/NaN when T, sigma,
+    or S are non-positive or sigma is near zero.
     """
-    values = _pro_metrics_vector(
-        S, K, T, r, sigma, model, q=q, option_type=option_type, v0=v0, kappa=kappa, theta=theta, heston_sigma=heston_sigma, rho=rho
+    return _pack_pro_metric(
+        "Ultima", S, K, T, r, sigma, model, q=q, option_type=option_type, v0=v0, kappa=kappa, theta=theta, heston_sigma=heston_sigma, rho=rho
     )
-    return _pack_second_order(S, values["Ultima"])
+
+
+def _format_pro_surface_frame(frame: pd.DataFrame) -> pd.DataFrame:
+    """Coerce Price, DaysToExpiry, Value to float for Plotly Surface."""
+    empty = pd.DataFrame(columns=["Price", "DaysToExpiry", "Value"])
+    if frame is None or frame.empty:
+        return empty
+    if not {"Price", "DaysToExpiry", "Value"}.issubset(frame.columns):
+        return empty
+    out = frame.loc[:, ["Price", "DaysToExpiry", "Value"]].copy()
+    out["Price"] = pd.to_numeric(out["Price"], errors="coerce")
+    out["DaysToExpiry"] = pd.to_numeric(out["DaysToExpiry"], errors="coerce")
+    out["Value"] = pd.to_numeric(out["Value"], errors="coerce")
+    return out.replace([np.inf, -np.inf], np.nan)
+
+
+def _smooth_pro_surface_grid(frame: pd.DataFrame) -> pd.DataFrame:
+    """Percentile-clip and Gaussian-smooth a Price × DTE Value grid."""
+    required = {"Price", "DaysToExpiry", "Value"}
+    if frame.empty or not required.issubset(frame.columns):
+        return frame
+    pivot = frame.pivot_table(index="DaysToExpiry", columns="Price", values="Value", aggfunc="mean")
+    pivot = pivot.sort_index().sort_index(axis=1)
+    z = np.array(pivot.to_numpy(dtype=float), copy=True)
+    finite = np.isfinite(z)
+    if not np.any(finite):
+        return frame
+    lo, hi = np.nanpercentile(z[finite], [1.0, 99.0])
+    if np.isfinite(lo) and np.isfinite(hi) and hi >= lo:
+        z = np.clip(z, lo, hi)
+    fill = float(np.nanmedian(z[finite]))
+    filled = np.where(finite, z, fill)
+    smoothed = gaussian_filter(np.asarray(filled, dtype=float), sigma=VOL_SURFACE_GAUSS_SIGMA)
+    pivot.iloc[:, :] = np.where(finite, smoothed, np.nan)
+    out = pivot.stack(future_stack=True).rename("Value").reset_index()
+    return _format_pro_surface_frame(out.loc[:, ["Price", "DaysToExpiry", "Value"]])
 
 
 def generate_pro_surface_data(
@@ -1428,11 +1487,14 @@ def generate_pro_surface_data(
     theta: float = DEFAULT_HESTON_THETA,
     heston_sigma: float = DEFAULT_HESTON_SIGMA,
     rho: float = DEFAULT_HESTON_RHO,
+    apply_smoothing: bool = False,
 ) -> pd.DataFrame:
     """3D Price × Days-to-Expiry grid for a Pro Metric (Vanna, Vomma, Zomma, Veta, Ultima).
 
     ``ticker`` is unused in pricing and kept for dashboard identity.
     Invalid or unknown ``greek_name`` defaults to Vanna. Edge cells are NaN, not inf.
+    When ``apply_smoothing`` is True, apply 1–99 percentile clipping and
+    ``scipy.ndimage.gaussian_filter``. Otherwise return the raw grid.
     """
     del ticker
     aliases = {
@@ -1470,6 +1532,9 @@ def generate_pro_surface_data(
         prices = np.linspace(max(k * 0.7, 1e-6), k * 1.3, 41)
     else:
         prices = pd.to_numeric(pd.Series(list(price_range), dtype="object"), errors="coerce").to_numpy(dtype=np.float64)
+        prices = prices[np.isfinite(prices)]
+        if prices.size < 2:
+            prices = np.linspace(max(k * 0.7, 1e-6), k * 1.3, 41)
     rows: list[dict[str, float]] = []
     for dte in dtes:
         time_years = dte / DAYS_PER_YEAR
@@ -1492,4 +1557,7 @@ def generate_pro_surface_data(
         for price, value in zip(prices, series):
             raw = float(value) if np.isfinite(value) else float("nan")
             rows.append({"Price": float(price), "DaysToExpiry": float(dte), "Value": raw})
-    return pd.DataFrame(rows)
+    frame = _format_pro_surface_frame(pd.DataFrame(rows))
+    if not apply_smoothing:
+        return frame
+    return _format_pro_surface_frame(_smooth_pro_surface_grid(frame))
