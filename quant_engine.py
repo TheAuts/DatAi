@@ -635,11 +635,15 @@ class DataRepository:
         os.makedirs("data_history", exist_ok=True)
         os.makedirs(self.history_dir, exist_ok=True)
         payload = self._payload_from_data(ticker, data)
+        payload.setdefault("delta_surface", {"Strike": [], "DaysToExpiry": [], "Delta": []})
+        payload.setdefault("vol_surface", {"Strike": [], "DaysToExpiry": [], "IV": []})
         live = self._atomic_json_write(self._cache_path(ticker), payload)
         history = self._atomic_json_write(self._history_path(ticker, str(payload["stamp"])), payload)
         self._prune_history(ticker)
-        _LOG.info("Snapshot saved to data_history/")
+        saved_keys = list(payload.keys())
+        _LOG.info("Snapshot saved to data_history/ keys=%s", saved_keys)
         print("Snapshot saved to data_history/")
+        print(f"Successfully saved {saved_keys} to snapshot.")
         return live if live else history
 
     def _atomic_json_write(self, path: Path, payload: dict[str, Any]) -> Path:
@@ -686,6 +690,7 @@ class DataRepository:
             records = data
         frame = self._records_to_frame(records)
         surface = self._delta_surface_payload(frame)
+        vol_surface = self._vol_surface_payload(frame)
         return {
             "version": self.VERSION,
             "ticker": str(ticker or "").strip().upper(),
@@ -693,6 +698,21 @@ class DataRepository:
             "stamp": self._history_stamp(),
             "data": records,
             "delta_surface": surface,
+            "vol_surface": vol_surface,
+        }
+
+    def _vol_surface_payload(self, frame: pd.DataFrame) -> dict[str, Any]:
+        empty = {"Strike": [], "DaysToExpiry": [], "IV": []}
+        try:
+            grid = build_vol_surface_grid(frame)
+        except Exception:
+            return empty
+        if not isinstance(grid, pd.DataFrame) or grid.empty:
+            return empty
+        return {
+            "Strike": grid["Strike"].to_numpy(dtype=np.float64).tolist(),
+            "DaysToExpiry": grid["DaysToExpiry"].to_numpy(dtype=np.float64).tolist(),
+            "IV": [None if not np.isfinite(v) else float(v) for v in grid["IV"].to_numpy(dtype=np.float64)],
         }
 
     def _prune_history(self, ticker: str) -> None:
@@ -935,8 +955,35 @@ class DataRepository:
             change[name] = {"a": left, "b": right, "change": delta, "pct": pct}
         return change
 
-    def calculate_delta_drift(self, ticker: str, ts_a: Any, ts_b: Any) -> pd.DataFrame:
-        empty = pd.DataFrame(columns=["Strike", "DaysToExpiry", "Delta"])
+    @staticmethod
+    def _validate_surface_grid(z: Any, x_axis: np.ndarray, y_axis: np.ndarray) -> np.ndarray:
+        """Coerce ``z`` to a float ``(len(y_axis), len(x_axis))`` matrix.
+
+        Flat lists/vectors are reshaped; anything with the wrong element count
+        raises ``ValueError`` so a bad grid never reaches Plotly as a flat plane.
+        """
+        rows, cols = int(len(y_axis)), int(len(x_axis))
+        arr = np.asarray(
+            [np.nan if v is None else v for v in z] if isinstance(z, (list, tuple)) else z,
+            dtype=np.float64,
+        )
+        if arr.ndim != 2:
+            if arr.size != rows * cols:
+                raise ValueError(f"surface has {arr.size} values, expected {rows}x{cols}")
+            arr = arr.reshape(rows, cols)
+        if arr.shape != (rows, cols):
+            raise ValueError(f"surface shape {arr.shape} != expected {(rows, cols)}")
+        return arr.astype(float)
+
+    def calculate_delta_drift_grid(
+        self, ticker: str, ts_a: Any, ts_b: Any
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Delta drift between two snapshots as a 2D grid: ``later - earlier``.
+
+        Returns ``(strike_axis, dte_axis, Z)`` with ``Z.shape == (len(dte_axis), len(strike_axis))``
+        and ``Z.dtype == float``. All three arrays are empty when either snapshot lacks usable data.
+        """
+        empty = (np.empty(0, dtype=float), np.empty(0, dtype=float), np.empty((0, 0), dtype=float))
         payload_a = self._snapshot_payload(ticker, ts_a) or {}
         payload_b = self._snapshot_payload(ticker, ts_b) or {}
         keys_a = list(payload_a.keys())
@@ -961,28 +1008,42 @@ class DataRepository:
         ny = int(max(2, min(VOL_SURFACE_DTE_POINTS, max(pts_a["DaysToExpiry"].nunique(), pts_b["DaysToExpiry"].nunique(), 8))))
         strike_axis = np.linspace(x_min, x_max if x_max > x_min else x_min + 1e-6, nx, dtype=np.float64)
         dte_axis = np.linspace(y_min, y_max if y_max > y_min else y_min + 1e-6, ny, dtype=np.float64)
-        za = self._interpolate_delta_grid(pts_a, strike_axis, dte_axis)
-        zb = self._interpolate_delta_grid(pts_b, strike_axis, dte_axis)
+        # Both snapshots are interpolated onto the SAME shared axes so the
+        # subtraction below is element-wise over identical (Strike, DTE) nodes.
+        za = self._validate_surface_grid(self._interpolate_delta_grid(pts_a, strike_axis, dte_axis), strike_axis, dte_axis)
+        zb = self._validate_surface_grid(self._interpolate_delta_grid(pts_b, strike_axis, dte_axis), strike_axis, dte_axis)
         if za.size == 0 or zb.size == 0:
             return empty
-        if za.shape != zb.shape:
-            height = min(za.shape[0], zb.shape[0])
-            width = min(za.shape[1], zb.shape[1])
-            if height < 1 or width < 1:
-                return empty
-            za = za[:height, :width]
-            zb = zb[:height, :width]
-            dte_axis = dte_axis[:height]
-            strike_axis = strike_axis[:width]
+        # Drift = later snapshot (ts_b) minus earlier snapshot (ts_a).
+        drift = (zb - za).astype(float)
         grid_x, grid_y = np.meshgrid(strike_axis, dte_axis)
-        drift = np.asarray(zb, dtype=np.float64) - np.asarray(za, dtype=np.float64)
-        return pd.DataFrame(
+        if drift.shape != grid_x.shape or drift.shape != (len(dte_axis), len(strike_axis)):
+            print("Delta drift grid shape mismatch:", drift.shape, grid_x.shape)
+            return empty
+        return strike_axis.astype(float), dte_axis.astype(float), drift
+
+    def calculate_delta_drift(self, ticker: str, ts_a: Any, ts_b: Any) -> pd.DataFrame:
+        """Long-format ``Strike``/``DaysToExpiry``/``Delta`` drift frame (``ts_b - ts_a``).
+
+        Thin wrapper over :meth:`calculate_delta_drift_grid`; the 2D grid is also
+        exposed via ``frame.attrs["Z"]``, ``["X"]`` and ``["Y"]`` for direct Plotly use.
+        """
+        empty = pd.DataFrame(columns=["Strike", "DaysToExpiry", "Delta"])
+        strike_axis, dte_axis, drift = self.calculate_delta_drift_grid(ticker, ts_a, ts_b)
+        if drift.size == 0:
+            return empty
+        grid_x, grid_y = np.meshgrid(strike_axis, dte_axis)
+        frame = pd.DataFrame(
             {
                 "Strike": np.asarray(grid_x, dtype=np.float64).ravel(),
                 "DaysToExpiry": np.asarray(grid_y, dtype=np.float64).ravel(),
                 "Delta": np.asarray(drift, dtype=np.float64).ravel(),
             }
         )
+        frame.attrs["X"] = strike_axis
+        frame.attrs["Y"] = dte_axis
+        frame.attrs["Z"] = drift
+        return frame
 
     def snapshot_vol_surface(self, ticker: str, timestamp: Any) -> pd.DataFrame | str:
         return build_vol_surface_grid(self._snapshot_frame(ticker, timestamp))
