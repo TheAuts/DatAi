@@ -632,10 +632,12 @@ class DataRepository:
             path = Path(self.history_dir) / os.path.basename(joined)
         return path
 
-    def save_to_cache(self, ticker: str, data: Any) -> Path:
+    def save_to_cache(self, ticker: str, data: Any, metadata: Mapping[str, Any] | None = None) -> Path:
         os.makedirs("data_history", exist_ok=True)
         os.makedirs(self.history_dir, exist_ok=True)
         payload = self._payload_from_data(ticker, data)
+        if metadata:
+            payload["metadata"] = self._normalize_metadata(ticker, metadata)
         # Mandatory: every computed surface must exist (actually computed from the
         # raw chain, not defaulted) before anything is written to disk.
         frame = self._records_to_frame(payload.get("data"))
@@ -661,6 +663,63 @@ class DataRepository:
         print("Snapshot saved to data_history/")
         print(f"Successfully saved {saved_keys} to snapshot.")
         return live if live else history
+
+    METADATA_KEYS: tuple[str, ...] = ("ticker", "strike", "expiry", "as_of_date")
+
+    def _normalize_metadata(self, ticker: str, metadata: Mapping[str, Any]) -> dict[str, Any]:
+        out: dict[str, Any] = {key: None for key in self.METADATA_KEYS}
+        out["ticker"] = str(metadata.get("ticker") or ticker or "").strip().upper() or None
+        strike = metadata.get("strike")
+        try:
+            out["strike"] = float(strike) if strike is not None and np.isfinite(float(strike)) else None
+        except (TypeError, ValueError):
+            out["strike"] = None
+        for key in ("expiry", "as_of_date"):
+            value = metadata.get(key)
+            if value is None or value == "":
+                continue
+            out[key] = value.isoformat() if isinstance(value, (date, datetime)) else str(value).strip()[:10]
+        return out
+
+    @classmethod
+    def validate_snapshot_match(cls, snapshot_a: Any, snapshot_b: Any) -> tuple[bool, str]:
+        """Check two snapshot payloads describe the same contract (ticker, strike, expiry).
+
+        Only fields recorded on both sides are compared (legacy snapshots without
+        ``metadata`` remain comparable); any differing field is reported.
+        """
+        if not isinstance(snapshot_a, dict) or not isinstance(snapshot_b, dict):
+            return False, "Snapshot payload missing or not a JSON object."
+        meta_a = snapshot_a.get("metadata") if isinstance(snapshot_a.get("metadata"), dict) else {}
+        meta_b = snapshot_b.get("metadata") if isinstance(snapshot_b.get("metadata"), dict) else {}
+
+        def _field(payload: dict[str, Any], meta: dict[str, Any], key: str) -> Any:
+            value = meta.get(key)
+            if value is None and key == "ticker":
+                value = payload.get("ticker")
+            if value is None or value == "":
+                return None
+            if key == "ticker":
+                return str(value).strip().upper()
+            if key == "strike":
+                try:
+                    return round(float(value), 6)
+                except (TypeError, ValueError):
+                    return str(value)
+            return str(value).strip()[:10]
+
+        problems: list[str] = []
+        for key in ("ticker", "strike", "expiry"):
+            left, right = _field(snapshot_a, meta_a, key), _field(snapshot_b, meta_b, key)
+            if left is None or right is None:
+                continue
+            if left != right:
+                problems.append(f"{key}: {left!r} vs {right!r}")
+        if problems:
+            label_a = snapshot_a.get("stamp") or snapshot_a.get("snapshot_id") or "A"
+            label_b = snapshot_b.get("stamp") or snapshot_b.get("snapshot_id") or "B"
+            return False, f"Snapshot mismatch between {label_a} and {label_b} — " + "; ".join(problems)
+        return True, ""
 
     def _latest_snapshot_path(self, ticker: str) -> Path | None:
         snapshots = self.get_historical_snapshots(ticker)
@@ -1144,6 +1203,11 @@ class DataRepository:
             print("Both timestamps resolve to the same snapshot_id; drift will be zero.")
         if "delta_surface" not in payload_a or "delta_surface" not in payload_b:
             print("Delta surface missing from snapshot!")
+        if payload_a and payload_b:
+            matched, message = self.validate_snapshot_match(payload_a, payload_b)
+            if not matched:
+                print(message)
+                return empty
         frame_a = self._records_to_frame(payload_a.get("data"))
         frame_b = self._records_to_frame(payload_b.get("data"))
         if frame_a.empty or frame_b.empty:
@@ -1200,7 +1264,11 @@ class DataRepository:
     def snapshot_vol_surface(self, ticker: str, timestamp: Any) -> pd.DataFrame | str:
         return build_vol_surface_grid(self._snapshot_frame(ticker, timestamp))
 
-    def get_data(self, ticker: str, expiry: Any = None) -> pd.DataFrame:
+    def get_data(self, ticker: str, expiry: Any = None, date: str | None = None) -> pd.DataFrame:
+        if date:
+            # Historical EOD request: bypass the live TTL cache and never overwrite it.
+            frame = self._fetch(ticker, expiry, date=date)
+            return frame if isinstance(frame, pd.DataFrame) else pd.DataFrame()
         if self.is_fresh(ticker):
             payload = self._read_payload(ticker) or {}
             records = payload.get("data") or []
@@ -1233,17 +1301,18 @@ class DataRepository:
         except Exception as exc:
             return {"ok": False, "status_code": None, "message": str(exc)}
 
-    def _fetch(self, ticker: str, expiry: Any) -> pd.DataFrame:
+    def _fetch(self, ticker: str, expiry: Any, date: str | None = None) -> pd.DataFrame:
         if self._fetcher is not None:
             try:
-                return self._fetcher(ticker, expiry)
+                # Only forward ``date`` when set so two-argument fetchers keep working.
+                return self._fetcher(ticker, expiry, date=date) if date else self._fetcher(ticker, expiry)
             except Exception as exc:
                 _LOG.warning("DataRepository fetch failed ticker=%s expiry=%s error=%s", ticker, expiry, exc)
                 return pd.DataFrame()
         try:
             from data_ingestion import fetch_option_chain
 
-            return fetch_option_chain(ticker, expiry)
+            return fetch_option_chain(ticker, expiry, date=date) if date else fetch_option_chain(ticker, expiry)
         except Exception as exc:
             _LOG.warning("DataRepository fetch failed ticker=%s expiry=%s error=%s", ticker, expiry, exc)
             return pd.DataFrame()
