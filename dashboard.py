@@ -1434,6 +1434,11 @@ def cached_delta_drift(ticker: str, ts_a: str, ts_b: str) -> pd.DataFrame:
     return DATA_REPO.calculate_delta_drift(ticker, ts_a, ts_b)
 
 
+@st.cache_data(ttl=120, show_spinner="Calculating delta drift grid…")
+def cached_delta_drift_grid(ticker: str, ts_a: str, ts_b: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    return DATA_REPO.calculate_delta_drift_grid(ticker, ts_a, ts_b)
+
+
 @st.cache_data(ttl=120, show_spinner="Loading snapshot volatility surface…")
 def cached_snapshot_vol_surface(ticker: str, timestamp: str) -> pd.DataFrame | str:
     return DATA_REPO.snapshot_vol_surface(ticker, timestamp)
@@ -2061,29 +2066,70 @@ def render_vol_surface(frame: pd.DataFrame | str) -> None:
         st.exception(error)
 
 
-def render_delta_drift_surface(frame: pd.DataFrame) -> None:
-    required = {"Strike", "DaysToExpiry", "Delta"}
-    if frame is None or frame.empty or not required.issubset(frame.columns):
-        st.info("No delta-drift surface for the selected snapshots.")
+def _surface_payload_is_empty(surface: Any, value_key: str) -> bool:
+    """True when a stored snapshot surface has no finite, non-zero values."""
+    if not isinstance(surface, dict):
+        return True
+    values = surface.get(value_key) or []
+    if not isinstance(values, list) or not values:
+        return True
+    arr = np.asarray([np.nan if v is None else v for v in values], dtype=float)
+    finite = arr[np.isfinite(arr)]
+    return finite.size == 0 or bool(np.all(finite == 0.0))
+
+
+def render_delta_drift_surface(
+    frame: pd.DataFrame,
+    grid: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None,
+) -> None:
+    x_axis: np.ndarray
+    y_axis: np.ndarray
+    Z: np.ndarray
+    if grid is not None and len(grid) == 3 and np.asarray(grid[2]).size > 0:
+        x_axis = np.asarray(grid[0], dtype=float)
+        y_axis = np.asarray(grid[1], dtype=float)
+        Z = np.array(grid[2], dtype=float, copy=True)
+    else:
+        required = {"Strike", "DaysToExpiry", "Delta"}
+        if frame is None or frame.empty or not required.issubset(frame.columns):
+            st.info("No delta-drift surface for the selected snapshots.")
+            return
+        plot = frame.loc[:, ["Strike", "DaysToExpiry", "Delta"]].copy()
+        plot["Strike"] = pd.to_numeric(plot["Strike"], errors="coerce")
+        plot["DaysToExpiry"] = pd.to_numeric(plot["DaysToExpiry"], errors="coerce")
+        plot["Delta"] = pd.to_numeric(plot["Delta"], errors="coerce")
+        plot = plot.replace([np.inf, -np.inf], np.nan).dropna(subset=["Strike", "DaysToExpiry"])
+        if plot.empty or not plot["Delta"].notna().any():
+            st.info("No delta-drift surface for the selected snapshots.")
+            return
+        pivot = plot.pivot_table(index="DaysToExpiry", columns="Strike", values="Delta", aggfunc="mean")
+        pivot = pivot.sort_index().sort_index(axis=1)
+        x_axis = pivot.columns.to_numpy(dtype=float)
+        y_axis = pivot.index.to_numpy(dtype=float)
+        Z = np.array(pivot.to_numpy(dtype=float), copy=True)
+    Z = Z.astype(float)
+    Z[~np.isfinite(Z)] = np.nan
+    if Z.ndim != 2 or not np.isfinite(Z).any():
+        st.write(f"Z-matrix shape: {Z.shape}")
+        st.error("Delta drift Z-matrix is not a 2D grid or contains no finite values; refusing to render a flat plane.")
         return
-    plot = frame.loc[:, ["Strike", "DaysToExpiry", "Delta"]].copy()
-    plot["Strike"] = pd.to_numeric(plot["Strike"], errors="coerce")
-    plot["DaysToExpiry"] = pd.to_numeric(plot["DaysToExpiry"], errors="coerce")
-    plot["Delta"] = pd.to_numeric(plot["Delta"], errors="coerce")
-    plot = plot.replace([np.inf, -np.inf], np.nan).dropna(subset=["Strike", "DaysToExpiry"])
-    if plot.empty or not plot["Delta"].notna().any():
-        st.info("No delta-drift surface for the selected snapshots.")
+    z_min, z_max = float(np.nanmin(Z)), float(np.nanmax(Z))
+    st.write(f"Z-matrix shape: {Z.shape}, Min: {z_min}, Max: {z_max}")
+    if Z.shape != (len(y_axis), len(x_axis)):
+        st.error(f"Delta drift grid shape {Z.shape} does not match axes ({len(y_axis)}, {len(x_axis)}).")
         return
-    pivot = plot.pivot_table(index="DaysToExpiry", columns="Strike", values="Delta", aggfunc="mean")
-    pivot = pivot.sort_index().sort_index(axis=1)
-    z = np.array(pivot.to_numpy(dtype=float), copy=True)
-    z[~np.isfinite(z)] = np.nan
+    if z_min == z_max:
+        st.error(
+            "Delta drift surface is constant (Min == Max), so it would render as a flat plane. "
+            "Pick two snapshots whose option data actually differs."
+        )
+        return
     fig = go.Figure(
         data=[
             go.Surface(
-                x=pivot.columns.to_numpy(dtype=float),
-                y=pivot.index.to_numpy(dtype=float),
-                z=z,
+                x=x_axis,
+                y=y_axis,
+                z=Z,
                 colorscale="RdBu",
                 reversescale=True,
                 cmid=0,
@@ -2139,6 +2185,11 @@ def render_time_machine_vol_surface(frame: pd.DataFrame | str, timestamp: str) -
     pivot = pivot.sort_index().sort_index(axis=1)
     z = np.array(pivot.to_numpy(dtype=float), copy=True)
     z[~np.isfinite(z)] = np.nan
+    if z.ndim != 2 or not np.isfinite(z).any():
+        st.write(f"IV Z-matrix shape: {z.shape}")
+        st.error("Snapshot volatility surface has no finite values.")
+        return
+    st.write(f"IV Z-matrix shape: {z.shape}, Min: {np.nanmin(z)}, Max: {np.nanmax(z)}")
     fig = go.Figure(
         data=[
             go.Surface(
@@ -2199,19 +2250,44 @@ def add_time_machine_tab(tab: Any, ticker: str) -> None:
         )
         if "delta_surface" not in payload_a or "delta_surface" not in payload_b:
             st.error("Snapshot does not contain delta data!")
+        elif _surface_payload_is_empty(payload_a.get("delta_surface"), "Delta") or _surface_payload_is_empty(
+            payload_b.get("delta_surface"), "Delta"
+        ):
+            st.error("Snapshot data is corrupt/empty.")
+        elif str(start) == str(end):
+            st.error("Start and End snapshots are identical; delta drift is zero everywhere. Pick two different snapshots.")
         else:
             try:
+                grid = cached_delta_drift_grid(str(ticker), str(start), str(end))
                 drift = cached_delta_drift(str(ticker), str(start), str(end))
-                render_delta_drift_surface(drift)
-            except Exception:
+                render_delta_drift_surface(drift, grid=grid)
+            except Exception as error:
                 st.error("Could not render the Delta Drift surface.")
+                st.exception(error)
         st.subheader("Surface evolution")
+        # Map each stamp to its on-disk snapshot file so the loader receives the
+        # exact filename rather than a stamp/index that could match several files.
+        stamp_to_file: dict[str, str] = {}
+        for path in _get_repo().get_historical_snapshots(ticker):
+            name = path.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+            prefix = f"{_get_repo()._safe_ticker(ticker)}_"
+            if name.startswith(prefix) and name.endswith(".json"):
+                stamp_to_file.setdefault(name[len(prefix) : -len(".json")], path)
         stamp = st.select_slider("Snapshot", options=snapshots, value=snapshots[-1], key=f"tm_scrub_{ticker}")
+        snapshot_file = stamp_to_file.get(str(stamp), str(stamp))
+        st.caption(f"Snapshot file: {snapshot_file}")
         try:
-            surface = cached_snapshot_vol_surface(str(ticker), str(stamp))
+            surface = cached_snapshot_vol_surface(str(ticker), snapshot_file)
+            if isinstance(surface, pd.DataFrame) and "IV" in surface.columns and not surface.empty:
+                iv_vals = pd.to_numeric(surface["IV"], errors="coerce").to_numpy(dtype=float)
+                if np.isfinite(iv_vals).any():
+                    st.write(f"IV points: {iv_vals.size}, Min: {np.nanmin(iv_vals)}, Max: {np.nanmax(iv_vals)}")
+                else:
+                    st.write(f"IV points: {iv_vals.size}, no finite values")
             render_time_machine_vol_surface(surface, str(stamp))
-        except Exception:
+        except Exception as error:
             st.error("Could not render the snapshot volatility surface.")
+            st.exception(error)
 
 
 def render_advanced_greek_surface(frame: pd.DataFrame, greek: str) -> None:
