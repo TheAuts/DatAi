@@ -237,9 +237,11 @@ def _init_state() -> None:
 
 
 def _get_repo() -> DataRepository:
-    if "data_repo" not in st.session_state or st.session_state.data_repo is None:
+    repo = st.session_state.get("data_repo")
+    if repo is None or type(repo) is not DataRepository or not hasattr(repo, "get_available_snapshots"):
         st.session_state.data_repo = DATA_REPO
-    return st.session_state.data_repo
+        return DATA_REPO
+    return repo
 
 
 def _api_status_ok(status: Any) -> bool:
@@ -1399,6 +1401,16 @@ def cached_vol_surface(ticker: str) -> pd.DataFrame | str:
     return generate_vol_surface_data(ticker)
 
 
+@st.cache_data(ttl=120, show_spinner="Calculating delta drift…")
+def cached_delta_drift(ticker: str, ts_a: str, ts_b: str) -> pd.DataFrame:
+    return DATA_REPO.calculate_delta_drift(ticker, ts_a, ts_b)
+
+
+@st.cache_data(ttl=120, show_spinner="Loading snapshot volatility surface…")
+def cached_snapshot_vol_surface(ticker: str, timestamp: str) -> pd.DataFrame | str:
+    return DATA_REPO.snapshot_vol_surface(ticker, timestamp)
+
+
 def cached_analyst_chain(ticker: str) -> pd.DataFrame:
     try:
         expiries = list(get_available_expirations(ticker) or [])
@@ -2021,6 +2033,148 @@ def render_vol_surface(frame: pd.DataFrame | str) -> None:
         st.exception(error)
 
 
+def render_delta_drift_surface(frame: pd.DataFrame) -> None:
+    required = {"Strike", "DaysToExpiry", "Delta"}
+    if frame is None or frame.empty or not required.issubset(frame.columns):
+        st.info("No delta-drift surface for the selected snapshots.")
+        return
+    plot = frame.loc[:, ["Strike", "DaysToExpiry", "Delta"]].copy()
+    plot["Strike"] = pd.to_numeric(plot["Strike"], errors="coerce")
+    plot["DaysToExpiry"] = pd.to_numeric(plot["DaysToExpiry"], errors="coerce")
+    plot["Delta"] = pd.to_numeric(plot["Delta"], errors="coerce")
+    plot = plot.replace([np.inf, -np.inf], np.nan).dropna(subset=["Strike", "DaysToExpiry"])
+    if plot.empty or not plot["Delta"].notna().any():
+        st.info("No delta-drift surface for the selected snapshots.")
+        return
+    pivot = plot.pivot_table(index="DaysToExpiry", columns="Strike", values="Delta", aggfunc="mean")
+    pivot = pivot.sort_index().sort_index(axis=1)
+    z = np.array(pivot.to_numpy(dtype=float), copy=True)
+    z[~np.isfinite(z)] = np.nan
+    fig = go.Figure(
+        data=[
+            go.Surface(
+                x=pivot.columns.to_numpy(dtype=float),
+                y=pivot.index.to_numpy(dtype=float),
+                z=z,
+                colorscale="RdBu",
+                reversescale=True,
+                cmid=0,
+                colorbar={"title": "Delta drift"},
+                hovertemplate="Strike=%{x:.2f}<br>DTE=%{y:.1f}<br>Drift=%{z:.6f}<extra></extra>",
+            )
+        ]
+    )
+    fig.update_layout(
+        template="plotly_dark",
+        paper_bgcolor=DARK_BG,
+        font={"color": TEXT},
+        height=560,
+        title={"text": "Delta drift", "x": 0.0, "xanchor": "left"},
+        scene={
+            "xaxis_title": "Strike",
+            "yaxis_title": "Days to Expiry",
+            "zaxis_title": "Delta drift",
+            "bgcolor": PANEL_BG,
+            "dragmode": "orbit",
+        },
+        margin={"l": 8, "r": 8, "t": 48, "b": 8},
+        uirevision="time-machine-delta-drift",
+    )
+    st.plotly_chart(
+        fig,
+        width="stretch",
+        height=560,
+        theme=None,
+        config={"displayModeBar": True, "scrollZoom": True},
+        key="time-machine-delta-drift",
+    )
+    st.caption("Blue: increasing Delta (buying pressure). Red: decreasing Delta (selling pressure).")
+
+
+def render_time_machine_vol_surface(frame: pd.DataFrame | str, timestamp: str) -> None:
+    if isinstance(frame, str):
+        st.info(frame)
+        return
+    required = {"Strike", "DaysToExpiry", "IV"}
+    if frame is None or frame.empty or not required.issubset(frame.columns):
+        st.info("Insufficient Data")
+        return
+    plot = frame.loc[:, ["Strike", "DaysToExpiry", "IV"]].copy()
+    plot["Strike"] = pd.to_numeric(plot["Strike"], errors="coerce")
+    plot["DaysToExpiry"] = pd.to_numeric(plot["DaysToExpiry"], errors="coerce")
+    plot["IV"] = pd.to_numeric(plot["IV"], errors="coerce")
+    plot = plot.replace([np.inf, -np.inf], np.nan).dropna(subset=["Strike", "DaysToExpiry"])
+    if plot.empty or not plot["IV"].notna().any():
+        st.info("Insufficient Data")
+        return
+    pivot = plot.pivot_table(index="DaysToExpiry", columns="Strike", values="IV", aggfunc="mean")
+    pivot = pivot.sort_index().sort_index(axis=1)
+    z = np.array(pivot.to_numpy(dtype=float), copy=True)
+    z[~np.isfinite(z)] = np.nan
+    fig = go.Figure(
+        data=[
+            go.Surface(
+                x=pivot.columns.to_numpy(dtype=float),
+                y=pivot.index.to_numpy(dtype=float),
+                z=z,
+                colorscale="Viridis",
+                colorbar={"title": "IV"},
+                hovertemplate="Strike=%{x:.2f}<br>DTE=%{y:.1f}<br>IV=%{z:.4f}<extra></extra>",
+            )
+        ]
+    )
+    fig.update_layout(
+        template="plotly_dark",
+        paper_bgcolor=DARK_BG,
+        font={"color": TEXT},
+        height=560,
+        title={"text": f"Volatility surface · {timestamp}", "x": 0.0, "xanchor": "left"},
+        scene={
+            "xaxis_title": "Strike",
+            "yaxis_title": "Days to Expiry",
+            "zaxis_title": "IV",
+            "bgcolor": PANEL_BG,
+            "dragmode": "orbit",
+        },
+        margin={"l": 8, "r": 8, "t": 48, "b": 8},
+        uirevision="time-machine-vol-surface",
+    )
+    st.plotly_chart(
+        fig,
+        width="stretch",
+        height=560,
+        theme=None,
+        config={"displayModeBar": True, "scrollZoom": True},
+        key="time-machine-vol-surface",
+    )
+
+
+def add_time_machine_tab(tab: Any, ticker: str) -> None:
+    with tab:
+        snapshots = _get_repo().get_available_snapshots(ticker)
+        if not snapshots:
+            st.info("No snapshots in data_history/ for this ticker.")
+            return
+        st.subheader("Delta drift")
+        start_col, end_col = st.columns(2)
+        with start_col:
+            start = st.selectbox("Start Snapshot", snapshots, index=0, key=f"tm_start_{ticker}")
+        with end_col:
+            end = st.selectbox("End Snapshot", snapshots, index=len(snapshots) - 1, key=f"tm_end_{ticker}")
+        try:
+            drift = cached_delta_drift(str(ticker), str(start), str(end))
+            render_delta_drift_surface(drift)
+        except Exception:
+            st.error("Could not render the Delta Drift surface.")
+        st.subheader("Surface evolution")
+        stamp = st.select_slider("Snapshot", options=snapshots, value=snapshots[-1], key=f"tm_scrub_{ticker}")
+        try:
+            surface = cached_snapshot_vol_surface(str(ticker), str(stamp))
+            render_time_machine_vol_surface(surface, str(stamp))
+        except Exception:
+            st.error("Could not render the snapshot volatility surface.")
+
+
 def render_advanced_greek_surface(frame: pd.DataFrame, greek: str) -> None:
     required = {"Price", "DaysToExpiry", "Value"}
     if frame.empty or not required.issubset(frame.columns):
@@ -2334,12 +2488,23 @@ def main() -> None:
         "Advanced Metrics",
         "3D Surface",
         "Time-Sensitivity",
+        "Time Machine",
         "Volatility Surface",
         "Pro Metrics",
         "Market Analyst",
         "Portfolio & Risk",
     ]
-    greeks_tab, advanced_tab, surface_tab, time_tab, vol_tab, pro_tab, analyst_tab, portfolio_tab = st.tabs(
+    (
+        greeks_tab,
+        advanced_tab,
+        surface_tab,
+        time_tab,
+        machine_tab,
+        vol_tab,
+        pro_tab,
+        analyst_tab,
+        portfolio_tab,
+    ) = st.tabs(
         tab_labels,
         on_change="rerun",
         key="main_view_tabs",
@@ -2470,6 +2635,9 @@ def main() -> None:
                 render_delta_term_structure(term)
             except Exception:
                 st.error("Could not render the Time-Sensitivity chart.")
+
+    if machine_tab.open:
+        add_time_machine_tab(machine_tab, ticker)
 
     if vol_tab.open:
         with vol_tab:

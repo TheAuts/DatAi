@@ -589,26 +589,76 @@ class DataRepository:
 
     VERSION = "1.0"
     TTL_SECONDS = 15 * 60
+    HISTORY_LIMIT = 50
 
     def __init__(
         self,
         cache_dir: str | Path | None = None,
         fetcher: Callable[[str, Any], pd.DataFrame] | None = None,
         status_probe: Callable[[], dict[str, Any]] | None = None,
+        history_dir: str | Path | None = None,
     ) -> None:
         root = Path(cache_dir) if cache_dir is not None else Path(__file__).resolve().parent / "cache" / "marketdata"
         self.cache_dir = root
         self.cache_dir.mkdir(parents=True, exist_ok=True)
+        hist = Path(history_dir) if history_dir is not None else (
+            Path(__file__).resolve().parent / "data_history" if cache_dir is None else root / "data_history"
+        )
+        self.history_dir = hist
+        self.history_dir.mkdir(parents=True, exist_ok=True)
         self._fetcher = fetcher
         self._status_probe = status_probe
 
-    def _cache_path(self, ticker: str) -> Path:
+    def _safe_ticker(self, ticker: str) -> str:
         symbol = str(ticker or "").strip().upper() or "_"
-        safe = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in symbol)
-        return self.cache_dir / f"{safe}.json"
+        return "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in symbol)
 
-    def _read_payload(self, ticker: str) -> dict[str, Any] | None:
-        path = self._cache_path(ticker)
+    def _cache_path(self, ticker: str) -> Path:
+        return self.cache_dir / f"{self._safe_ticker(ticker)}.json"
+
+    def _history_stamp(self, when: datetime | None = None) -> str:
+        moment = when or datetime.now(timezone.utc)
+        return moment.strftime("%Y-%m-%d_%H%M")
+
+    def _history_path(self, ticker: str, stamp: str | None = None) -> Path:
+        label = stamp or self._history_stamp()
+        filename = f"{self._safe_ticker(ticker)}_{label}.json"
+        joined = os.path.join("data_history", filename)
+        path = Path(self.history_dir) / os.path.basename(joined)
+        if path.exists():
+            filename = f"{self._safe_ticker(ticker)}_{self._history_stamp()}_{int(time.time())}.json"
+            joined = os.path.join("data_history", filename)
+            path = Path(self.history_dir) / os.path.basename(joined)
+        return path
+
+    def save_to_cache(self, ticker: str, data: Any) -> Path:
+        os.makedirs("data_history", exist_ok=True)
+        os.makedirs(self.history_dir, exist_ok=True)
+        payload = self._payload_from_data(ticker, data)
+        live = self._atomic_json_write(self._cache_path(ticker), payload)
+        history = self._atomic_json_write(self._history_path(ticker, str(payload["stamp"])), payload)
+        self._prune_history(ticker)
+        _LOG.info("Snapshot saved to data_history/")
+        print("Snapshot saved to data_history/")
+        return live if live else history
+
+    def _atomic_json_write(self, path: Path, payload: dict[str, Any]) -> Path:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp_name = tempfile.mkstemp(suffix=".json", dir=str(path.parent))
+        os.close(fd)
+        try:
+            with open(tmp_name, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle, allow_nan=True)
+            os.replace(tmp_name, path)
+        except Exception:
+            try:
+                os.remove(tmp_name)
+            except OSError:
+                pass
+            raise
+        return path
+
+    def _read_json(self, path: Path) -> dict[str, Any] | None:
         if not path.is_file():
             return None
         try:
@@ -619,6 +669,42 @@ class DataRepository:
         if not isinstance(payload, dict):
             return None
         return payload
+
+    def _records_to_frame(self, records: Any) -> pd.DataFrame:
+        if isinstance(records, pd.DataFrame):
+            return records.copy()
+        if not records:
+            return pd.DataFrame()
+        return pd.DataFrame(records)
+
+    def _payload_from_data(self, ticker: str, data: Any) -> dict[str, Any]:
+        if isinstance(data, pd.DataFrame):
+            records = json.loads(data.to_json(orient="records", date_format="iso"))
+        elif isinstance(data, dict) and "data" in data:
+            records = data.get("data")
+        else:
+            records = data
+        return {
+            "version": self.VERSION,
+            "ticker": str(ticker or "").strip().upper(),
+            "saved_at": time.time(),
+            "stamp": self._history_stamp(),
+            "data": records,
+        }
+
+    def _prune_history(self, ticker: str) -> None:
+        snapshots = self.get_historical_snapshots(ticker)
+        extra = snapshots[: max(0, len(snapshots) - int(self.HISTORY_LIMIT))]
+        for item in extra:
+            path = Path(item)
+            try:
+                if path.is_file():
+                    path.unlink()
+            except OSError:
+                continue
+
+    def _read_payload(self, ticker: str) -> dict[str, Any] | None:
+        return self._read_json(self._cache_path(ticker))
 
     def is_fresh(self, ticker: str) -> bool:
         payload = self._read_payload(ticker)
@@ -632,33 +718,206 @@ class DataRepository:
             return False
         return (time.time() - saved_at) < float(self.TTL_SECONDS)
 
-    def save_to_cache(self, ticker: str, data: Any) -> Path:
-        path = self._cache_path(ticker)
-        if isinstance(data, pd.DataFrame):
-            records = json.loads(data.to_json(orient="records", date_format="iso"))
-        elif isinstance(data, dict) and "data" in data:
-            records = data.get("data")
+    def get_historical_snapshots(self, ticker: str) -> list[str]:
+        safe = self._safe_ticker(ticker)
+        paths = [path for path in self.history_dir.glob(f"{safe}_*.json") if path.is_file()]
+        paths.sort(key=lambda item: (item.stat().st_mtime, item.name))
+        return [str(path) for path in paths]
+
+    def get_available_snapshots(self, ticker: str) -> list[str]:
+        os.makedirs("data_history", exist_ok=True)
+        safe = self._safe_ticker(ticker)
+        prefix = f"{safe}_"
+        found: list[tuple[float, str]] = []
+        seen: set[str] = set()
+        folders = [Path(os.path.join("data_history")), Path(self.history_dir)]
+        for folder in folders:
+            if not folder.is_dir():
+                continue
+            for path in folder.glob(f"{prefix}*.json"):
+                if not path.is_file():
+                    continue
+                stamp = path.stem[len(prefix):]
+                if not stamp or stamp in seen:
+                    continue
+                seen.add(stamp)
+                try:
+                    mtime = float(path.stat().st_mtime)
+                except OSError:
+                    mtime = 0.0
+                found.append((mtime, stamp))
+        found.sort(key=lambda item: (item[0], item[1]))
+        return [stamp for _, stamp in found]
+
+    def _delta_points(self, frame: pd.DataFrame) -> pd.DataFrame:
+        empty = pd.DataFrame(columns=["Strike", "DaysToExpiry", "Delta"])
+        if frame is None or not isinstance(frame, pd.DataFrame) or frame.empty:
+            return empty
+        strike_col = _sentiment_column(frame, "Strike", "K", "strike")
+        if strike_col is None:
+            return empty
+        strikes = np.array(pd.to_numeric(strike_col, errors="coerce").to_numpy(dtype=np.float64), copy=True)
+        dtes = np.array(_sentiment_tenor_days(frame), dtype=np.float64, copy=True)
+        delta_col = _sentiment_column(frame, "Delta", "delta")
+        if delta_col is None:
+            deltas = np.full(len(frame.index), np.nan, dtype=np.float64)
         else:
-            records = data
-        payload = {
-            "version": self.VERSION,
-            "ticker": str(ticker or "").strip().upper(),
-            "saved_at": time.time(),
-            "data": records,
-        }
-        fd, tmp_name = tempfile.mkstemp(suffix=".json", dir=str(self.cache_dir))
-        os.close(fd)
+            deltas = np.array(pd.to_numeric(delta_col, errors="coerce").to_numpy(dtype=np.float64), copy=True)
+        mask = np.isfinite(strikes) & np.isfinite(dtes) & np.isfinite(deltas) & (strikes > 0) & (dtes > 0)
+        if not np.any(mask):
+            return empty
+        points = pd.DataFrame(
+            {
+                "Strike": strikes[mask],
+                "DaysToExpiry": dtes[mask],
+                "Delta": deltas[mask],
+            }
+        )
+        return points.groupby(["Strike", "DaysToExpiry"], as_index=False)["Delta"].mean()
+
+    def _interpolate_delta_grid(
+        self,
+        points: pd.DataFrame,
+        strike_axis: np.ndarray,
+        dte_axis: np.ndarray,
+    ) -> np.ndarray:
+        grid_x, grid_y = np.meshgrid(strike_axis, dte_axis)
+        blank = np.full(grid_x.shape, np.nan, dtype=np.float64)
+        if points is None or points.empty:
+            return blank
+        xy = points[["Strike", "DaysToExpiry"]].to_numpy(dtype=np.float64)
+        z = points["Delta"].to_numpy(dtype=np.float64)
+        if z.size == 0 or not np.any(np.isfinite(z)):
+            return blank
         try:
-            with open(tmp_name, "w", encoding="utf-8") as handle:
-                json.dump(payload, handle, allow_nan=True)
-            os.replace(tmp_name, path)
+            nearest = griddata(xy, z, (grid_x, grid_y), method="nearest")
+            if np.unique(xy[:, 0]).size < 2 or np.unique(xy[:, 1]).size < 2:
+                return np.asarray(nearest, dtype=np.float64)
+            linear = griddata(xy, z, (grid_x, grid_y), method="linear")
+            return np.where(np.isfinite(linear), linear, nearest).astype(np.float64)
         except Exception:
-            try:
-                os.remove(tmp_name)
-            except OSError:
-                pass
-            raise
-        return path
+            return blank
+
+    def _snapshot_frame(self, ticker: str, timestamp: Any) -> pd.DataFrame:
+        text = str(timestamp or "").strip()
+        candidates = [Path(text), self.history_dir / text, self.history_dir / f"{self._safe_ticker(ticker)}_{text}.json"]
+        path = next((item for item in candidates if item.is_file()), None)
+        if path is None:
+            stamp = text.replace(".json", "")
+            for item in self.get_historical_snapshots(ticker):
+                name = Path(item).name
+                if stamp in name or name.endswith(f"{stamp}.json"):
+                    path = Path(item)
+                    break
+        payload = self._read_json(path) if path is not None else None
+        if not payload:
+            return pd.DataFrame()
+        return self._records_to_frame(payload.get("data"))
+
+    def _snapshot_metrics(self, frame: pd.DataFrame) -> dict[str, float]:
+        if frame is None or not isinstance(frame, pd.DataFrame) or frame.empty:
+            return {"IV": 0.0, "Delta": 0.0, "Gamma": 0.0, "Theta": 0.0, "Vega": 0.0}
+        iv = _sentiment_iv_series(frame).to_numpy(dtype=np.float64)
+        iv = np.array(iv, dtype=np.float64, copy=True)
+        iv_mean = _finite_mean(iv[np.isfinite(iv) & (iv > SIGMA_MIN)])
+        greeks = {name: np.full(len(frame.index), np.nan, dtype=np.float64) for name in ("Delta", "Gamma", "Theta", "Vega")}
+        for name in greeks:
+            col = _sentiment_column(frame, name, name.lower())
+            if col is not None:
+                greeks[name] = np.array(pd.to_numeric(col, errors="coerce").to_numpy(dtype=np.float64), copy=True)
+        need = np.ones(len(frame.index), dtype=bool)
+        for values in greeks.values():
+            need &= ~np.isfinite(values)
+        if np.any(need):
+            s_col = _sentiment_column(frame, "S", "underlyingPrice", "Price")
+            k_col = _sentiment_column(frame, "K", "strike", "Strike")
+            t_col = _sentiment_column(frame, "T")
+            type_col = _sentiment_column(frame, "option_type", "type")
+            spots = np.array(pd.to_numeric(s_col, errors="coerce").to_numpy(dtype=np.float64), copy=True) if s_col is not None else np.full(len(frame.index), np.nan)
+            strikes = np.array(pd.to_numeric(k_col, errors="coerce").to_numpy(dtype=np.float64), copy=True) if k_col is not None else np.full(len(frame.index), np.nan)
+            if t_col is None:
+                tenors = _sentiment_tenor_days(frame) / DAYS_PER_YEAR
+            else:
+                tenors = np.array(pd.to_numeric(t_col, errors="coerce").to_numpy(dtype=np.float64), copy=True)
+            types = ["call"] * len(frame.index) if type_col is None else type_col.astype(str).tolist()
+            vols = np.array(iv, dtype=np.float64, copy=True)
+            for i in np.flatnonzero(need):
+                packed = calculate_greeks(
+                    {
+                        "S": spots[i] if i < spots.size else float("nan"),
+                        "K": strikes[i] if i < strikes.size else float("nan"),
+                        "T": tenors[i] if i < tenors.size else float("nan"),
+                        "r": DEFAULT_RATE,
+                        "sigma": vols[i] if i < vols.size else float("nan"),
+                        "option_type": types[i] if i < len(types) else "call",
+                    }
+                )
+                for name in greeks:
+                    value = packed.get(name)
+                    if value is not None and np.isfinite(value):
+                        greeks[name][i] = float(value)
+        out = {"IV": iv_mean if np.isfinite(iv_mean) else 0.0}
+        for name, values in greeks.items():
+            mean = _finite_mean(values)
+            out[name] = mean if np.isfinite(mean) else 0.0
+        return out
+
+    def calculate_change_over_time(self, ticker: str, timestamp_a: Any, timestamp_b: Any) -> dict[str, Any]:
+        """Compare mean IV and first-order Greeks between two historical snapshots."""
+        metrics_a = self._snapshot_metrics(self._snapshot_frame(ticker, timestamp_a))
+        metrics_b = self._snapshot_metrics(self._snapshot_frame(ticker, timestamp_b))
+        change: dict[str, Any] = {"ticker": str(ticker or "").strip().upper(), "timestamp_a": str(timestamp_a), "timestamp_b": str(timestamp_b)}
+        for name in ("IV", "Delta", "Gamma", "Theta", "Vega"):
+            left = float(metrics_a.get(name, 0.0))
+            right = float(metrics_b.get(name, 0.0))
+            delta = right - left
+            pct = float((delta / left) * 100.0) if abs(left) > 1e-12 else 0.0
+            change[name] = {"a": left, "b": right, "change": delta, "pct": pct}
+        return change
+
+    def calculate_delta_drift(self, ticker: str, ts_a: Any, ts_b: Any) -> pd.DataFrame:
+        empty = pd.DataFrame(columns=["Strike", "DaysToExpiry", "Delta"])
+        frame_a = self._snapshot_frame(ticker, ts_a)
+        frame_b = self._snapshot_frame(ticker, ts_b)
+        if frame_a.empty or frame_b.empty:
+            return empty
+        pts_a = self._delta_points(frame_a)
+        pts_b = self._delta_points(frame_b)
+        if pts_a.empty or pts_b.empty:
+            return empty
+        x_min = float(min(float(pts_a["Strike"].min()), float(pts_b["Strike"].min())))
+        x_max = float(max(float(pts_a["Strike"].max()), float(pts_b["Strike"].max())))
+        y_min = float(min(float(pts_a["DaysToExpiry"].min()), float(pts_b["DaysToExpiry"].min())))
+        y_max = float(max(float(pts_a["DaysToExpiry"].max()), float(pts_b["DaysToExpiry"].max())))
+        nx = int(max(2, min(VOL_SURFACE_STRIKE_POINTS, max(pts_a["Strike"].nunique(), pts_b["Strike"].nunique(), 8))))
+        ny = int(max(2, min(VOL_SURFACE_DTE_POINTS, max(pts_a["DaysToExpiry"].nunique(), pts_b["DaysToExpiry"].nunique(), 8))))
+        strike_axis = np.linspace(x_min, x_max if x_max > x_min else x_min + 1e-6, nx, dtype=np.float64)
+        dte_axis = np.linspace(y_min, y_max if y_max > y_min else y_min + 1e-6, ny, dtype=np.float64)
+        za = self._interpolate_delta_grid(pts_a, strike_axis, dte_axis)
+        zb = self._interpolate_delta_grid(pts_b, strike_axis, dte_axis)
+        if za.size == 0 or zb.size == 0:
+            return empty
+        if za.shape != zb.shape:
+            height = min(za.shape[0], zb.shape[0])
+            width = min(za.shape[1], zb.shape[1])
+            if height < 1 or width < 1:
+                return empty
+            za = za[:height, :width]
+            zb = zb[:height, :width]
+            dte_axis = dte_axis[:height]
+            strike_axis = strike_axis[:width]
+        grid_x, grid_y = np.meshgrid(strike_axis, dte_axis)
+        drift = np.asarray(zb, dtype=np.float64) - np.asarray(za, dtype=np.float64)
+        return pd.DataFrame(
+            {
+                "Strike": np.asarray(grid_x, dtype=np.float64).ravel(),
+                "DaysToExpiry": np.asarray(grid_y, dtype=np.float64).ravel(),
+                "Delta": np.asarray(drift, dtype=np.float64).ravel(),
+            }
+        )
+
+    def snapshot_vol_surface(self, ticker: str, timestamp: Any) -> pd.DataFrame | str:
+        return build_vol_surface_grid(self._snapshot_frame(ticker, timestamp))
 
     def get_data(self, ticker: str, expiry: Any = None) -> pd.DataFrame:
         if self.is_fresh(ticker):
@@ -1291,9 +1550,8 @@ def _zero_vol_surface() -> pd.DataFrame:
     )
 
 
-def generate_vol_surface_data(ticker: str) -> pd.DataFrame | str:
+def build_vol_surface_grid(chain: pd.DataFrame, *, verbose: bool = False) -> pd.DataFrame | str:
     """Implied-vol grid: Strike (X) × Days-to-Expiry (Y) × IV (Z) for Plotly."""
-    from data_ingestion import fetch_option_chain, get_available_expirations
 
     def _finish(frame: pd.DataFrame) -> pd.DataFrame | str:
         out = frame.replace([np.inf, -np.inf], np.nan).dropna(how="any")
@@ -1301,32 +1559,26 @@ def generate_vol_surface_data(ticker: str) -> pd.DataFrame | str:
             out["Strike"] = out["Strike"].astype(float)
             out["DaysToExpiry"] = out["DaysToExpiry"].astype(float)
             out["IV"] = out["IV"].astype(float)
-        print("generate_vol_surface_data shape:", out.shape)
-        print(out.head())
+        if verbose:
+            print("generate_vol_surface_data shape:", out.shape)
+            print(out.head())
         if len(out) < 10:
             return "Insufficient Data"
         return out
 
-    try:
-        frames: list[pd.DataFrame] = []
-        try:
-            expiries = list(get_available_expirations(ticker) or [])
-        except Exception:
-            expiries = []
-        if not expiries:
-            frames.append(fetch_option_chain(ticker))
-        else:
-            for expiry in expiries[:16]:
-                frames.append(fetch_option_chain(ticker, expiry))
-        chain = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
-    except Exception:
-        return _finish(pd.DataFrame(columns=["Strike", "DaysToExpiry", "IV"]))
-    if chain.empty:
-        return _finish(pd.DataFrame(columns=["Strike", "DaysToExpiry", "IV"]))
-
-    strikes = pd.to_numeric(chain.get("strike", chain.get("K")), errors="coerce")
-    ivs = pd.to_numeric(chain.get("impliedVolatility", chain.get("sigma")), errors="coerce")
-    if "T" in chain.columns:
+    empty = pd.DataFrame(columns=["Strike", "DaysToExpiry", "IV"])
+    if chain is None or not isinstance(chain, pd.DataFrame) or chain.empty:
+        return _finish(empty)
+    strike_col = _sentiment_column(chain, "Strike", "K", "strike")
+    iv_col = _sentiment_column(chain, "impliedVolatility", "IV", "sigma", "iv")
+    if strike_col is None or iv_col is None:
+        return _finish(empty)
+    strikes = pd.to_numeric(strike_col, errors="coerce")
+    ivs = pd.to_numeric(iv_col, errors="coerce")
+    dte_col = _sentiment_column(chain, "DaysToExpiry", "dte", "days_to_expiry")
+    if dte_col is not None:
+        dtes = pd.to_numeric(dte_col, errors="coerce")
+    elif "T" in chain.columns:
         dtes = pd.to_numeric(chain["T"], errors="coerce") * DAYS_PER_YEAR
     elif "expiration" in chain.columns:
         dtes = pd.to_numeric(chain["expiration"].map(_time_to_expiry_years), errors="coerce") * DAYS_PER_YEAR
@@ -1372,6 +1624,27 @@ def generate_vol_surface_data(ticker: str) -> pd.DataFrame | str:
         }
     )
     return _finish(frame)
+
+
+def generate_vol_surface_data(ticker: str) -> pd.DataFrame | str:
+    """Implied-vol grid: Strike (X) × Days-to-Expiry (Y) × IV (Z) for Plotly."""
+    from data_ingestion import fetch_option_chain, get_available_expirations
+
+    try:
+        frames: list[pd.DataFrame] = []
+        try:
+            expiries = list(get_available_expirations(ticker) or [])
+        except Exception:
+            expiries = []
+        if not expiries:
+            frames.append(fetch_option_chain(ticker))
+        else:
+            for expiry in expiries[:16]:
+                frames.append(fetch_option_chain(ticker, expiry))
+        chain = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    except Exception:
+        return build_vol_surface_grid(pd.DataFrame(), verbose=True)
+    return build_vol_surface_grid(chain, verbose=True)
 
 
 def _safe_div(numerator: np.ndarray, denominator: np.ndarray | float) -> np.ndarray:

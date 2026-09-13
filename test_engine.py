@@ -5,8 +5,10 @@ from __future__ import annotations
 import json
 import math
 import time
+from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pandas as pd
 import pytest
 
@@ -429,6 +431,81 @@ def test_data_repository_ttl_version_and_atomic_cache(tmp_path) -> None:
     curve = generate_greek_curve("SPY", 100.0, 1.0, [90.0, 110.0], repo=repo)
     assert not curve.empty
     assert "Delta" in curve.columns
+    snaps = repo.get_historical_snapshots("SPY")
+    assert len(snaps) >= 1
+    assert "data_history" in snaps[0].replace("\\", "/")
+    assert Path(snaps[0]).name.startswith("SPY_")
+
+
+def test_data_repository_historical_compare_and_prune(tmp_path) -> None:
+    repo = DataRepository(cache_dir=tmp_path, status_probe=lambda: {"ok": True})
+    first = pd.DataFrame({"impliedVolatility": [0.20, 0.22], "Delta": [0.50, 0.40], "Gamma": [0.02, 0.01], "Theta": [-0.03, -0.02], "Vega": [0.10, 0.12]})
+    second = pd.DataFrame({"impliedVolatility": [0.30, 0.32], "Delta": [0.60, 0.50], "Gamma": [0.03, 0.02], "Theta": [-0.04, -0.03], "Vega": [0.20, 0.22]})
+    repo.save_to_cache("QQQ", first)
+    stamp_a = Path(repo.get_historical_snapshots("QQQ")[-1]).name.replace("QQQ_", "").replace(".json", "")
+    repo.save_to_cache("QQQ", second)
+    snaps = repo.get_historical_snapshots("QQQ")
+    assert len(snaps) >= 2
+    stamp_b = Path(snaps[-1]).name.replace("QQQ_", "").replace(".json", "")
+    change = repo.calculate_change_over_time("QQQ", stamp_a, stamp_b)
+    assert change["IV"]["b"] > change["IV"]["a"]
+    assert change["Delta"]["change"] == pytest.approx(0.10)
+    repo.HISTORY_LIMIT = 2
+    for idx in range(6):
+        repo.save_to_cache("QQQ", pd.DataFrame({"impliedVolatility": [0.1 + idx * 0.01]}))
+    assert len(repo.get_historical_snapshots("QQQ")) <= 2
+
+
+def test_data_repository_delta_drift_and_snapshots(tmp_path) -> None:
+    repo = DataRepository(cache_dir=tmp_path, history_dir=tmp_path / "data_history", status_probe=lambda: {"ok": True})
+    first = pd.DataFrame(
+        {
+            "Strike": [90.0, 100.0, 110.0, 90.0, 100.0, 110.0],
+            "DaysToExpiry": [7.0, 7.0, 7.0, 30.0, 30.0, 30.0],
+            "Delta": [0.80, 0.50, 0.20, 0.70, 0.50, 0.30],
+        }
+    )
+    second = first.copy()
+    second["Delta"] = first["Delta"] + 0.10
+    mismatched = pd.DataFrame(
+        {
+            "Strike": [95.0, 105.0, 95.0, 105.0],
+            "DaysToExpiry": [10.0, 10.0, 21.0, 21.0],
+            "Delta": [0.90, 0.40, 0.75, 0.35],
+        }
+    )
+    repo.save_to_cache("IWM", first)
+    ts_a = repo.get_available_snapshots("IWM")[-1]
+    repo.save_to_cache("IWM", second)
+    stamps = repo.get_available_snapshots("IWM")
+    assert ts_a in stamps
+    ts_b = stamps[-1]
+    assert len(stamps) >= 2
+    drift = repo.calculate_delta_drift("IWM", ts_a, ts_b)
+    assert {"Strike", "DaysToExpiry", "Delta"}.issubset(drift.columns)
+    assert not drift.empty
+    assert float(np.nanmean(drift["Delta"].to_numpy(dtype=float))) == pytest.approx(0.10, abs=1e-6)
+    missing = repo.calculate_delta_drift("IWM", "missing-a", ts_b)
+    assert missing.empty
+    repo.save_to_cache("IWM", mismatched)
+    ts_c = repo.get_available_snapshots("IWM")[-1]
+    mixed = repo.calculate_delta_drift("IWM", ts_a, ts_c)
+    assert not mixed.empty
+    assert mixed["Delta"].notna().any()
+
+
+def test_snapshot_vol_surface_from_history(tmp_path) -> None:
+    repo = DataRepository(cache_dir=tmp_path, history_dir=tmp_path / "data_history")
+    rows = []
+    for dte in (7.0, 14.0, 21.0, 30.0, 45.0):
+        for strike in (90.0, 95.0, 100.0, 105.0, 110.0):
+            rows.append({"Strike": strike, "DaysToExpiry": dte, "impliedVolatility": 0.20 + (strike - 100.0) * 0.002 + dte * 0.001})
+    repo.save_to_cache("DIA", pd.DataFrame(rows))
+    stamp = repo.get_available_snapshots("DIA")[-1]
+    surface = repo.snapshot_vol_surface("DIA", stamp)
+    assert isinstance(surface, pd.DataFrame)
+    assert {"Strike", "DaysToExpiry", "IV"}.issubset(surface.columns)
+    assert len(surface.index) >= 10
 
 
 def test_generate_greek_curve_uses_injected_repo() -> None:
