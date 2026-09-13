@@ -352,9 +352,22 @@ def _price_range(spot: float, span: float = PRICE_SPAN, n: int = CURVE_POINTS) -
     return tuple(float(x) for x in np.linspace(lo, hi, max(int(n), 200)))
 
 
+def _historical_date_iso() -> str | None:
+    """Selected 'Fetch Historical Data' date as YYYY-MM-DD, or None for live data."""
+    picked = st.session_state.get("historical_date")
+    if isinstance(picked, (list, tuple)):
+        picked = picked[0] if picked else None
+    if isinstance(picked, date):
+        return picked.isoformat()
+    return None
+
+
 def _repo_chain(ticker: str, expiry: Any = None) -> pd.DataFrame:
     repo = _get_repo()
     symbol = str(ticker or "").strip().upper()
+    as_of = _historical_date_iso()
+    if as_of:
+        return repo.get_data(symbol, expiry, date=as_of)
     if not repo.is_fresh(symbol):
         return repo.get_data(symbol, expiry)
     return repo.get_data(symbol, expiry)
@@ -386,13 +399,15 @@ def _fresh_chain_for_snapshot(symbol: str, expiry: Any = None) -> pd.DataFrame:
             except Exception:
                 pass
     frame = pd.DataFrame()
+    as_of = _historical_date_iso()
     try:
-        frame = repo._fetch(symbol, expiry)
+        frame = repo._fetch(symbol, expiry, date=as_of) if as_of else repo._fetch(symbol, expiry)
     except Exception:
         frame = pd.DataFrame()
     if not isinstance(frame, pd.DataFrame) or frame.empty:
         frame = _repo_chain(symbol, expiry)
-    if live_spot is not None and isinstance(frame, pd.DataFrame) and not frame.empty:
+    # Never stamp today's live spot onto a historical EOD chain.
+    if as_of is None and live_spot is not None and isinstance(frame, pd.DataFrame) and not frame.empty:
         frame = frame.copy()
         frame["underlyingPrice"] = float(live_spot)
         frame["S"] = float(live_spot)
@@ -400,12 +415,19 @@ def _fresh_chain_for_snapshot(symbol: str, expiry: Any = None) -> pd.DataFrame:
     return frame
 
 
-def _capture_snapshot(ticker: str, expiry: Any = None) -> None:
+def _capture_snapshot(ticker: str, expiry: Any = None, strike: float | None = None) -> None:
     symbol = str(ticker or "").strip().upper() or DEFAULT_TICKER
     repo = _get_repo()
     data = _fresh_chain_for_snapshot(symbol, expiry)
+    as_of = _historical_date_iso() or date.today().isoformat()
+    metadata = {
+        "ticker": symbol,
+        "strike": strike,
+        "expiry": expiry.isoformat() if isinstance(expiry, date) else (str(expiry)[:10] if expiry else None),
+        "as_of_date": as_of,
+    }
     before = len(repo.get_historical_snapshots(symbol))
-    repo.save_to_cache(symbol, data)
+    repo.save_to_cache(symbol, data, metadata=metadata)
     after = len(repo.get_historical_snapshots(symbol))
     _reset_time_machine_keys(symbol)
     try:
@@ -932,8 +954,18 @@ def _sidebar_inputs() -> tuple[str, float, date, float, str, bool, Any]:
             st.session_state.persisted_iv = None
             st.rerun()
 
+        historical = st.date_input(
+            "Fetch Historical Data",
+            value=None,
+            max_value=date.today(),
+            key="historical_date",
+            help="Pick a past date to load that day's end-of-day chain instead of live data. Clear to return to live.",
+        )
+        if isinstance(historical, date):
+            st.caption(f"Historical mode: chain as of {historical.isoformat()}")
+
         if st.button("Capture Snapshot", width="stretch"):
-            _capture_snapshot(ticker_norm, expiry)
+            _capture_snapshot(ticker_norm, expiry, strike)
             st.rerun()
         if st.session_state.pop("snapshot_saved", False):
             st.success("Snapshot saved!")
@@ -2335,6 +2367,8 @@ def add_time_machine_tab(tab: Any, ticker: str) -> None:
             st.error("Snapshot data is corrupt/empty.")
         elif str(start) == str(end):
             st.error("Start and End snapshots are identical; delta drift is zero everywhere. Pick two different snapshots.")
+        elif not (match := DataRepository.validate_snapshot_match(payload_a, payload_b))[0]:
+            st.error(match[1])
         else:
             try:
                 grid = cached_delta_drift_grid(str(ticker), str(start), str(end))

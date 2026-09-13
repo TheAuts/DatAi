@@ -239,12 +239,23 @@ def _payload_to_frame(payload: dict[str, Any], ticker: str) -> pd.DataFrame:
     return pd.DataFrame(rows).loc[:, list(CHAIN_COLUMNS)]
 
 
-def fetch_option_chain(ticker: str, expiry: Any = None) -> pd.DataFrame:
+def _with_date_query(path: str, date: str | None) -> str:
+    """Append ``date=YYYY-MM-DD`` to ``path`` (``?`` or ``&`` as appropriate) for historical EOD data."""
+    text = str(date or "").strip()
+    if not text:
+        return path
+    separator = "&" if "?" in path else "?"
+    return f"{path}{separator}date={text}"
+
+
+def fetch_option_chain(ticker: str, expiry: Any = None, date: str | None = None) -> pd.DataFrame:
     """Fetch the MarketData.app options chain for ``ticker``.
 
     Args:
         ticker: Underlying symbol.
         expiry: Optional ``YYYY-MM-DD``. If omitted, the API returns the next monthly expiry.
+        date: Optional ``YYYY-MM-DD``. When given, requests the historical end-of-day
+            chain as of that date (``?date=`` query parameter) instead of live data.
 
     Returns:
         DataFrame with strike, expiration, bid, ask, underlyingPrice, plus S/K/T/sigma.
@@ -262,7 +273,8 @@ def fetch_option_chain(ticker: str, expiry: Any = None) -> pd.DataFrame:
     if expiry_iso:
         params["expiration"] = expiry_iso
 
-    payload = _marketdata_get(CHAIN_PATH.format(symbol=symbol), params)
+    path = _with_date_query(CHAIN_PATH.format(symbol=symbol), _expiry_iso(date) if date else None)
+    payload = _marketdata_get(path, params)
     if not payload or str(payload.get("s") or "").lower() == "no_data":
         return _empty_chain()
     try:
