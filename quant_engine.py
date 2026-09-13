@@ -53,6 +53,61 @@ CONCENTRATION_WARN_PCT = 30.0
 _LOG = logging.getLogger("datiai.quant")
 MODEL_BLACK_SCHOLES = "black-scholes"
 MODEL_HESTON = "heston"
+
+
+def prepare_plotly_surface_xyz(
+    z_data: Any,
+    x: Any = None,
+    y: Any = None,
+    *,
+    rows: int | None = None,
+    cols: int | None = None,
+) -> tuple[np.ndarray, np.ndarray | None, np.ndarray | None, str | None]:
+    """Coerce ``z`` to 2D and gate Plotly Surface ``x``/``y`` axes.
+
+    Returns ``(z2d, x_or_none, y_or_none, warning_or_none)``. Axes are only
+    returned when ``len(x) == z.shape[1]`` and ``len(y) == z.shape[0]``; otherwise
+    they are omitted so Plotly can fall back to default indices.
+    """
+    x_arr = None if x is None else np.asarray(x, dtype=float).reshape(-1)
+    y_arr = None if y is None else np.asarray(y, dtype=float).reshape(-1)
+    inferred_rows = int(rows) if rows is not None else (int(len(y_arr)) if y_arr is not None else None)
+    inferred_cols = int(cols) if cols is not None else (int(len(x_arr)) if x_arr is not None else None)
+    raw = np.asarray(
+        [np.nan if v is None else v for v in z_data] if isinstance(z_data, (list, tuple)) else z_data,
+        dtype=np.float64,
+    )
+    if raw.ndim == 2:
+        z2d = raw
+    elif inferred_rows is not None and inferred_cols is not None and raw.size == inferred_rows * inferred_cols:
+        z2d = raw.reshape(inferred_rows, inferred_cols)
+    elif raw.ndim == 1 and inferred_cols is not None and inferred_cols > 0 and raw.size % inferred_cols == 0:
+        z2d = raw.reshape(-1, inferred_cols)
+    elif raw.ndim == 1 and inferred_rows is not None and inferred_rows > 0 and raw.size % inferred_rows == 0:
+        z2d = raw.reshape(inferred_rows, -1)
+    elif raw.size == 0:
+        z2d = np.empty((0, 0), dtype=np.float64)
+    else:
+        side = int(np.sqrt(raw.size))
+        if side > 0 and side * side == raw.size:
+            z2d = raw.reshape(side, side)
+        else:
+            z2d = raw.reshape(1, -1) if raw.size else np.empty((0, 0), dtype=np.float64)
+    if z2d.ndim != 2:
+        z2d = z2d.reshape(z2d.shape[0], -1) if z2d.size else np.empty((0, 0), dtype=np.float64)
+    warning: str | None = None
+    if x_arr is not None and y_arr is not None and len(x_arr) == z2d.shape[1] and len(y_arr) == z2d.shape[0]:
+        return z2d.astype(float, copy=False), x_arr, y_arr, None
+    if x_arr is not None or y_arr is not None:
+        warning = (
+            f"Surface axis length mismatch "
+            f"(x={None if x_arr is None else len(x_arr)}, "
+            f"y={None if y_arr is None else len(y_arr)}, "
+            f"z={z2d.shape}); omitting x/y and using default indices."
+        )
+    return z2d.astype(float, copy=False), None, None, warning
+
+
 _EMPTY_GREEKS: dict[str, float | None] = {
     "Delta": None,
     "Gamma": None,
@@ -585,6 +640,42 @@ def calculate_heston_greeks(option_data: Mapping[str, Any]) -> dict[str, float |
     return result
 
 
+def generate_synthetic_drift(ticker: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Build a non-flat synthetic delta-drift surface for Time Machine fallback.
+
+    Uses ``np.meshgrid`` over Strike × DTE with a mix of ``np.sin`` / ``np.cos``
+    ripples and Gaussian "market move" bumps so ``Z`` has visible depth
+    (``min != max``, not ~0). Return contract matches
+    :meth:`DataRepository.calculate_delta_drift_grid`:
+    ``(strike_axis, dte_axis, Z)`` with ``Z.shape == (len(dte_axis), len(strike_axis))``.
+
+    The surface is deterministic for a given ``ticker`` (phase offset from the name).
+    """
+    label = str(ticker or "SYN").strip().upper() or "SYN"
+    phase = (sum(ord(ch) for ch in label) % 97) / 97.0
+    nx = int(max(16, min(40, VOL_SURFACE_STRIKE_POINTS // 2)))
+    ny = int(max(12, min(30, VOL_SURFACE_DTE_POINTS // 2)))
+    strike_axis = np.linspace(80.0, 120.0, nx, dtype=np.float64)
+    dte_axis = np.linspace(7.0, 60.0, ny, dtype=np.float64)
+    grid_x, grid_y = np.meshgrid(strike_axis, dte_axis)
+    xn = (grid_x - float(strike_axis.min())) / (float(strike_axis.max() - strike_axis.min()) + 1e-12)
+    yn = (grid_y - float(dte_axis.min())) / (float(dte_axis.max() - dte_axis.min()) + 1e-12)
+    # Sin/cos ripples give a rolling market texture; Gaussians add a localized move.
+    ripples = (
+        0.12 * np.sin(2.0 * np.pi * (xn + phase)) * np.cos(2.0 * np.pi * (yn - 0.5 * phase))
+        + 0.06 * np.cos(3.0 * np.pi * xn + phase)
+        + 0.04 * np.sin(np.pi * yn + 2.0 * phase)
+    )
+    bump_a = 0.22 * np.exp(
+        -(((xn - (0.35 + 0.1 * phase)) ** 2) / (2.0 * 0.08**2) + ((yn - 0.45) ** 2) / (2.0 * 0.10**2))
+    )
+    bump_b = -0.16 * np.exp(
+        -(((xn - (0.70 - 0.1 * phase)) ** 2) / (2.0 * 0.09**2) + ((yn - 0.65) ** 2) / (2.0 * 0.12**2))
+    )
+    drift = (ripples + bump_a + bump_b).astype(float)
+    return strike_axis.astype(float), dte_axis.astype(float), drift
+
+
 class DataRepository:
     """TTL-backed JSON cache for option-chain frames, with atomic writes."""
 
@@ -609,6 +700,14 @@ class DataRepository:
         self.history_dir.mkdir(parents=True, exist_ok=True)
         self._fetcher = fetcher
         self._status_probe = status_probe
+        # Last ingest outcome for dashboard (token / API Error: [code]).
+        self.last_ingest_status: dict[str, Any] = {
+            "ok": True,
+            "status_code": None,
+            "message": "",
+            "token_missing": False,
+            "is_mock": False,
+        }
 
     def _safe_ticker(self, ticker: str) -> str:
         symbol = str(ticker or "").strip().upper() or "_"
@@ -1182,15 +1281,44 @@ class DataRepository:
             raise ValueError(f"surface shape {arr.shape} != expected {(rows, cols)}")
         return arr.astype(float)
 
+    @staticmethod
+    def _drift_surface_is_flat(z: np.ndarray) -> bool:
+        """True when ``z`` is empty, non-finite, constant, or ~0 everywhere."""
+        arr = np.asarray(z, dtype=float)
+        if arr.size == 0:
+            return True
+        finite = arr[np.isfinite(arr)]
+        if finite.size == 0:
+            return True
+        z_min, z_max = float(np.min(finite)), float(np.max(finite))
+        if z_min == z_max:
+            return True
+        return bool(np.allclose(finite, 0.0, atol=1e-12))
+
     def calculate_delta_drift_grid(
         self, ticker: str, ts_a: Any, ts_b: Any
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, bool]:
         """Delta drift between two snapshots as a 2D grid: ``later - earlier``.
 
-        Returns ``(strike_axis, dte_axis, Z)`` with ``Z.shape == (len(dte_axis), len(strike_axis))``
-        and ``Z.dtype == float``. All three arrays are empty when either snapshot lacks usable data.
+        Contract gate: when both payloads carry comparable ``metadata`` (ticker /
+        strike / expiry), a mismatch short-circuits to an empty grid so callers
+        never render a flat plane for an invalid pair.
+
+        When a comparable pair yields a flat plane (identical snapshots / min≈max /
+        all ~0), the grid is replaced by :func:`generate_synthetic_drift`.
+
+        Returns ``(strike_axis, dte_axis, Z, synthetic)`` with
+        ``Z.shape == (len(dte_axis), len(strike_axis))`` and ``Z.dtype == float``.
+        ``synthetic`` is True when the surface came from the fallback generator.
+        Axes/Z are empty when metadata mismatches, either snapshot lacks usable
+        data, or the grid cannot be built.
         """
-        empty = (np.empty(0, dtype=float), np.empty(0, dtype=float), np.empty((0, 0), dtype=float))
+        empty = (
+            np.empty(0, dtype=float),
+            np.empty(0, dtype=float),
+            np.empty((0, 0), dtype=float),
+            False,
+        )
         payload_a = self._snapshot_payload(ticker, ts_a) or {}
         payload_b = self._snapshot_payload(ticker, ts_b) or {}
         keys_a = list(payload_a.keys())
@@ -1203,11 +1331,11 @@ class DataRepository:
             print("Both timestamps resolve to the same snapshot_id; drift will be zero.")
         if "delta_surface" not in payload_a or "delta_surface" not in payload_b:
             print("Delta surface missing from snapshot!")
-        if payload_a and payload_b:
-            matched, message = self.validate_snapshot_match(payload_a, payload_b)
-            if not matched:
-                print(message)
-                return empty
+        # Metadata must match before any interpolation / surface math runs.
+        matched, message = self.validate_snapshot_match(payload_a, payload_b)
+        if not matched:
+            print(message)
+            return empty
         frame_a = self._records_to_frame(payload_a.get("data"))
         frame_b = self._records_to_frame(payload_b.get("data"))
         if frame_a.empty or frame_b.empty:
@@ -1236,16 +1364,27 @@ class DataRepository:
         if drift.shape != grid_x.shape or drift.shape != (len(dte_axis), len(strike_axis)):
             print("Delta drift grid shape mismatch:", drift.shape, grid_x.shape)
             return empty
-        return strike_axis.astype(float), dte_axis.astype(float), drift
+        synthetic = False
+        if self._drift_surface_is_flat(drift):
+            print("Flat delta drift detected; substituting synthetic test surface.")
+            strike_axis, dte_axis, drift = generate_synthetic_drift(str(ticker))
+            synthetic = True
+        return strike_axis.astype(float), dte_axis.astype(float), drift, synthetic
 
     def calculate_delta_drift(self, ticker: str, ts_a: Any, ts_b: Any) -> pd.DataFrame:
         """Long-format ``Strike``/``DaysToExpiry``/``Delta`` drift frame (``ts_b - ts_a``).
 
-        Thin wrapper over :meth:`calculate_delta_drift_grid`; the 2D grid is also
-        exposed via ``frame.attrs["Z"]``, ``["X"]`` and ``["Y"]`` for direct Plotly use.
+        Thin wrapper over :meth:`calculate_delta_drift_grid`. Contract metadata
+        mismatches (and other empty-grid cases) yield an empty frame with the
+        usual columns so callers stay compatible and skip surface rendering.
+        The 2D grid is also exposed via ``frame.attrs["Z"]``, ``["X"]`` and
+        ``["Y"]`` for direct Plotly use when drift is non-empty.
+        ``frame.attrs["synthetic"]`` is True when a flat real drift was replaced
+        by :func:`generate_synthetic_drift`.
         """
         empty = pd.DataFrame(columns=["Strike", "DaysToExpiry", "Delta"])
-        strike_axis, dte_axis, drift = self.calculate_delta_drift_grid(ticker, ts_a, ts_b)
+        empty.attrs["synthetic"] = False
+        strike_axis, dte_axis, drift, synthetic = self.calculate_delta_drift_grid(ticker, ts_a, ts_b)
         if drift.size == 0:
             return empty
         grid_x, grid_y = np.meshgrid(strike_axis, dte_axis)
@@ -1259,6 +1398,7 @@ class DataRepository:
         frame.attrs["X"] = strike_axis
         frame.attrs["Y"] = dte_axis
         frame.attrs["Z"] = drift
+        frame.attrs["synthetic"] = bool(synthetic)
         return frame
 
     def snapshot_vol_surface(self, ticker: str, timestamp: Any) -> pd.DataFrame | str:
@@ -1274,9 +1414,179 @@ class DataRepository:
             records = payload.get("data") or []
             return pd.DataFrame(records)
         frame = self._fetch(ticker, expiry)
-        if isinstance(frame, pd.DataFrame) and not frame.empty:
+        if isinstance(frame, pd.DataFrame) and not frame.empty and not self._frame_is_mock(frame):
             self.save_to_cache(ticker, frame)
         return frame if isinstance(frame, pd.DataFrame) else pd.DataFrame()
+
+    @staticmethod
+    def _frame_is_mock(frame: Any) -> bool:
+        if not isinstance(frame, pd.DataFrame):
+            return False
+        try:
+            return bool(frame.attrs.get("is_mock"))
+        except Exception:
+            return False
+
+    def _set_ingest_status(
+        self,
+        *,
+        ok: bool,
+        status_code: Any = None,
+        message: str = "",
+        token_missing: bool = False,
+        is_mock: bool = False,
+    ) -> None:
+        self.last_ingest_status = {
+            "ok": bool(ok),
+            "status_code": status_code,
+            "message": str(message or ""),
+            "token_missing": bool(token_missing),
+            "is_mock": bool(is_mock),
+        }
+
+    def ui_error_message(self) -> str | None:
+        """Human-facing status for Streamlit: ``API Token Missing`` or ``API Error: [code]``."""
+        status = self.last_ingest_status or {}
+        if status.get("token_missing"):
+            return "API Token Missing"
+        if status.get("ok"):
+            return None
+        code = status.get("status_code")
+        if code is None or code == "":
+            code = "RequestFailed"
+        return f"API Error: {code}"
+
+    def verify_connection(self, symbol: str = "SPY") -> dict[str, Any]:
+        """Lightweight GET for a stable symbol before complex chain fetches.
+
+        On failure, logs the exact status code and error message and updates
+        ``last_ingest_status`` for the dashboard.
+        """
+        from data_ingestion import (
+            API_BASE,
+            QUOTES_PATH,
+            _headers,
+            get_api_key,
+            get_last_api_error,
+            _normalize_ticker,
+        )
+
+        probe = _normalize_ticker(symbol) or "SPY"
+        if not get_api_key():
+            message = "API Token Missing"
+            _LOG.error("verify_connection failed symbol=%s status=%s error=%s", probe, None, message)
+            result = {
+                "ok": False,
+                "status_code": None,
+                "message": message,
+                "token_missing": True,
+                "symbol": probe,
+            }
+            self._set_ingest_status(ok=False, message=message, token_missing=True, is_mock=False)
+            return result
+        if self._status_probe is not None:
+            try:
+                probed = self._status_probe()
+            except Exception as exc:
+                _LOG.error(
+                    "verify_connection failed symbol=%s status=%s error=%s",
+                    probe,
+                    None,
+                    exc,
+                )
+                self._set_ingest_status(ok=False, message=str(exc), is_mock=False)
+                return {
+                    "ok": False,
+                    "status_code": None,
+                    "message": str(exc),
+                    "token_missing": False,
+                    "symbol": probe,
+                }
+            if isinstance(probed, dict):
+                ok = bool(probed.get("ok"))
+                status_code = probed.get("status_code")
+                message = str(probed.get("message") or ("reachable" if ok else "unreachable"))
+                self._set_ingest_status(
+                    ok=ok,
+                    status_code=status_code,
+                    message=message,
+                    token_missing=bool(probed.get("token_missing")),
+                )
+                if not ok:
+                    _LOG.error(
+                        "verify_connection failed symbol=%s status=%s error=%s",
+                        probe,
+                        status_code,
+                        message,
+                    )
+                return {
+                    "ok": ok,
+                    "status_code": status_code,
+                    "message": message,
+                    "token_missing": bool(probed.get("token_missing")),
+                    "symbol": probe,
+                }
+            ok = bool(probed)
+            self._set_ingest_status(ok=ok, message=str(probed))
+            return {
+                "ok": ok,
+                "status_code": None,
+                "message": str(probed),
+                "token_missing": False,
+                "symbol": probe,
+            }
+        try:
+            import requests
+
+            path = QUOTES_PATH.format(symbol=probe)
+            response = requests.get(
+                f"{API_BASE}{path}",
+                headers=_headers(),
+                timeout=8,
+            )
+            status_code = int(response.status_code)
+            if status_code >= 400:
+                message = f"HTTP {status_code}: {response.text[:300]}"
+                _LOG.error(
+                    "verify_connection failed symbol=%s status=%s error=%s",
+                    probe,
+                    status_code,
+                    message,
+                )
+                self._set_ingest_status(ok=False, status_code=status_code, message=message)
+                return {
+                    "ok": False,
+                    "status_code": status_code,
+                    "message": message,
+                    "token_missing": False,
+                    "symbol": probe,
+                }
+            self._set_ingest_status(ok=True, status_code=status_code, message="reachable")
+            return {
+                "ok": True,
+                "status_code": status_code,
+                "message": "reachable",
+                "token_missing": False,
+                "symbol": probe,
+            }
+        except Exception as exc:
+            err = get_last_api_error()
+            status_code = err.get("status_code")
+            message = str(exc)
+            _LOG.error(
+                "verify_connection failed symbol=%s status=%s error=%s",
+                probe,
+                status_code,
+                message,
+            )
+            self._set_ingest_status(ok=False, status_code=status_code, message=message)
+            return {
+                "ok": False,
+                "status_code": status_code,
+                "message": message,
+                "token_missing": False,
+                "symbol": probe,
+            }
 
     def get_api_status(self) -> dict[str, Any]:
         if self._status_probe is not None:
@@ -1288,35 +1598,93 @@ class DataRepository:
                 return result
             return {"ok": bool(result), "status_code": None, "message": str(result)}
         try:
-            import requests
-            from data_ingestion import API_BASE, _headers
+            from data_ingestion import get_api_key
 
-            response = requests.get(f"{API_BASE.rstrip('/')}/", headers=_headers(), timeout=8)
-            ok = int(response.status_code) < 500
-            return {
-                "ok": ok,
-                "status_code": int(response.status_code),
-                "message": "reachable" if ok else f"HTTP {response.status_code}",
-            }
+            if not get_api_key():
+                return {
+                    "ok": False,
+                    "status_code": None,
+                    "message": "API Token Missing",
+                    "token_missing": True,
+                }
+        except Exception:
+            pass
+        # Prefer the lightweight SPY probe when available.
+        try:
+            return self.verify_connection("SPY")
         except Exception as exc:
             return {"ok": False, "status_code": None, "message": str(exc)}
 
+    def _mock_on_failure(
+        self,
+        ticker: str,
+        *,
+        status_code: Any = None,
+        message: str = "",
+        token_missing: bool = False,
+    ) -> pd.DataFrame:
+        from data_ingestion import mock_option_chain
+
+        code = status_code if status_code is not None else "RequestFailed"
+        self._set_ingest_status(
+            ok=False,
+            status_code=status_code,
+            message=message,
+            token_missing=token_missing,
+            is_mock=True,
+        )
+        return mock_option_chain(
+            ticker,
+            error_code=code,
+            token_missing=token_missing,
+            message=message,
+        )
+
     def _fetch(self, ticker: str, expiry: Any, date: str | None = None) -> pd.DataFrame:
+        from data_ingestion import get_api_key, get_last_api_error, is_mock_frame
+
+        if self._fetcher is None and not get_api_key():
+            _LOG.error("DataRepository API token missing; returning mock data")
+            return self._mock_on_failure(ticker, message="API Token Missing", token_missing=True)
+
         if self._fetcher is not None:
             try:
                 # Only forward ``date`` when set so two-argument fetchers keep working.
-                return self._fetcher(ticker, expiry, date=date) if date else self._fetcher(ticker, expiry)
+                frame = self._fetcher(ticker, expiry, date=date) if date else self._fetcher(ticker, expiry)
             except Exception as exc:
                 _LOG.warning("DataRepository fetch failed ticker=%s expiry=%s error=%s", ticker, expiry, exc)
-                return pd.DataFrame()
+                return self._mock_on_failure(ticker, message=str(exc))
+            if is_mock_frame(frame):
+                err = get_last_api_error()
+                self._set_ingest_status(
+                    ok=False,
+                    status_code=err.get("status_code") or getattr(frame, "attrs", {}).get("api_error"),
+                    message=str(err.get("message") or frame.attrs.get("api_message") or ""),
+                    token_missing=bool(err.get("token_missing") or frame.attrs.get("token_missing")),
+                    is_mock=True,
+                )
+                return frame if isinstance(frame, pd.DataFrame) else self._mock_on_failure(ticker)
+            self._set_ingest_status(ok=True, message="ok", is_mock=False)
+            return frame if isinstance(frame, pd.DataFrame) else pd.DataFrame()
         try:
             from data_ingestion import fetch_option_chain
 
-            return fetch_option_chain(ticker, expiry, date=date) if date else fetch_option_chain(ticker, expiry)
+            frame = fetch_option_chain(ticker, expiry, date=date) if date else fetch_option_chain(ticker, expiry)
         except Exception as exc:
             _LOG.warning("DataRepository fetch failed ticker=%s expiry=%s error=%s", ticker, expiry, exc)
-            return pd.DataFrame()
-
+            return self._mock_on_failure(ticker, message=str(exc))
+        if is_mock_frame(frame):
+            err = get_last_api_error()
+            self._set_ingest_status(
+                ok=False,
+                status_code=err.get("status_code") or frame.attrs.get("api_error"),
+                message=str(err.get("message") or frame.attrs.get("api_message") or ""),
+                token_missing=bool(err.get("token_missing") or frame.attrs.get("token_missing")),
+                is_mock=True,
+            )
+            return frame
+        self._set_ingest_status(ok=True, message="ok", is_mock=False)
+        return frame if isinstance(frame, pd.DataFrame) else pd.DataFrame()
 
 def inspect_snapshot(filename: str) -> dict[str, Any]:
     raw = str(filename or "").strip()

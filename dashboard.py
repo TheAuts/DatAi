@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import time
 from datetime import date, timedelta
-from typing import Any
+from typing import Any, Mapping
 
 import pandas as pd
 import numpy as np
@@ -30,6 +30,7 @@ from quant_engine import (
     MODEL_BLACK_SCHOLES,
     MODEL_HESTON,
     DataRepository,
+    prepare_plotly_surface_xyz,
     analyze_event_outlook,
     analyze_gex_outlook,
     analyze_market_sentiment,
@@ -253,6 +254,44 @@ def _api_status_ok(status: Any) -> bool:
     return bool(status)
 
 
+def _surface_ingest_alerts(repo: DataRepository | None = None, frame: Any = None) -> None:
+    """Show ``API Token Missing`` / ``API Error: [code]`` from repo or mock frame attrs."""
+    status: dict[str, Any] = {}
+    if repo is not None:
+        status = dict(getattr(repo, "last_ingest_status", None) or {})
+        ui_msg = None
+        try:
+            ui_msg = repo.ui_error_message()
+        except Exception:
+            ui_msg = None
+        if ui_msg:
+            if "Token Missing" in ui_msg:
+                st.error(ui_msg)
+            else:
+                st.warning(ui_msg)
+            return
+    if isinstance(frame, pd.DataFrame):
+        try:
+            if frame.attrs.get("token_missing"):
+                st.error("API Token Missing")
+                return
+            if frame.attrs.get("is_mock"):
+                code = frame.attrs.get("api_error")
+                if code is None or code == "":
+                    code = "RequestFailed"
+                st.warning(f"API Error: {code}")
+                return
+        except Exception:
+            pass
+    if status.get("token_missing"):
+        st.error("API Token Missing")
+    elif status and not status.get("ok"):
+        code = status.get("status_code")
+        if code is None or code == "":
+            code = "RequestFailed"
+        st.warning(f"API Error: {code}")
+
+
 def _apply_theme() -> None:
     st.markdown(
         f"""
@@ -366,11 +405,38 @@ def _repo_chain(ticker: str, expiry: Any = None) -> pd.DataFrame:
     repo = _get_repo()
     symbol = str(ticker or "").strip().upper()
     as_of = _historical_date_iso()
-    if as_of:
-        return repo.get_data(symbol, expiry, date=as_of)
-    if not repo.is_fresh(symbol):
-        return repo.get_data(symbol, expiry)
-    return repo.get_data(symbol, expiry)
+    try:
+        health = repo.verify_connection("SPY")
+        if isinstance(health, dict) and health.get("token_missing"):
+            from data_ingestion import mock_option_chain
+
+            frame = mock_option_chain(symbol, token_missing=True, message="API Token Missing")
+            st.session_state["ingest_alert"] = "API Token Missing"
+            return frame
+    except Exception:
+        pass
+    try:
+        if as_of:
+            frame = repo.get_data(symbol, expiry, date=as_of)
+        else:
+            frame = repo.get_data(symbol, expiry)
+    except Exception as exc:
+        from data_ingestion import mock_option_chain
+
+        frame = mock_option_chain(symbol, error_code="Exception", message=str(exc))
+    msg = None
+    try:
+        msg = repo.ui_error_message()
+    except Exception:
+        msg = None
+    if msg:
+        st.session_state["ingest_alert"] = msg
+    elif isinstance(frame, pd.DataFrame) and frame.attrs.get("is_mock"):
+        code = frame.attrs.get("api_error") or "RequestFailed"
+        st.session_state["ingest_alert"] = (
+            "API Token Missing" if frame.attrs.get("token_missing") else f"API Error: {code}"
+        )
+    return frame if isinstance(frame, pd.DataFrame) else pd.DataFrame()
 
 
 def _reset_time_machine_keys(ticker: str) -> None:
@@ -1508,7 +1574,9 @@ def cached_delta_drift(ticker: str, ts_a: str, ts_b: str) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=120, show_spinner="Calculating delta drift grid…")
-def cached_delta_drift_grid(ticker: str, ts_a: str, ts_b: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+def cached_delta_drift_grid(
+    ticker: str, ts_a: str, ts_b: str
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, bool]:
     return DATA_REPO.calculate_delta_drift_grid(ticker, ts_a, ts_b)
 
 
@@ -1645,10 +1713,10 @@ def render_gamma_surface(frame: pd.DataFrame) -> None:
     pivot = pivot.sort_index().sort_index(axis=1)
     fig = go.Figure(
         data=[
-            go.Surface(
-                x=pivot.columns.to_numpy(dtype=float),
-                y=pivot.index.to_numpy(dtype=float),
-                z=pivot.to_numpy(dtype=float),
+            _plotly_surface(
+                pivot.to_numpy(dtype=float),
+                pivot.columns.to_numpy(dtype=float),
+                pivot.index.to_numpy(dtype=float),
                 colorscale="Viridis",
                 colorbar={"title": "Gamma"},
             )
@@ -1696,10 +1764,10 @@ def render_pro_surface(frame: pd.DataFrame, greek_name: str, *, apply_smoothing:
     z[~np.isfinite(z)] = np.nan
     fig = go.Figure(
         data=[
-            go.Surface(
-                x=pivot.columns.to_numpy(dtype=float),
-                y=pivot.index.to_numpy(dtype=float),
-                z=z,
+            _plotly_surface(
+                z,
+                pivot.columns.to_numpy(dtype=float),
+                pivot.index.to_numpy(dtype=float),
                 colorscale="Viridis",
                 connectgaps=False,
                 colorbar={"title": greek_name},
@@ -2151,6 +2219,38 @@ def _surface_payload_is_empty(surface: Any, value_key: str) -> bool:
     return finite.size == 0 or bool(np.all(finite == 0.0))
 
 
+def _plotly_surface(
+    z_data: Any,
+    x: Any = None,
+    y: Any = None,
+    *,
+    rows: int | None = None,
+    cols: int | None = None,
+    **surface_kwargs: Any,
+) -> go.Surface:
+    """Build ``go.Surface`` with 2D ``z`` and gated ``x``/``y`` axes."""
+    z2d, x_ok, y_ok, warning = prepare_plotly_surface_xyz(z_data, x, y, rows=rows, cols=cols)
+    if warning:
+        st.warning(warning)
+    payload: dict[str, Any] = {"z": z2d, **surface_kwargs}
+    if x_ok is not None and y_ok is not None:
+        payload["x"] = x_ok
+        payload["y"] = y_ok
+    return go.Surface(**payload)
+
+
+def _snapshot_ui_metadata(payload: Mapping[str, Any] | None, stamp: str) -> dict[str, Any]:
+    """Ticker / Strike / Expiry / Timestamp for the Snapshot Details expander."""
+    payload = payload if isinstance(payload, dict) else {}
+    meta = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+    return {
+        "Ticker": meta.get("ticker") or payload.get("ticker"),
+        "Strike": meta.get("strike"),
+        "Expiry": meta.get("expiry"),
+        "Timestamp": payload.get("stamp") or stamp,
+    }
+
+
 def _write_snapshot_delta_ranges(payload_a: dict, payload_b: dict, label_a: str, label_b: str) -> None:
     """Show min/max of both compared delta surfaces so a flat drift can be diagnosed."""
 
@@ -2191,15 +2291,19 @@ def _write_snapshot_delta_ranges(payload_a: dict, payload_b: dict, label_a: str,
 
 def render_delta_drift_surface(
     frame: pd.DataFrame,
-    grid: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None,
+    grid: tuple[np.ndarray, np.ndarray, np.ndarray] | tuple[np.ndarray, np.ndarray, np.ndarray, bool] | None = None,
 ) -> None:
     x_axis: np.ndarray
     y_axis: np.ndarray
     Z: np.ndarray
-    if grid is not None and len(grid) == 3 and np.asarray(grid[2]).size > 0:
+    synthetic = bool(getattr(frame, "attrs", {}).get("synthetic")) if frame is not None else False
+    if grid is not None and len(grid) >= 3 and np.asarray(grid[2]).size > 0:
         x_axis = np.asarray(grid[0], dtype=float)
         y_axis = np.asarray(grid[1], dtype=float)
+        # Grid contract: Z = surface_b - surface_a (later - earlier), or synthetic.
         Z = np.array(grid[2], dtype=float, copy=True)
+        if len(grid) >= 4:
+            synthetic = bool(grid[3]) or synthetic
     else:
         required = {"Strike", "DaysToExpiry", "Delta"}
         if frame is None or frame.empty or not required.issubset(frame.columns):
@@ -2218,33 +2322,31 @@ def render_delta_drift_surface(
         x_axis = pivot.columns.to_numpy(dtype=float)
         y_axis = pivot.index.to_numpy(dtype=float)
         Z = np.array(pivot.to_numpy(dtype=float), copy=True)
+    if synthetic:
+        st.info("No real drift detected. Showing synthetic test surface.")
     Z = Z.astype(float)
     Z[~np.isfinite(Z)] = np.nan
-    if Z.ndim != 2 or not np.isfinite(Z).any():
-        st.write(f"Z-matrix shape: {Z.shape}")
+    z2d, _, _, _ = prepare_plotly_surface_xyz(Z, x_axis, y_axis)
+    if z2d.ndim != 2 or not np.isfinite(z2d).any():
+        st.write(f"Z-matrix shape: {z2d.shape}")
         st.error("Delta drift Z-matrix is not a 2D grid or contains no finite values; refusing to render a flat plane.")
         return
-    z_min, z_max = float(np.nanmin(Z)), float(np.nanmax(Z))
-    st.write(f"Z-matrix shape: {Z.shape}, Min: {z_min}, Max: {z_max}")
-    if Z.shape != (len(y_axis), len(x_axis)):
-        st.error(f"Delta drift grid shape {Z.shape} does not match axes ({len(y_axis)}, {len(x_axis)}).")
-        return
-    if z_min == z_max:
-        st.error(
-            "Delta drift surface is constant (Min == Max), so it would render as a flat plane. "
-            "Pick two snapshots whose option data actually differs."
-        )
-        return
+    z_min, z_max = float(np.nanmin(z2d)), float(np.nanmax(z2d))
+    st.write(f"Z-matrix shape: {z2d.shape}, Min: {z_min}, Max: {z_max}")
+    st.write({"drift_min": z_min, "drift_max": z_max, "synthetic": synthetic})
+    finite = z2d[np.isfinite(z2d)]
+    if not synthetic and (z_min == z_max or (finite.size > 0 and bool(np.allclose(finite, 0.0, atol=1e-12)))):
+        st.write({"drift_min": z_min, "drift_max": z_max, "flat_plane": True})
     fig = go.Figure(
         data=[
-            go.Surface(
-                x=x_axis,
-                y=y_axis,
-                z=Z,
+            _plotly_surface(
+                z2d,
+                x_axis,
+                y_axis,
                 colorscale="RdBu",
                 reversescale=True,
                 cmid=0,
-                colorbar={"title": "Delta drift"},
+                colorbar={"title": "Delta drift" + (" (synthetic)" if synthetic else "")},
                 hovertemplate="Strike=%{x:.2f}<br>DTE=%{y:.1f}<br>Drift=%{z:.6f}<extra></extra>",
             )
         ]
@@ -2303,10 +2405,10 @@ def render_time_machine_vol_surface(frame: pd.DataFrame | str, timestamp: str) -
     st.write(f"IV Z-matrix shape: {z.shape}, Min: {np.nanmin(z)}, Max: {np.nanmax(z)}")
     fig = go.Figure(
         data=[
-            go.Surface(
-                x=pivot.columns.to_numpy(dtype=float),
-                y=pivot.index.to_numpy(dtype=float),
-                z=z,
+            _plotly_surface(
+                z,
+                pivot.columns.to_numpy(dtype=float),
+                pivot.index.to_numpy(dtype=float),
                 colorscale="Viridis",
                 colorbar={"title": "IV"},
                 hovertemplate="Strike=%{x:.2f}<br>DTE=%{y:.1f}<br>IV=%{z:.4f}<extra></extra>",
@@ -2341,18 +2443,34 @@ def render_time_machine_vol_surface(frame: pd.DataFrame | str, timestamp: str) -
 
 def add_time_machine_tab(tab: Any, ticker: str) -> None:
     with tab:
-        snapshots = _get_repo().get_available_snapshots(ticker)
+        _surface_ingest_alerts(_get_repo())
+        alert = st.session_state.get("ingest_alert")
+        if alert and isinstance(alert, str):
+            if "Token Missing" in alert:
+                st.error(alert)
+            elif alert.startswith("API Error:"):
+                st.warning(alert)
+        repo = _get_repo()
+        # Data sync: stamps come from timestamped files under data_history/ via DataRepository.
+        snapshots = repo.get_available_snapshots(ticker)
         if not snapshots:
             st.info("No snapshots in data_history/ for this ticker.")
             return
         st.subheader("Delta drift")
-        start_col, end_col = st.columns(2)
+        start_col, end_col = st.columns([1, 1])
         with start_col:
             start = st.selectbox("Start Snapshot", snapshots, index=0, key=f"tm_start_{ticker}")
         with end_col:
             end = st.selectbox("End Snapshot", snapshots, index=len(snapshots) - 1, key=f"tm_end_{ticker}")
-        payload_a = _get_repo()._snapshot_payload(ticker, start) or {}
-        payload_b = _get_repo()._snapshot_payload(ticker, end) or {}
+        payload_a = repo._snapshot_payload(ticker, start) or {}
+        payload_b = repo._snapshot_payload(ticker, end) or {}
+        with st.expander("Snapshot Details", expanded=False):
+            st.write(
+                {
+                    "Start": _snapshot_ui_metadata(payload_a, str(start)),
+                    "End": _snapshot_ui_metadata(payload_b, str(end)),
+                }
+            )
         st.write(
             {
                 "Start Snapshot keys": list(payload_a.keys()),
@@ -2365,17 +2483,34 @@ def add_time_machine_tab(tab: Any, ticker: str) -> None:
             payload_b.get("delta_surface"), "Delta"
         ):
             st.error("Snapshot data is corrupt/empty.")
-        elif str(start) == str(end):
-            st.error("Start and End snapshots are identical; delta drift is zero everywhere. Pick two different snapshots.")
-        elif not (match := DataRepository.validate_snapshot_match(payload_a, payload_b))[0]:
-            st.error(match[1])
+        elif not DataRepository.validate_snapshot_match(payload_a, payload_b)[0]:
+            st.warning(
+                "Invalid Comparison: You must select snapshots of the same contract to calculate Delta Drift."
+            )
         else:
+            if str(start) == str(end):
+                st.info("Identical snapshots selected — real drift is flat; synthetic fallback may apply.")
+            else:
+                st.success("Valid Contract Pair: Calculating Drift...")
             try:
                 grid = cached_delta_drift_grid(str(ticker), str(start), str(end))
                 drift = cached_delta_drift(str(ticker), str(start), str(end))
-                z_grid = np.asarray(grid[2], dtype=float) if grid is not None and len(grid) == 3 else np.empty(0)
+                synthetic = bool(getattr(drift, "attrs", {}).get("synthetic")) or (
+                    len(grid) >= 4 and bool(grid[3])
+                )
+                z_grid = np.asarray(grid[2], dtype=float) if grid is not None and len(grid) >= 3 else np.empty(0)
                 finite = z_grid[np.isfinite(z_grid)] if z_grid.size else z_grid
-                if finite.size == 0 or float(np.min(finite)) == float(np.max(finite)) or bool(np.all(finite == 0.0)):
+                if not synthetic and (
+                    finite.size == 0
+                    or float(np.min(finite)) == float(np.max(finite))
+                    or bool(np.all(np.isclose(finite, 0.0)))
+                ):
+                    st.write(
+                        {
+                            "drift_min": float(np.min(finite)) if finite.size else None,
+                            "drift_max": float(np.max(finite)) if finite.size else None,
+                        }
+                    )
                     _write_snapshot_delta_ranges(payload_a, payload_b, str(start), str(end))
                 render_delta_drift_surface(drift, grid=grid)
             except Exception as error:
@@ -2385,13 +2520,16 @@ def add_time_machine_tab(tab: Any, ticker: str) -> None:
         # Map each stamp to its on-disk snapshot file so the loader receives the
         # exact filename rather than a stamp/index that could match several files.
         stamp_to_file: dict[str, str] = {}
-        for path in _get_repo().get_historical_snapshots(ticker):
+        for path in repo.get_historical_snapshots(ticker):
             name = path.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
-            prefix = f"{_get_repo()._safe_ticker(ticker)}_"
+            prefix = f"{repo._safe_ticker(ticker)}_"
             if name.startswith(prefix) and name.endswith(".json"):
                 stamp_to_file.setdefault(name[len(prefix) : -len(".json")], path)
         stamp = st.select_slider("Snapshot", options=snapshots, value=snapshots[-1], key=f"tm_scrub_{ticker}")
         snapshot_file = stamp_to_file.get(str(stamp), str(stamp))
+        scrub_payload = repo._snapshot_payload(ticker, snapshot_file) or repo._snapshot_payload(ticker, stamp) or {}
+        with st.expander("Selected Snapshot Details", expanded=False):
+            st.write(_snapshot_ui_metadata(scrub_payload, str(stamp)))
         st.caption(f"Snapshot file: {snapshot_file}")
         try:
             surface = cached_snapshot_vol_surface(str(ticker), snapshot_file)
@@ -2416,10 +2554,10 @@ def render_advanced_greek_surface(frame: pd.DataFrame, greek: str) -> None:
     pivot = pivot.sort_index().sort_index(axis=1)
     fig = go.Figure(
         data=[
-            go.Surface(
-                x=pivot.columns.to_numpy(dtype=float),
-                y=pivot.index.to_numpy(dtype=float),
-                z=pivot.to_numpy(dtype=float),
+            _plotly_surface(
+                pivot.to_numpy(dtype=float),
+                pivot.columns.to_numpy(dtype=float),
+                pivot.index.to_numpy(dtype=float),
                 colorscale="Viridis",
                 colorbar={"title": greek},
                 hovertemplate="Price=%{x:.2f}<br>DTE=%{y:.1f}<br>" + greek + "=%{z:.6f}<extra></extra>",
@@ -2623,11 +2761,44 @@ def main() -> None:
     )
     _init_state()
     _apply_theme()
-    if not _api_status_ok(_get_repo().get_api_status()):
+    repo = _get_repo()
+    shown_alerts: set[str] = set()
+    try:
+        health = repo.verify_connection("SPY")
+    except Exception as exc:
+        health = {"ok": False, "status_code": None, "message": str(exc), "token_missing": False}
+    if isinstance(health, dict) and health.get("token_missing"):
+        st.error("API Token Missing")
+        shown_alerts.add("API Token Missing")
+    elif not _api_status_ok(health):
+        code = None
+        if isinstance(health, dict):
+            code = health.get("status_code")
+        if code is None or code == "":
+            code = "RequestFailed"
+        msg = f"API Error: {code}"
+        st.warning(msg)
+        shown_alerts.add(msg)
         st.error("API Service Unavailable")
 
     ticker, strike, expiry, current_price, option_type, _refresh, download_slot = _sidebar_inputs()
     ticker = ticker.strip().upper() or DEFAULT_TICKER
+    try:
+        ui_msg = repo.ui_error_message()
+    except Exception:
+        ui_msg = None
+    if ui_msg and ui_msg not in shown_alerts:
+        if "Token Missing" in ui_msg:
+            st.error(ui_msg)
+        else:
+            st.warning(ui_msg)
+        shown_alerts.add(ui_msg)
+    alert = st.session_state.pop("ingest_alert", None)
+    if isinstance(alert, str) and alert and alert not in shown_alerts:
+        if "Token Missing" in alert:
+            st.error(alert)
+        else:
+            st.warning(alert)
 
     st.title("Contract Greeks")
     st.caption("Price-domain Delta, Gamma, Theta, Vega, and Rho from `generate_greek_curve`.")

@@ -10,9 +10,10 @@ import argparse
 import json
 import logging
 import os
+import time
 from dataclasses import asdict, dataclass
 import math
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -30,6 +31,9 @@ CHAIN_PATH = "/options/chain/{symbol}/"
 EXPIRATIONS_PATH = "/options/expirations/{symbol}/"
 QUOTES_PATH = "/stocks/quotes/{symbol}/"
 REQUEST_TIMEOUT_SEC = 30
+API_RETRY_ATTEMPTS = 3
+API_RETRY_BACKOFF_SEC = 0.5
+HEALTH_CHECK_SYMBOL = "SPY"
 EASTERN = ZoneInfo("America/New_York")
 
 load_dotenv(PROJECT_ROOT / ".env")
@@ -51,6 +55,15 @@ CHAIN_COLUMNS = (
     "T",
     "sigma",
 )
+
+# Last API call outcome for dashboard / callers (status_code may be int or None).
+_LAST_API_ERROR: dict[str, Any] = {
+    "ok": True,
+    "status_code": None,
+    "message": "",
+    "token_missing": False,
+    "attempts": 0,
+}
 
 
 def _setup_logger() -> logging.Logger:
@@ -107,8 +120,93 @@ def get_api_key() -> str | None:
     return key or None
 
 
+def clear_last_api_error() -> None:
+    """Reset the module-level last-error record (used by tests and callers)."""
+    _LAST_API_ERROR.update(
+        {"ok": True, "status_code": None, "message": "", "token_missing": False, "attempts": 0}
+    )
+
+
+def get_last_api_error() -> dict[str, Any]:
+    """Return a shallow copy of the last API outcome for UI / diagnostics."""
+    return dict(_LAST_API_ERROR)
+
+
+def _record_api_error(
+    *,
+    status_code: Any = None,
+    message: str = "",
+    token_missing: bool = False,
+    attempts: int = 0,
+    ok: bool = False,
+) -> None:
+    _LAST_API_ERROR.update(
+        {
+            "ok": bool(ok),
+            "status_code": status_code,
+            "message": str(message or ""),
+            "token_missing": bool(token_missing),
+            "attempts": int(attempts),
+        }
+    )
+
+
 def _empty_chain() -> pd.DataFrame:
     return pd.DataFrame(columns=list(CHAIN_COLUMNS))
+
+
+def is_mock_frame(frame: Any) -> bool:
+    """True when ``frame`` is a mock fallback produced after an API failure."""
+    if not isinstance(frame, pd.DataFrame):
+        return False
+    try:
+        return bool(frame.attrs.get("is_mock"))
+    except Exception:
+        return False
+
+
+def mock_option_chain(
+    ticker: str = "SPY",
+    *,
+    error_code: Any = None,
+    token_missing: bool = False,
+    message: str = "",
+) -> pd.DataFrame:
+    """Minimal valid chain DataFrame so the dashboard does not crash on API failure.
+
+    Columns match ``CHAIN_COLUMNS`` (what the dashboard / engine expect). Marked
+    with ``attrs['is_mock']=True`` so callers must not treat it as a live fetch.
+    """
+    symbol = _normalize_ticker(ticker) or "SPY"
+    expiry = (date.today() + timedelta(days=30)).isoformat()
+    spot = 100.0
+    iv = 0.20
+    frame = pd.DataFrame(
+        [
+            {
+                "ticker": symbol,
+                "expiration": expiry,
+                "option_type": "call",
+                "strike": spot,
+                "lastPrice": 1.0,
+                "impliedVolatility": iv,
+                "bid": 0.9,
+                "ask": 1.1,
+                "underlyingPrice": spot,
+                "volume": 0,
+                "openInterest": 0,
+                "S": spot,
+                "K": spot,
+                "T": _time_to_expiry_years(expiry),
+                "sigma": iv,
+            }
+        ]
+    ).loc[:, list(CHAIN_COLUMNS)]
+    frame.attrs["is_mock"] = True
+    frame.attrs["token_missing"] = bool(token_missing)
+    frame.attrs["api_error"] = error_code
+    frame.attrs["api_message"] = str(message or "")
+    return frame
 
 
 def _headers() -> dict[str, str]:
@@ -120,28 +218,70 @@ def _headers() -> dict[str, str]:
 
 
 def _marketdata_get(path: str, params: dict[str, Any] | None = None) -> dict[str, Any] | None:
+    """GET MarketData with simple retry (3 attempts) for transient network blips."""
     url = f"{API_BASE}{path}"
     query = dict(params or {})
-    try:
-        response = requests.get(url, headers=_headers(), params=query, timeout=REQUEST_TIMEOUT_SEC)
-    except requests.RequestException as exc:
-        log.error("MarketData request failed url=%s error=%s", path, exc)
-        return None
-    if response.status_code >= 400:
-        log.error("MarketData HTTP %s url=%s body=%s", response.status_code, path, response.text[:300])
-        return None
-    try:
-        payload = response.json()
-    except ValueError:
-        log.error("MarketData non-JSON url=%s body=%s", path, response.text[:300])
-        return None
-    if not isinstance(payload, dict):
-        return None
-    status = str(payload.get("s") or "").lower()
-    if status and status not in {"ok", "no_data"}:
-        log.error("MarketData error url=%s errmsg=%s", path, payload.get("errmsg") or payload)
-        return None
-    return payload
+    last_status: Any = None
+    last_message = ""
+    attempts = 0
+    for attempt in range(1, API_RETRY_ATTEMPTS + 1):
+        attempts = attempt
+        try:
+            response = requests.get(url, headers=_headers(), params=query, timeout=REQUEST_TIMEOUT_SEC)
+        except requests.RequestException as exc:
+            last_status = None
+            last_message = str(exc)
+            log.error(
+                "MarketData request failed url=%s attempt=%s/%s status=%s error=%s",
+                path,
+                attempt,
+                API_RETRY_ATTEMPTS,
+                last_status,
+                exc,
+            )
+            if attempt < API_RETRY_ATTEMPTS:
+                time.sleep(API_RETRY_BACKOFF_SEC * attempt)
+                continue
+            _record_api_error(status_code=None, message=last_message, attempts=attempts)
+            return None
+        last_status = int(response.status_code)
+        if response.status_code >= 400:
+            last_message = f"HTTP {response.status_code}: {response.text[:300]}"
+            log.error(
+                "MarketData HTTP %s url=%s attempt=%s/%s body=%s",
+                response.status_code,
+                path,
+                attempt,
+                API_RETRY_ATTEMPTS,
+                response.text[:300],
+            )
+            # Retry transient server errors; permanent client errors stop early.
+            if response.status_code >= 500 and attempt < API_RETRY_ATTEMPTS:
+                time.sleep(API_RETRY_BACKOFF_SEC * attempt)
+                continue
+            _record_api_error(status_code=last_status, message=last_message, attempts=attempts)
+            return None
+        try:
+            payload = response.json()
+        except ValueError:
+            last_message = f"non-JSON body: {response.text[:300]}"
+            log.error("MarketData non-JSON url=%s body=%s", path, response.text[:300])
+            _record_api_error(status_code=last_status, message=last_message, attempts=attempts)
+            return None
+        if not isinstance(payload, dict):
+            last_message = "payload is not a JSON object"
+            _record_api_error(status_code=last_status, message=last_message, attempts=attempts)
+            return None
+        status = str(payload.get("s") or "").lower()
+        if status and status not in {"ok", "no_data"}:
+            last_message = str(payload.get("errmsg") or payload)
+            log.error("MarketData error url=%s errmsg=%s", path, last_message)
+            _record_api_error(status_code=last_status, message=last_message, attempts=attempts)
+            return None
+        _record_api_error(status_code=last_status, message="ok", attempts=attempts, ok=True)
+        return payload
+    _record_api_error(status_code=last_status, message=last_message or "request failed", attempts=attempts)
+    return None
 
 
 def _unix_to_iso(value: Any) -> str | None:
@@ -259,14 +399,21 @@ def fetch_option_chain(ticker: str, expiry: Any = None, date: str | None = None)
 
     Returns:
         DataFrame with strike, expiration, bid, ask, underlyingPrice, plus S/K/T/sigma.
-        Empty DataFrame if the ticker has no chain or the request fails.
+        On request failure or missing token, returns a mock DataFrame (``attrs['is_mock']``)
+        so the dashboard does not crash; check ``get_last_api_error()`` / attrs for status.
     """
     symbol = _normalize_ticker(ticker)
     if not symbol:
         return _empty_chain()
     if not get_api_key():
         log.error("MARKETDATA_API_KEY is missing")
-        return _empty_chain()
+        _record_api_error(
+            status_code=None,
+            message="API Token Missing",
+            token_missing=True,
+            attempts=0,
+        )
+        return mock_option_chain(symbol, token_missing=True, message="API Token Missing")
 
     params: dict[str, Any] = {}
     expiry_iso = _expiry_iso(expiry)
@@ -274,14 +421,28 @@ def fetch_option_chain(ticker: str, expiry: Any = None, date: str | None = None)
         params["expiration"] = expiry_iso
 
     path = _with_date_query(CHAIN_PATH.format(symbol=symbol), _expiry_iso(date) if date else None)
-    payload = _marketdata_get(path, params)
-    if not payload or str(payload.get("s") or "").lower() == "no_data":
+    try:
+        payload = _marketdata_get(path, params)
+    except Exception as exc:
+        log.error("MarketData chain fetch raised ticker=%s error=%s", symbol, exc)
+        _record_api_error(status_code=None, message=str(exc), attempts=API_RETRY_ATTEMPTS)
+        return mock_option_chain(symbol, error_code="Exception", message=str(exc))
+    if not payload:
+        err = get_last_api_error()
+        code = err.get("status_code") if err.get("status_code") is not None else "RequestFailed"
+        return mock_option_chain(
+            symbol,
+            error_code=code,
+            message=str(err.get("message") or "request failed"),
+        )
+    if str(payload.get("s") or "").lower() == "no_data":
         return _empty_chain()
     try:
         return _payload_to_frame(payload, symbol)
     except Exception as exc:
         log.error("Failed to parse option chain ticker=%s error=%s", symbol, exc)
-        return _empty_chain()
+        _record_api_error(status_code=None, message=str(exc), attempts=1)
+        return mock_option_chain(symbol, error_code="ParseError", message=str(exc))
 
 
 def fetch_options_data(ticker: str, expiry: Any = None) -> pd.DataFrame:
@@ -298,7 +459,11 @@ def get_available_expirations(ticker: str) -> list[str]:
     symbol = _normalize_ticker(ticker)
     if not symbol:
         return []
-    payload = _marketdata_get(EXPIRATIONS_PATH.format(symbol=symbol))
+    try:
+        payload = _marketdata_get(EXPIRATIONS_PATH.format(symbol=symbol))
+    except Exception as exc:
+        log.error("get_available_expirations failed ticker=%s error=%s", symbol, exc)
+        return []
     if payload:
         raw = _series(payload, "expirations", "expiration")
         out: list[str] = []
@@ -309,7 +474,7 @@ def get_available_expirations(ticker: str) -> list[str]:
         if out:
             return sorted(dict.fromkeys(out))
     frame = fetch_option_chain(symbol)
-    if frame.empty or "expiration" not in frame.columns:
+    if is_mock_frame(frame) or frame.empty or "expiration" not in frame.columns:
         return []
     return sorted(dict.fromkeys(str(value) for value in frame["expiration"].dropna()))
 
@@ -319,7 +484,11 @@ def get_current_price(ticker: str) -> float | None:
     symbol = _normalize_ticker(ticker)
     if not symbol:
         return None
-    payload = _marketdata_get(QUOTES_PATH.format(symbol=symbol))
+    try:
+        payload = _marketdata_get(QUOTES_PATH.format(symbol=symbol))
+    except Exception as exc:
+        log.error("get_current_price failed ticker=%s error=%s", symbol, exc)
+        payload = None
     if payload:
         last = _series(payload, "last", "mid")
         if last:
@@ -327,7 +496,7 @@ def get_current_price(ticker: str) -> float | None:
             if pd.notna(price) and float(price) > 0:
                 return float(price)
     frame = fetch_option_chain(symbol)
-    if frame.empty or "underlyingPrice" not in frame.columns:
+    if is_mock_frame(frame) or frame.empty or "underlyingPrice" not in frame.columns:
         return None
     spots = pd.to_numeric(frame["underlyingPrice"], errors="coerce").dropna()
     spots = spots.loc[spots > 0]
@@ -347,7 +516,7 @@ def preflight_check(ticker: str, expiry: Any = None) -> PreflightResult:
     expirations = get_available_expirations(symbol)
     if not expirations:
         frame = fetch_option_chain(symbol, expiry)
-        if frame.empty:
+        if frame.empty or is_mock_frame(frame):
             return PreflightResult(False, symbol, f"No option chain for {symbol}.")
         expirations = sorted(dict.fromkeys(str(value) for value in frame["expiration"].dropna()))
 
