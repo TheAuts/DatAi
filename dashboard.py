@@ -12,7 +12,13 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
-from data_ingestion import get_available_expirations, get_available_strikes, get_contract_iv, get_current_price
+from data_ingestion import (
+    fetch_option_chain,
+    get_available_expirations,
+    get_available_strikes,
+    get_contract_iv,
+    get_current_price,
+)
 from quant_engine import (
     DAYS_PER_YEAR,
     DEFAULT_HESTON_KAPPA,
@@ -22,8 +28,13 @@ from quant_engine import (
     DEFAULT_HESTON_V0,
     DEFAULT_RATE,
     DEFAULT_SIGMA,
+    GAMMA_FLIP_NEAR_PCT,
     MODEL_BLACK_SCHOLES,
     MODEL_HESTON,
+    analyze_event_outlook,
+    analyze_gex_outlook,
+    analyze_market_sentiment,
+    analyze_volatility_risk_outlook,
     calculate_charm,
     calculate_color,
     calculate_gamma_theta_ratio,
@@ -105,6 +116,7 @@ def _init_state() -> None:
         "heston_sigma": DEFAULT_HESTON_SIGMA,
         "heston_rho": DEFAULT_HESTON_RHO,
         "show_second_order": False,
+        "show_gamma_flip_line": True,
         "advanced_view_3d": False,
         "advanced_surface_greek": "Charm",
         "main_view": "Greeks",
@@ -434,7 +446,13 @@ def _spot_greeks(frame: pd.DataFrame, spot: float, use_heston: bool = False) -> 
     return out
 
 
-def render_greek_chart(frame: pd.DataFrame, y_column: str, container: Any, revision: str = "greeks") -> None:
+def render_greek_chart(
+    frame: pd.DataFrame,
+    y_column: str,
+    container: Any,
+    revision: str = "greeks",
+    gamma_flip: float | None = None,
+) -> None:
     """Plot one Greek vs Price from a caller-supplied DataFrame."""
     if y_column not in frame.columns or "Price" not in frame.columns:
         container.warning(f"Column '{y_column}' is missing from the Greeks frame.")
@@ -536,6 +554,20 @@ def render_greek_chart(frame: pd.DataFrame, y_column: str, container: Any, revis
         uirevision=revision,
         **layout_extra,
     )
+    if (
+        bool(st.session_state.get("show_gamma_flip_line", True))
+        and gamma_flip is not None
+        and np.isfinite(float(gamma_flip))
+        and float(gamma_flip) > 0
+    ):
+        fig.add_vline(
+            x=float(gamma_flip),
+            line_width=1.5,
+            line_dash="dash",
+            line_color="#e3b341",
+            annotation_text="Gamma Flip",
+            annotation_position="top",
+        )
     container.plotly_chart(
         fig,
         width="stretch",
@@ -666,6 +698,7 @@ def _sidebar_inputs() -> tuple[str, float, date, float, str, bool, Any]:
         st.number_input("v0", min_value=0.0001, max_value=1.0, step=0.005, format="%.4f", key="heston_v0")
 
         st.toggle("Second-Order Greeks", key="show_second_order")
+        st.sidebar.checkbox("Show Gamma Flip Line", value=True, key="show_gamma_flip_line")
 
         refresh = st.button("Refresh", use_container_width=True, type="primary")
         if refresh:
@@ -682,6 +715,11 @@ def _sidebar_inputs() -> tuple[str, float, date, float, str, bool, Any]:
             cached_vol_surface.clear()
             cached_pro_surface.clear()
             cached_pro_curve.clear()
+            cached_analyst_chain.clear()
+            cached_market_sentiment.clear()
+            cached_gex_outlook.clear()
+            cached_vol_risk_outlook.clear()
+            cached_event_outlook.clear()
             st.session_state.price_ticker = ""
             st.session_state.iv_fingerprint = None
             st.session_state.persisted_iv = None
@@ -1217,6 +1255,59 @@ def cached_vol_surface(ticker: str) -> pd.DataFrame | str:
     return generate_vol_surface_data(ticker)
 
 
+@st.cache_data(ttl=120, show_spinner="Loading option chain for analyst…")
+def cached_analyst_chain(ticker: str) -> pd.DataFrame:
+    frames: list[pd.DataFrame] = []
+    try:
+        expiries = list(get_available_expirations(ticker) or [])
+    except Exception:
+        expiries = []
+    try:
+        if not expiries:
+            frames.append(fetch_option_chain(ticker))
+        else:
+            for expiry in expiries[:8]:
+                frames.append(fetch_option_chain(ticker, expiry))
+    except Exception:
+        return pd.DataFrame()
+    frames = [frame for frame in frames if isinstance(frame, pd.DataFrame) and not frame.empty]
+    if not frames:
+        return pd.DataFrame()
+    return pd.concat(frames, ignore_index=True)
+
+
+@st.cache_data(ttl=120, show_spinner="Scoring market sentiment…")
+def cached_market_sentiment(ticker: str) -> dict[str, str]:
+    return analyze_market_sentiment(cached_analyst_chain(ticker))
+
+
+@st.cache_data(ttl=120, show_spinner="Scoring dealer GEX…")
+def cached_gex_outlook(ticker: str) -> dict[str, Any]:
+    return analyze_gex_outlook(cached_analyst_chain(ticker))
+
+
+@st.cache_data(ttl=120, show_spinner="Scoring volatility risk…")
+def cached_vol_risk_outlook(ticker: str) -> dict[str, Any]:
+    return analyze_volatility_risk_outlook(cached_analyst_chain(ticker))
+
+
+@st.cache_data(ttl=120, show_spinner="Scoring event outlook…")
+def cached_event_outlook(ticker: str) -> dict[str, Any]:
+    return analyze_event_outlook(cached_analyst_chain(ticker))
+
+
+def _format_iv_metric(value: Any) -> str:
+    if value is None:
+        return "—"
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return "—"
+    if not np.isfinite(number):
+        return "—"
+    return f"{number * 100.0:.1f}%"
+
+
 def render_delta_term_structure(frame: pd.DataFrame) -> None:
     required = {"DaysToExpiry", "Delta"}
     if frame.empty or not required.issubset(frame.columns):
@@ -1513,6 +1604,89 @@ def add_pro_metrics_tab(
             render_pro_surface(pro_frame, str(greek_name), apply_smoothing=bool(apply_smoothing))
         except Exception as error:
             st.exception(error)
+
+
+def _sentiment_metric_style(flag: str) -> tuple[str, str]:
+    if flag in {"Bearish Skew", "Event Risk / Catalyst", "Volatile/Amplifying"}:
+        return "Bearish", "red"
+    if flag in {"Range-Bound/Stabilizing", "Stable Term Structure"}:
+        return "Bullish", "green"
+    return "Neutral", "off"
+
+
+def add_market_analyst_tab(tab: Any, ticker: str, current_price: float = 0.0) -> None:
+    with tab:
+        try:
+            report = cached_market_sentiment(str(ticker).strip().upper())
+        except Exception as error:
+            st.exception(error)
+            return
+        with st.container(border=True):
+            st.subheader("Market Outlook")
+            st.write(str(report.get("Summary", "")))
+        with st.container(horizontal=True):
+            for label, key in (("Skew", "Skew"), ("Term structure", "TermStructure"), ("Gamma", "Gamma")):
+                flag = str(report.get(key, "—"))
+                delta, color = _sentiment_metric_style(flag)
+                st.metric(label, flag, delta=delta, delta_color=color, border=True)
+        st.text_area(
+            "Market Interpretation",
+            value=str(report.get("Interpretation", "")),
+            height=140,
+            disabled=True,
+            key="market_interpretation",
+        )
+        try:
+            gex = cached_gex_outlook(str(ticker).strip().upper())
+        except Exception as error:
+            st.exception(error)
+            return
+        outlook = str(gex.get("Outlook", ""))
+        flip = gex.get("GammaFlip")
+        with st.expander("Dealer Positioning (GEX)", expanded=True):
+            st.write(outlook)
+            if flip is not None and np.isfinite(float(flip)):
+                st.metric("Gamma Flip", f"{float(flip):.2f}", border=True)
+                if current_price > 0 and abs(float(flip) - current_price) / current_price <= GAMMA_FLIP_NEAR_PCT:
+                    st.warning("Market is at a Gamma Flip point—expect high volatility.")
+        try:
+            vol_risk = cached_vol_risk_outlook(str(ticker).strip().upper())
+        except Exception as error:
+            st.exception(error)
+            return
+        with st.expander("Volatility Risk Outlook", expanded=True):
+            st.write(str(vol_risk.get("Outlook", "")))
+            if bool(vol_risk.get("HighSensitivity")):
+                st.warning(
+                    "Market is sensitive to volatility changes; expect potential adjustments in Delta and Vega."
+                )
+        try:
+            event = cached_event_outlook(str(ticker).strip().upper())
+        except Exception as error:
+            st.exception(error)
+            return
+        short_iv = event.get("ShortIV")
+        long_iv = event.get("LongIV")
+        spread = None
+        if short_iv is not None and long_iv is not None:
+            try:
+                short_n = float(short_iv)
+                long_n = float(long_iv)
+            except (TypeError, ValueError):
+                short_n = float("nan")
+                long_n = float("nan")
+            if np.isfinite(short_n) and np.isfinite(long_n):
+                spread = short_n - long_n
+        with st.expander("Event Outlook (Term Structure)", expanded=True):
+            with st.container(horizontal=True):
+                st.metric("Short-Term IV", _format_iv_metric(short_iv), border=True)
+                st.metric("Long-Term IV", _format_iv_metric(long_iv), border=True)
+                st.metric("IV Spread", _format_iv_metric(spread), border=True)
+            st.write(str(event.get("Summary", event.get("Outlook", ""))))
+            if bool(event.get("EventRisk")):
+                st.warning(
+                    "Volatility is elevated for near-term expiries—expect high sensitivity to upcoming news."
+                )
 
 
 def render_vol_surface(frame: pd.DataFrame | str) -> None:
@@ -1876,6 +2050,17 @@ def main() -> None:
     with header:
         render_metric_header(frame, current_price, ticker, strike, expiry, current_iv, heston_selected)
 
+    gamma_flip: float | None = None
+    try:
+        gex_report = cached_gex_outlook(ticker)
+        raw_flip = gex_report.get("GammaFlip")
+        if raw_flip is not None and np.isfinite(float(raw_flip)) and float(raw_flip) > 0:
+            gamma_flip = float(raw_flip)
+            if current_price > 0 and abs(gamma_flip - current_price) / current_price <= GAMMA_FLIP_NEAR_PCT:
+                st.warning("Market is at a Gamma Flip point—expect high volatility.")
+    except Exception:
+        gamma_flip = None
+
     if st.session_state.get("show_second_order"):
         try:
             render_vanna_volga_chart(
@@ -1901,8 +2086,9 @@ def main() -> None:
         "Time-Sensitivity",
         "Volatility Surface",
         "Pro Metrics",
+        "Market Analyst",
     ]
-    greeks_tab, advanced_tab, surface_tab, time_tab, vol_tab, pro_tab = st.tabs(
+    greeks_tab, advanced_tab, surface_tab, time_tab, vol_tab, pro_tab, analyst_tab = st.tabs(
         tab_labels,
         on_change="rerun",
         key="main_view_tabs",
@@ -1913,7 +2099,7 @@ def main() -> None:
             cols = st.columns(len(pair), gap="medium")
             for column_name, col in zip(pair, cols):
                 try:
-                    render_greek_chart(frame, column_name, col, revision=revision)
+                    render_greek_chart(frame, column_name, col, revision=revision, gamma_flip=gamma_flip)
                 except Exception:
                     col.error(f"Could not render the {column_name} chart.")
         with st.expander("Greeks table"):
@@ -2058,6 +2244,9 @@ def main() -> None:
             heston_sigma,
             rho,
         )
+
+    if analyst_tab.open:
+        add_market_analyst_tab(analyst_tab, ticker, float(current_price))
 
 
 if __name__ == "__main__":

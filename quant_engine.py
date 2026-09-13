@@ -31,6 +31,15 @@ VOL_SURFACE_IV_MAX = 3.00
 VOL_SURFACE_STRIKE_POINTS = 80
 VOL_SURFACE_DTE_POINTS = 60
 VOL_SURFACE_GAUSS_SIGMA = 1.0
+SKEW_BEARISH_THRESHOLD = 0.10
+TERM_SHORT_DTE = 21.0
+TERM_LONG_DTE = 45.0
+GAMMA_SIGNIFICANCE = 0.50
+OPTIONS_CONTRACT_SIZE = 100
+GAMMA_FLIP_NEAR_PCT = 0.01
+EVENT_SHORT_DTE = 15.0
+EVENT_MEDIUM_DTE = 60.0
+EVENT_IV_RATIO = 1.2
 MODEL_BLACK_SCHOLES = "black-scholes"
 MODEL_HESTON = "heston"
 _EMPTY_GREEKS: dict[str, float | None] = {
@@ -1561,3 +1570,530 @@ def generate_pro_surface_data(
     if not apply_smoothing:
         return frame
     return _format_pro_surface_frame(_smooth_pro_surface_grid(frame))
+
+
+def _sentiment_column(frame: pd.DataFrame, *names: str) -> pd.Series | None:
+    lookup = {str(col).strip().lower(): col for col in frame.columns}
+    for name in names:
+        key = str(name).strip().lower()
+        if key in lookup:
+            return frame[lookup[key]]
+    return None
+
+
+def _sentiment_iv_series(frame: pd.DataFrame) -> pd.Series:
+    raw = _sentiment_column(frame, "impliedVolatility", "IV", "sigma", "iv", "call_iv", "put_iv")
+    if raw is None:
+        return pd.Series(np.nan, index=frame.index, dtype=np.float64)
+    return pd.to_numeric(raw, errors="coerce")
+
+
+def _sentiment_type_mask(frame: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
+    raw = _sentiment_column(frame, "option_type", "type", "cp", "callPut", "side", "right")
+    n = len(frame.index)
+    if raw is None:
+        return np.zeros(n, dtype=bool), np.zeros(n, dtype=bool)
+    text = raw.astype(str).str.strip().str.lower()
+    is_put = text.str.startswith("p") | text.eq("put")
+    is_call = text.str.startswith("c") | text.eq("call")
+    return is_call.to_numpy(dtype=bool), is_put.to_numpy(dtype=bool)
+
+
+def _sentiment_tenor_days(frame: pd.DataFrame) -> np.ndarray:
+    dte = _sentiment_column(frame, "DaysToExpiry", "dte", "days_to_expiry")
+    if dte is not None:
+        values = pd.to_numeric(dte, errors="coerce").to_numpy(dtype=np.float64)
+        return np.where(np.isfinite(values) & (values > 0), values, np.nan)
+    tenor = _sentiment_column(frame, "T", "t", "tenor")
+    if tenor is not None:
+        values = pd.to_numeric(tenor, errors="coerce").to_numpy(dtype=np.float64)
+        years = np.where(np.isfinite(values) & (values > 0) & (values <= 5.0), values * DAYS_PER_YEAR, np.nan)
+        days = np.where(np.isfinite(values) & (values > 5.0), values, years)
+        return np.where(np.isfinite(days) & (days > 0), days, np.nan)
+    expiry = _sentiment_column(frame, "expiration", "expiry", "Expiration")
+    if expiry is None:
+        return np.full(len(frame.index), np.nan, dtype=np.float64)
+    return np.asarray([_time_to_expiry_years(v) * DAYS_PER_YEAR for v in expiry], dtype=np.float64)
+
+
+def _attach_chain_gamma(frame: pd.DataFrame) -> pd.DataFrame:
+    """Fill a Gamma column from Black–Scholes when the chain has S, K, T, and IV."""
+    if _sentiment_column(frame, "Gamma", "gamma", "GEX", "dealer_gamma", "net_gamma") is not None:
+        return frame
+    s_col = _sentiment_column(frame, "S", "underlyingPrice")
+    k_col = _sentiment_column(frame, "K", "strike", "Strike")
+    t_col = _sentiment_column(frame, "T")
+    sig_col = _sentiment_column(frame, "sigma", "impliedVolatility", "IV")
+    type_col = _sentiment_column(frame, "option_type", "type")
+    if s_col is None or k_col is None or t_col is None or sig_col is None:
+        return frame
+    spots = pd.to_numeric(s_col, errors="coerce").to_numpy(dtype=np.float64)
+    strikes = pd.to_numeric(k_col, errors="coerce").to_numpy(dtype=np.float64)
+    tenors = pd.to_numeric(t_col, errors="coerce").to_numpy(dtype=np.float64)
+    vols = pd.to_numeric(sig_col, errors="coerce").to_numpy(dtype=np.float64)
+    types = ["call"] * len(frame) if type_col is None else type_col.astype(str).tolist()
+    gammas = np.full(len(frame), np.nan, dtype=np.float64)
+    for i in range(len(frame)):
+        greeks = calculate_greeks(
+            {
+                "S": spots[i],
+                "K": strikes[i],
+                "T": tenors[i],
+                "r": DEFAULT_RATE,
+                "sigma": vols[i],
+                "option_type": types[i],
+            }
+        )
+        value = greeks.get("Gamma")
+        if value is not None and np.isfinite(value):
+            gammas[i] = float(value)
+    out = frame.copy()
+    out["Gamma"] = gammas
+    return out
+
+
+def _finite_mean(values: np.ndarray) -> float:
+    finite = np.asarray(values, dtype=np.float64)
+    finite = finite[np.isfinite(finite)]
+    if finite.size == 0:
+        return float("nan")
+    return float(np.mean(finite))
+
+
+def analyze_market_sentiment(df: pd.DataFrame | None) -> dict[str, str]:
+    """Flag bearish put/call IV skew, inverted vol term structure, and gamma regime.
+
+    Skew: mean put IV vs mean call IV (matched by strike when ``K``/``strike`` exists).
+    Bearish if put IV exceeds call IV by more than ``SKEW_BEARISH_THRESHOLD`` (10%).
+    Term structure: mean IV with DTE <= 21 vs DTE >= 45. Short > long → event risk.
+    Gamma: mean signed Gamma vs 0.5 × median |Gamma|; large positive is stabilizing,
+    large negative is amplifying.
+
+    Args:
+        df: Option chain or Greeks frame with IV, option type, tenor, and/or Gamma.
+
+    Returns:
+        Dict with Skew, TermStructure, Gamma flags and a combined Summary.
+    """
+    empty = {
+        "Skew": "Neutral Skew",
+        "TermStructure": "Stable Term Structure",
+        "Gamma": "Neutral Gamma",
+        "Summary": "Insufficient chain data for a market-sentiment read.",
+        "Interpretation": "Not enough listed-option quotes to explain skew, term structure, or gamma.",
+    }
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        return empty
+    df = _attach_chain_gamma(df)
+
+    iv = _sentiment_iv_series(df).to_numpy(dtype=np.float64)
+    iv = np.where(np.isfinite(iv) & (iv > 0), iv, np.nan)
+    is_call, is_put = _sentiment_type_mask(df)
+    strike_col = _sentiment_column(df, "strike", "K", "Strike")
+    call_iv = float("nan")
+    put_iv = float("nan")
+    if strike_col is not None and np.any(is_call) and np.any(is_put):
+        strikes = pd.to_numeric(strike_col, errors="coerce").to_numpy(dtype=np.float64)
+        pairs: list[tuple[float, float]] = []
+        for k in np.unique(strikes[np.isfinite(strikes)]):
+            c = _finite_mean(iv[is_call & (strikes == k)])
+            p = _finite_mean(iv[is_put & (strikes == k)])
+            if np.isfinite(c) and np.isfinite(p) and c > 1e-12:
+                pairs.append((c, p))
+        if pairs:
+            call_iv = float(np.mean([c for c, _ in pairs]))
+            put_iv = float(np.mean([p for _, p in pairs]))
+    if not np.isfinite(call_iv):
+        call_iv = _finite_mean(iv[is_call]) if np.any(is_call) else _finite_mean(iv)
+    if not np.isfinite(put_iv):
+        put_col = _sentiment_column(df, "put_iv", "PutIV")
+        call_col = _sentiment_column(df, "call_iv", "CallIV")
+        if put_col is not None:
+            put_iv = _finite_mean(pd.to_numeric(put_col, errors="coerce").to_numpy(dtype=np.float64))
+        elif np.any(is_put):
+            put_iv = _finite_mean(iv[is_put])
+        if call_col is not None:
+            call_iv = _finite_mean(pd.to_numeric(call_col, errors="coerce").to_numpy(dtype=np.float64))
+    with np.errstate(divide="ignore", invalid="ignore"):
+        skew_ratio = (put_iv - call_iv) / call_iv if (np.isfinite(call_iv) and call_iv > 1e-12) else float("nan")
+    if np.isfinite(skew_ratio) and skew_ratio > SKEW_BEARISH_THRESHOLD:
+        skew_flag = "Bearish Skew"
+    else:
+        skew_flag = "Neutral Skew"
+
+    dtes = _sentiment_tenor_days(df)
+    short_iv = _finite_mean(iv[np.isfinite(dtes) & (dtes > 0) & (dtes <= TERM_SHORT_DTE)])
+    long_iv = _finite_mean(iv[np.isfinite(dtes) & (dtes >= TERM_LONG_DTE)])
+    if (not np.isfinite(short_iv) or not np.isfinite(long_iv)) and np.isfinite(dtes).sum() >= 2:
+        finite_dte = dtes[np.isfinite(dtes) & (dtes > 0)]
+        split = float(np.median(finite_dte))
+        short_iv = _finite_mean(iv[dtes <= split])
+        long_iv = _finite_mean(iv[dtes > split])
+    if np.isfinite(short_iv) and np.isfinite(long_iv) and short_iv > long_iv:
+        term_flag = "Event Risk / Catalyst"
+    else:
+        term_flag = "Stable Term Structure"
+
+    gamma_col = _sentiment_column(df, "Gamma", "gamma", "GEX", "dealer_gamma", "net_gamma")
+    if gamma_col is None:
+        gamma_flag = "Neutral Gamma"
+    else:
+        gamma = pd.to_numeric(gamma_col, errors="coerce").to_numpy(dtype=np.float64)
+        gamma = np.where(np.isfinite(gamma), gamma, np.nan)
+        gamma_mean = _finite_mean(gamma)
+        abs_med = float(np.nanmedian(np.abs(gamma))) if np.any(np.isfinite(gamma)) else float("nan")
+        hurdle = GAMMA_SIGNIFICANCE * abs_med if np.isfinite(abs_med) and abs_med > 0 else 1e-8
+        if np.isfinite(gamma_mean) and gamma_mean > hurdle:
+            gamma_flag = "Range-Bound/Stabilizing"
+        elif np.isfinite(gamma_mean) and gamma_mean < -hurdle:
+            gamma_flag = "Volatile/Amplifying"
+        else:
+            gamma_flag = "Neutral Gamma"
+
+    parts = [skew_flag, term_flag, gamma_flag]
+    summary = (
+        f"Market outlook: {parts[0]}; {parts[1]}; {parts[2]}. "
+        "Put-call IV skew, the vol term structure, and net gamma jointly describe "
+        "hedging demand, event pricing, and whether dealer flows dampen or amplify spot moves."
+    )
+    if skew_flag == "Neutral Skew" and term_flag == "Stable Term Structure" and gamma_flag == "Neutral Gamma":
+        summary = (
+            "Market outlook: balanced. No bearish put skew, no inverted term structure, "
+            "and no extreme gamma regime in the supplied chain."
+        )
+        interpretation = (
+            "Call and put implied vols are aligned, the term structure is not inverted, "
+            "and net gamma is not extreme, so the tape is not sending a one-sided hedge signal."
+        )
+    else:
+        reasons: list[str] = []
+        if skew_flag == "Bearish Skew":
+            reasons.append(
+                "The market is pricing in near-term downside protection due to the elevated Put-Skew."
+            )
+        if term_flag == "Event Risk / Catalyst":
+            reasons.append(
+                "Short-dated implied volatility is bid versus longer-dated vol, which is consistent with event risk or a near-term catalyst."
+            )
+        if gamma_flag == "Range-Bound/Stabilizing":
+            reasons.append(
+                "Net gamma is highly positive, a range-bound/stabilizing regime in which dealer hedges dampen spot moves."
+            )
+        elif gamma_flag == "Volatile/Amplifying":
+            reasons.append(
+                "Net gamma is highly negative, a volatile/amplifying regime in which dealer hedges can chase spot."
+            )
+        interpretation = " ".join(reasons) if reasons else summary
+    return {
+        "Skew": skew_flag,
+        "TermStructure": term_flag,
+        "Gamma": gamma_flag,
+        "Summary": summary,
+        "Interpretation": interpretation,
+    }
+
+
+def _gex_unavailable() -> str:
+    return "Dealer hedging outlook is unavailable: option chain or open interest is missing."
+
+
+def _gex_unavailable_result() -> dict[str, Any]:
+    return {"Outlook": _gex_unavailable(), "GammaFlip": None}
+
+
+def _gex_outlook_text(price: float) -> str:
+    level = f"{price:.2f}"
+    return (
+        f"Dealer hedging is likely to support the market above {level} "
+        f"and accelerate selling below {level}."
+    )
+
+
+def analyze_gex_outlook(df: pd.DataFrame | None) -> dict[str, Any]:
+    """Gamma-exposure outlook and the gamma-flip price.
+
+    GEX per contract is ``Gamma * Open Interest * contract size`` (default 100).
+    Puts are signed negative so net GEX can change sign across strikes. The
+    flip is the interpolated strike where net GEX goes from positive (higher
+    strikes) to negative (lower strikes).
+
+    Args:
+        df: Option chain with Gamma (or BS inputs), open interest, and strikes.
+
+    Returns:
+        Dict with ``Outlook`` string and ``GammaFlip`` price (or None).
+    """
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        return _gex_unavailable_result()
+    frame = _attach_chain_gamma(df)
+    gamma_col = _sentiment_column(frame, "Gamma", "gamma")
+    oi_col = _sentiment_column(frame, "openInterest", "open_interest", "OI", "oi")
+    price_col = _sentiment_column(frame, "strike", "K", "Strike", "Price")
+    if gamma_col is None or oi_col is None or price_col is None:
+        return _gex_unavailable_result()
+    gamma = pd.to_numeric(gamma_col, errors="coerce").to_numpy(dtype=np.float64)
+    oi = pd.to_numeric(oi_col, errors="coerce").to_numpy(dtype=np.float64)
+    prices = pd.to_numeric(price_col, errors="coerce").to_numpy(dtype=np.float64)
+    size_col = _sentiment_column(frame, "contractSize", "contract_size", "multiplier")
+    if size_col is None:
+        size = np.full(prices.shape, float(OPTIONS_CONTRACT_SIZE), dtype=np.float64)
+    else:
+        size = pd.to_numeric(size_col, errors="coerce").to_numpy(dtype=np.float64)
+        size = np.where(np.isfinite(size) & (size > 0), size, float(OPTIONS_CONTRACT_SIZE))
+    valid = np.isfinite(gamma) & np.isfinite(oi) & (oi >= 0) & np.isfinite(prices) & (prices > 0)
+    if not np.any(valid):
+        return _gex_unavailable_result()
+    is_call, is_put = _sentiment_type_mask(frame)
+    sign = np.ones(prices.shape, dtype=np.float64)
+    if np.any(is_put) or np.any(is_call):
+        sign = np.where(is_put, -1.0, 1.0)
+    with np.errstate(invalid="ignore", over="ignore"):
+        gex = gamma * oi * size * sign
+    gex = np.where(valid & np.isfinite(gex), gex, np.nan)
+    if not np.any(np.isfinite(gex)):
+        return _gex_unavailable_result()
+    table = pd.DataFrame({"Price": prices, "GEX": gex}).dropna()
+    net = table.groupby("Price", sort=True, as_index=True)["GEX"].sum()
+    if net.empty:
+        return _gex_unavailable_result()
+    strikes = net.index.to_numpy(dtype=np.float64)
+    values = net.to_numpy(dtype=np.float64)
+    order = np.argsort(strikes)[::-1]
+    strikes = strikes[order]
+    values = values[order]
+    flip = float("nan")
+    for i in range(strikes.size - 1):
+        high_gex, low_gex = float(values[i]), float(values[i + 1])
+        if high_gex >= 0.0 and low_gex < 0.0:
+            denom = high_gex - low_gex
+            if abs(denom) < 1e-18:
+                flip = float(strikes[i])
+            else:
+                weight = high_gex / denom
+                flip = float(strikes[i] + weight * (strikes[i + 1] - strikes[i]))
+            break
+    if not np.isfinite(flip):
+        abs_gex = np.abs(values)
+        if np.any(np.isfinite(abs_gex)):
+            flip = float(strikes[int(np.nanargmin(abs_gex))])
+        else:
+            return _gex_unavailable_result()
+    if not np.isfinite(flip) or flip <= 0:
+        return _gex_unavailable_result()
+    return {"Outlook": _gex_outlook_text(flip), "GammaFlip": flip}
+
+
+def _vol_risk_unavailable() -> str:
+    return "Volatility-risk outlook is unavailable: implied volatility data is missing."
+
+
+def _chain_vanna_volga(frame: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
+    n = len(frame.index)
+    vanna_col = _sentiment_column(frame, "Vanna", "vanna")
+    volga_col = _sentiment_column(frame, "Volga", "volga", "Vomma", "vomma")
+    vanna = (
+        pd.to_numeric(vanna_col, errors="coerce").to_numpy(dtype=np.float64)
+        if vanna_col is not None
+        else np.full(n, np.nan, dtype=np.float64)
+    )
+    volga = (
+        pd.to_numeric(volga_col, errors="coerce").to_numpy(dtype=np.float64)
+        if volga_col is not None
+        else np.full(n, np.nan, dtype=np.float64)
+    )
+    need = (~np.isfinite(vanna)) | (~np.isfinite(volga))
+    if not np.any(need):
+        return vanna, volga
+    s_col = _sentiment_column(frame, "S", "underlyingPrice", "Price")
+    k_col = _sentiment_column(frame, "K", "strike", "Strike")
+    t_col = _sentiment_column(frame, "T")
+    sig_col = _sentiment_column(frame, "sigma", "impliedVolatility", "IV")
+    if s_col is None or k_col is None or sig_col is None:
+        return vanna, volga
+    spots = pd.to_numeric(s_col, errors="coerce").to_numpy(dtype=np.float64)
+    strikes = pd.to_numeric(k_col, errors="coerce").to_numpy(dtype=np.float64)
+    if t_col is None:
+        tenors = _sentiment_tenor_days(frame) / DAYS_PER_YEAR
+    else:
+        tenors = pd.to_numeric(t_col, errors="coerce").to_numpy(dtype=np.float64)
+    vols = pd.to_numeric(sig_col, errors="coerce").to_numpy(dtype=np.float64)
+    type_col = _sentiment_column(frame, "option_type", "type")
+    types = ["call"] * n if type_col is None else type_col.astype(str).tolist()
+    for i in np.flatnonzero(need):
+        if not (np.isfinite(spots[i]) and np.isfinite(strikes[i]) and np.isfinite(tenors[i]) and np.isfinite(vols[i]) and vols[i] > SIGMA_MIN):
+            continue
+        if not np.isfinite(vanna[i]):
+            packed = calculate_vanna(float(spots[i]), float(strikes[i]), float(tenors[i]), DEFAULT_RATE, float(vols[i]), option_type=types[i])
+            if packed is not None and np.isfinite(packed):
+                vanna[i] = float(packed)
+        if not np.isfinite(volga[i]):
+            packed = calculate_volga(float(spots[i]), float(strikes[i]), float(tenors[i]), DEFAULT_RATE, float(vols[i]), option_type=types[i])
+            if packed is not None and np.isfinite(packed):
+                volga[i] = float(packed)
+    return vanna, volga
+
+
+def _vol_risk_result(outlook: str, high: bool) -> dict[str, Any]:
+    return {"Outlook": outlook, "HighSensitivity": high}
+
+
+def analyze_volatility_risk_outlook(df: pd.DataFrame | None) -> dict[str, Any]:
+    """Summarize chain-level Vanna (∂Δ/∂σ) and Volga (∂²V/∂σ²) sensitivity.
+
+    Missing IV (and missing precomputed Vanna/Volga) returns a safe unavailable
+    message. Open interest weights the aggregate when present.
+
+    Args:
+        df: Option chain or Greeks frame.
+
+    Returns:
+        Dict with ``Outlook`` string and ``HighSensitivity`` bool.
+    """
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        return _vol_risk_result(_vol_risk_unavailable(), False)
+    iv = _sentiment_iv_series(df).to_numpy(dtype=np.float64)
+    has_iv = np.any(np.isfinite(iv) & (iv > SIGMA_MIN))
+    has_precomputed = _sentiment_column(df, "Vanna", "vanna") is not None or _sentiment_column(df, "Volga", "volga", "Vomma", "vomma") is not None
+    if not has_iv and not has_precomputed:
+        return _vol_risk_result(_vol_risk_unavailable(), False)
+    vanna, volga = _chain_vanna_volga(df)
+    oi_col = _sentiment_column(df, "openInterest", "open_interest", "OI", "oi")
+    if oi_col is None:
+        weights = np.ones(len(df.index), dtype=np.float64)
+    else:
+        weights = pd.to_numeric(oi_col, errors="coerce").to_numpy(dtype=np.float64)
+        weights = np.where(np.isfinite(weights) & (weights > 0), weights, np.nan)
+        if not np.any(np.isfinite(weights)):
+            weights = np.ones(len(df.index), dtype=np.float64)
+    with np.errstate(invalid="ignore"):
+        vanna_exp = np.abs(vanna) * weights
+        volga_exp = np.abs(volga) * weights
+    vanna_score = _finite_mean(vanna_exp)
+    volga_score = _finite_mean(volga_exp)
+    if not np.isfinite(vanna_score) and not np.isfinite(volga_score):
+        return _vol_risk_result(_vol_risk_unavailable(), False)
+    vanna_score = vanna_score if np.isfinite(vanna_score) else 0.0
+    volga_score = volga_score if np.isfinite(volga_score) else 0.0
+    total = vanna_score + volga_score
+    if total <= 1e-18:
+        return _vol_risk_result(
+            "Volatility convexity is muted; Delta and Vega are not highly sensitive "
+            "to implied-vol shocks in this chain.",
+            False,
+        )
+    vanna_share = vanna_score / total
+    if vanna_share >= 0.60:
+        return _vol_risk_result(
+            "The market is Vanna-sensitive; a volatility spike could trigger substantial Delta shifts.",
+            True,
+        )
+    if vanna_share <= 0.40:
+        return _vol_risk_result(
+            "The market is Volga-sensitive; a volatility spike could reprice Vega convexity sharply.",
+            True,
+        )
+    return _vol_risk_result(
+        "The market is Vanna- and Volga-sensitive; volatility shocks can move Delta and Vega together.",
+        True,
+    )
+
+
+def _event_outlook_unavailable() -> dict[str, Any]:
+    return {
+        "Outlook": "Event outlook is unavailable: expiration coverage is too thin to compare short-, medium-, and long-dated implied volatility.",
+        "Summary": "Event outlook is unavailable: expiration coverage is too thin to compare short-, medium-, and long-dated implied volatility.",
+        "EventRisk": False,
+        "ShortIV": None,
+        "MediumIV": None,
+        "LongIV": None,
+    }
+
+
+def _event_expiry_label(frame: pd.DataFrame, dtes: np.ndarray, mask: np.ndarray) -> str:
+    """Label the nearest expiry in ``mask`` from an expiration column or DTE."""
+    picked = np.isfinite(dtes) & mask
+    if not np.any(picked):
+        picked = np.isfinite(dtes) & (dtes > 0)
+    if not np.any(picked):
+        return "nearest"
+    idx = int(np.nanargmin(np.where(picked, dtes, np.inf)))
+    expiry = _sentiment_column(frame, "expiration", "expiry", "Expiration", "Expiry")
+    if expiry is not None:
+        raw = expiry.iloc[idx]
+        if isinstance(raw, datetime):
+            return raw.date().isoformat()
+        if isinstance(raw, date):
+            return raw.isoformat()
+        text = str(raw).strip()
+        if len(text) >= 10:
+            try:
+                return date.fromisoformat(text[:10]).isoformat()
+            except ValueError:
+                pass
+        if text:
+            return text
+    dte = float(dtes[idx])
+    if np.isfinite(dte) and dte > 0:
+        return f"{dte:.0f} DTE"
+    return "nearest"
+
+
+def analyze_event_outlook(df: pd.DataFrame | None) -> dict[str, Any]:
+    """Flag a near-term catalyst from the implied-vol term structure.
+
+    Mean IV is taken over short-dated options (DTE < 15), medium-dated
+    (15–60), and long-dated (> 60). Short IV > 1.2 × medium IV is treated as
+    high event risk. Limited expiry coverage returns an unavailable result
+    instead of a false catalyst.
+
+    Args:
+        df: Option chain with implied volatility and tenor or expiration.
+
+    Returns:
+        Dict with ``Outlook``, ``Summary``, ``EventRisk``, and bucket IVs.
+    """
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        return _event_outlook_unavailable()
+    iv = _sentiment_iv_series(df).to_numpy(dtype=np.float64)
+    iv = np.where(np.isfinite(iv) & (iv > SIGMA_MIN), iv, np.nan)
+    dtes = _sentiment_tenor_days(df)
+    valid = np.isfinite(iv) & np.isfinite(dtes) & (dtes > 0)
+    if not np.any(valid):
+        return _event_outlook_unavailable()
+    short_mask = valid & (dtes < EVENT_SHORT_DTE)
+    medium_mask = valid & (dtes >= EVENT_SHORT_DTE) & (dtes <= EVENT_MEDIUM_DTE)
+    long_mask = valid & (dtes > EVENT_MEDIUM_DTE)
+    short_iv = _finite_mean(iv[short_mask])
+    medium_iv = _finite_mean(iv[medium_mask])
+    long_iv = _finite_mean(iv[long_mask])
+    compare_iv = medium_iv if np.isfinite(medium_iv) else long_iv
+    if not np.isfinite(short_iv) or not np.isfinite(compare_iv) or compare_iv <= SIGMA_MIN:
+        return _event_outlook_unavailable()
+    trend_iv = long_iv if np.isfinite(long_iv) and long_iv > SIGMA_MIN else compare_iv
+    with np.errstate(divide="ignore", invalid="ignore"):
+        event = bool(short_iv > EVENT_IV_RATIO * compare_iv)
+        lift_pct = float((short_iv / trend_iv - 1.0) * 100.0)
+    if not event:
+        return {
+            "Outlook": "Stable Event Outlook",
+            "Summary": (
+                "No near-term catalyst is priced: short-term IV is not elevated "
+                "versus the medium-term term structure."
+            ),
+            "EventRisk": False,
+            "ShortIV": short_iv,
+            "MediumIV": medium_iv if np.isfinite(medium_iv) else None,
+            "LongIV": long_iv if np.isfinite(long_iv) else None,
+        }
+    expiry_label = _event_expiry_label(df, dtes, short_mask)
+    return {
+        "Outlook": "High Event Risk / Catalyst Detected.",
+        "Summary": (
+            f"The market is pricing in a catalyst for the {expiry_label} expiry, "
+            f"with IV elevated by {lift_pct:.0f}% compared to the long-term trend."
+        ),
+        "EventRisk": True,
+        "ShortIV": short_iv,
+        "MediumIV": medium_iv if np.isfinite(medium_iv) else None,
+        "LongIV": long_iv if np.isfinite(long_iv) else None,
+    }

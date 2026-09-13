@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 
+import pandas as pd
 import pytest
 
 from quant_engine import (
@@ -23,6 +24,10 @@ from quant_engine import (
     calculate_vomma,
     calculate_zomma,
     generate_pro_surface_data,
+    analyze_event_outlook,
+    analyze_gex_outlook,
+    analyze_market_sentiment,
+    analyze_volatility_risk_outlook,
 )
 
 STANDARD = {"S": 100.0, "K": 100.0, "T": 1.0, "r": 0.05, "sigma": 0.2, "option_type": "call"}
@@ -181,3 +186,112 @@ def test_generate_pro_surface_data_grid() -> None:
     assert not raw.sort_values(["DaysToExpiry", "Price"]).reset_index(drop=True)["Value"].equals(
         smooth.sort_values(["DaysToExpiry", "Price"]).reset_index(drop=True)["Value"]
     )
+
+
+def test_analyze_market_sentiment_bearish_event_stabilizing() -> None:
+    frame = pd.DataFrame(
+        {
+            "strike": [100.0, 100.0, 100.0, 100.0],
+            "option_type": ["call", "put", "call", "put"],
+            "impliedVolatility": [0.20, 0.25, 0.18, 0.22],
+            "DaysToExpiry": [10.0, 10.0, 60.0, 60.0],
+            "Gamma": [0.04, 0.04, 0.02, 0.02],
+        }
+    )
+    out = analyze_market_sentiment(frame)
+    assert out["Skew"] == "Bearish Skew"
+    assert out["TermStructure"] == "Event Risk / Catalyst"
+    assert out["Gamma"] == "Range-Bound/Stabilizing"
+    assert "Bearish Skew" in out["Summary"]
+    assert "Put-Skew" in out["Interpretation"]
+
+
+def test_analyze_market_sentiment_amplifying_and_neutral_skew() -> None:
+    frame = pd.DataFrame(
+        {
+            "option_type": ["call", "put"],
+            "impliedVolatility": [0.20, 0.20],
+            "DaysToExpiry": [30.0, 90.0],
+            "Gamma": [-0.05, -0.04],
+        }
+    )
+    out = analyze_market_sentiment(frame)
+    assert out["Skew"] == "Neutral Skew"
+    assert out["TermStructure"] == "Stable Term Structure"
+    assert out["Gamma"] == "Volatile/Amplifying"
+
+
+def test_analyze_market_sentiment_empty() -> None:
+    out = analyze_market_sentiment(pd.DataFrame())
+    assert out["Skew"] == "Neutral Skew"
+    assert "Insufficient" in out["Summary"]
+    assert "Interpretation" in out
+
+
+def test_analyze_gex_outlook_flip_and_empty() -> None:
+    frame = pd.DataFrame(
+        {
+            "strike": [90.0, 90.0, 100.0, 100.0, 110.0, 110.0],
+            "option_type": ["call", "put", "call", "put", "call", "put"],
+            "Gamma": [0.01, 0.05, 0.05, 0.05, 0.02, 0.01],
+            "openInterest": [10.0, 100.0, 100.0, 80.0, 200.0, 10.0],
+        }
+    )
+    text = analyze_gex_outlook(frame)
+    assert "support the market above" in text["Outlook"]
+    assert "accelerate selling below" in text["Outlook"]
+    assert text["GammaFlip"] is not None
+    assert float(text["GammaFlip"]) > 0
+    empty = analyze_gex_outlook(pd.DataFrame())
+    assert empty["GammaFlip"] is None
+    assert "unavailable" in empty["Outlook"]
+    missing_oi = frame.drop(columns=["openInterest"])
+    assert "unavailable" in analyze_gex_outlook(missing_oi)["Outlook"]
+
+
+def test_analyze_volatility_risk_outlook() -> None:
+    frame = pd.DataFrame(
+        {
+            "S": [100.0, 100.0],
+            "K": [100.0, 100.0],
+            "T": [1.0, 1.0],
+            "impliedVolatility": [0.20, 0.20],
+            "option_type": ["call", "put"],
+            "openInterest": [100.0, 80.0],
+        }
+    )
+    text = analyze_volatility_risk_outlook(frame)
+    assert "Vanna" in text["Outlook"] or "Volga" in text["Outlook"] or "muted" in text["Outlook"]
+    empty = analyze_volatility_risk_outlook(pd.DataFrame())
+    assert empty["HighSensitivity"] is False
+    assert empty["Outlook"] == (
+        "Volatility-risk outlook is unavailable: implied volatility data is missing."
+    )
+    no_iv = pd.DataFrame({"strike": [100.0], "option_type": ["call"]})
+    assert "unavailable" in analyze_volatility_risk_outlook(no_iv)["Outlook"]
+
+
+def test_analyze_event_outlook_catalyst_and_thin_chain() -> None:
+    frame = pd.DataFrame(
+        {
+            "impliedVolatility": [0.36, 0.36, 0.20, 0.20, 0.18, 0.18],
+            "DaysToExpiry": [7.0, 7.0, 30.0, 30.0, 90.0, 90.0],
+            "expiration": ["2026-09-18", "2026-09-18", "2026-10-16", "2026-10-16", "2026-12-18", "2026-12-18"],
+        }
+    )
+    out = analyze_event_outlook(frame)
+    assert out["EventRisk"] is True
+    assert out["Outlook"] == "High Event Risk / Catalyst Detected."
+    assert "2026-09-18" in out["Summary"]
+    assert "catalyst" in out["Summary"]
+    assert "elevated by" in out["Summary"]
+    calm = frame.copy()
+    calm["impliedVolatility"] = [0.20, 0.20, 0.20, 0.20, 0.19, 0.19]
+    quiet = analyze_event_outlook(calm)
+    assert quiet["EventRisk"] is False
+    assert quiet["Outlook"] == "Stable Event Outlook"
+    empty = analyze_event_outlook(pd.DataFrame())
+    assert empty["EventRisk"] is False
+    assert "unavailable" in empty["Summary"]
+    thin = pd.DataFrame({"impliedVolatility": [0.40, 0.41], "DaysToExpiry": [5.0, 8.0]})
+    assert "unavailable" in analyze_event_outlook(thin)["Outlook"]
