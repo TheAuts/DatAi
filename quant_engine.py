@@ -53,6 +53,61 @@ CONCENTRATION_WARN_PCT = 30.0
 _LOG = logging.getLogger("datiai.quant")
 MODEL_BLACK_SCHOLES = "black-scholes"
 MODEL_HESTON = "heston"
+
+
+def prepare_plotly_surface_xyz(
+    z_data: Any,
+    x: Any = None,
+    y: Any = None,
+    *,
+    rows: int | None = None,
+    cols: int | None = None,
+) -> tuple[np.ndarray, np.ndarray | None, np.ndarray | None, str | None]:
+    """Coerce ``z`` to 2D and gate Plotly Surface ``x``/``y`` axes.
+
+    Returns ``(z2d, x_or_none, y_or_none, warning_or_none)``. Axes are only
+    returned when ``len(x) == z.shape[1]`` and ``len(y) == z.shape[0]``; otherwise
+    they are omitted so Plotly can fall back to default indices.
+    """
+    x_arr = None if x is None else np.asarray(x, dtype=float).reshape(-1)
+    y_arr = None if y is None else np.asarray(y, dtype=float).reshape(-1)
+    inferred_rows = int(rows) if rows is not None else (int(len(y_arr)) if y_arr is not None else None)
+    inferred_cols = int(cols) if cols is not None else (int(len(x_arr)) if x_arr is not None else None)
+    raw = np.asarray(
+        [np.nan if v is None else v for v in z_data] if isinstance(z_data, (list, tuple)) else z_data,
+        dtype=np.float64,
+    )
+    if raw.ndim == 2:
+        z2d = raw
+    elif inferred_rows is not None and inferred_cols is not None and raw.size == inferred_rows * inferred_cols:
+        z2d = raw.reshape(inferred_rows, inferred_cols)
+    elif raw.ndim == 1 and inferred_cols is not None and inferred_cols > 0 and raw.size % inferred_cols == 0:
+        z2d = raw.reshape(-1, inferred_cols)
+    elif raw.ndim == 1 and inferred_rows is not None and inferred_rows > 0 and raw.size % inferred_rows == 0:
+        z2d = raw.reshape(inferred_rows, -1)
+    elif raw.size == 0:
+        z2d = np.empty((0, 0), dtype=np.float64)
+    else:
+        side = int(np.sqrt(raw.size))
+        if side > 0 and side * side == raw.size:
+            z2d = raw.reshape(side, side)
+        else:
+            z2d = raw.reshape(1, -1) if raw.size else np.empty((0, 0), dtype=np.float64)
+    if z2d.ndim != 2:
+        z2d = z2d.reshape(z2d.shape[0], -1) if z2d.size else np.empty((0, 0), dtype=np.float64)
+    warning: str | None = None
+    if x_arr is not None and y_arr is not None and len(x_arr) == z2d.shape[1] and len(y_arr) == z2d.shape[0]:
+        return z2d.astype(float, copy=False), x_arr, y_arr, None
+    if x_arr is not None or y_arr is not None:
+        warning = (
+            f"Surface axis length mismatch "
+            f"(x={None if x_arr is None else len(x_arr)}, "
+            f"y={None if y_arr is None else len(y_arr)}, "
+            f"z={z2d.shape}); omitting x/y and using default indices."
+        )
+    return z2d.astype(float, copy=False), None, None, warning
+
+
 _EMPTY_GREEKS: dict[str, float | None] = {
     "Delta": None,
     "Gamma": None,

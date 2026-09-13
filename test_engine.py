@@ -21,6 +21,7 @@ from quant_engine import (
     MODEL_BLACK_SCHOLES,
     MODEL_HESTON,
     DataRepository,
+    prepare_plotly_surface_xyz,
     calculate_greeks,
     calculate_heston_greeks,
     calculate_portfolio_risk,
@@ -506,6 +507,26 @@ def test_snapshot_vol_surface_from_history(tmp_path) -> None:
     assert isinstance(surface, pd.DataFrame)
     assert {"Strike", "DaysToExpiry", "IV"}.issubset(surface.columns)
     assert len(surface.index) >= 10
+
+
+def test_prepare_plotly_surface_xyz_reshape_and_axis_gate() -> None:
+    flat = np.arange(6, dtype=float)
+    z2d, x_ok, y_ok, warning = prepare_plotly_surface_xyz(flat, [0.0, 1.0, 2.0], [10.0, 20.0])
+    assert z2d.shape == (2, 3)
+    assert x_ok is not None and y_ok is not None
+    assert warning is None
+    assert list(x_ok) == [0.0, 1.0, 2.0]
+    assert list(y_ok) == [10.0, 20.0]
+
+    bad_x = [0.0, 1.0]
+    z_bad, x_none, y_none, warn = prepare_plotly_surface_xyz(np.ones((2, 3)), bad_x, [10.0, 20.0])
+    assert z_bad.shape == (2, 3)
+    assert x_none is None and y_none is None
+    assert warn is not None and "mismatch" in warn
+
+    already_2d = np.ones((4, 5))
+    z_keep, _, _, _ = prepare_plotly_surface_xyz(already_2d)
+    assert z_keep.shape == (4, 5)
 
 
 def test_generate_greek_curve_uses_injected_repo() -> None:
