@@ -224,6 +224,7 @@ def _init_state() -> None:
         "pro_metric_choice": "Vanna",
         "pro_surface_smoothing": False,
         "portfolio_csv_sig": None,
+        "snapshot_saved": False,
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -357,6 +358,26 @@ def _repo_chain(ticker: str, expiry: Any = None) -> pd.DataFrame:
     if not repo.is_fresh(symbol):
         return repo.get_data(symbol, expiry)
     return repo.get_data(symbol, expiry)
+
+
+def _reset_time_machine_keys(ticker: str) -> None:
+    symbol = str(ticker or "").strip().upper()
+    for key in (f"tm_start_{symbol}", f"tm_end_{symbol}", f"tm_scrub_{symbol}"):
+        if key in st.session_state:
+            del st.session_state[key]
+
+
+def _capture_snapshot(ticker: str, expiry: Any = None) -> None:
+    symbol = str(ticker or "").strip().upper() or DEFAULT_TICKER
+    data = _repo_chain(symbol, expiry)
+    _get_repo().save_to_cache(symbol, data)
+    _reset_time_machine_keys(symbol)
+    try:
+        cached_delta_drift.clear()
+        cached_snapshot_vol_surface.clear()
+    except Exception:
+        pass
+    st.session_state.snapshot_saved = True
 
 
 def cached_current_price(ticker: str) -> float | None:
@@ -870,6 +891,13 @@ def _sidebar_inputs() -> tuple[str, float, date, float, str, bool, Any]:
             st.session_state.iv_fingerprint = None
             st.session_state.persisted_iv = None
             st.rerun()
+
+        if st.button("Capture Snapshot", width="stretch"):
+            _capture_snapshot(ticker_norm, expiry)
+            st.success("Snapshot saved!")
+            st.rerun()
+        if st.session_state.pop("snapshot_saved", False):
+            st.success("Snapshot saved!")
 
         download_slot = st.empty()
 
@@ -2161,11 +2189,22 @@ def add_time_machine_tab(tab: Any, ticker: str) -> None:
             start = st.selectbox("Start Snapshot", snapshots, index=0, key=f"tm_start_{ticker}")
         with end_col:
             end = st.selectbox("End Snapshot", snapshots, index=len(snapshots) - 1, key=f"tm_end_{ticker}")
-        try:
-            drift = cached_delta_drift(str(ticker), str(start), str(end))
-            render_delta_drift_surface(drift)
-        except Exception:
-            st.error("Could not render the Delta Drift surface.")
+        payload_a = _get_repo()._snapshot_payload(ticker, start) or {}
+        payload_b = _get_repo()._snapshot_payload(ticker, end) or {}
+        st.write(
+            {
+                "Start Snapshot keys": list(payload_a.keys()),
+                "End Snapshot keys": list(payload_b.keys()),
+            }
+        )
+        if "delta_surface" not in payload_a or "delta_surface" not in payload_b:
+            st.error("Snapshot does not contain delta data!")
+        else:
+            try:
+                drift = cached_delta_drift(str(ticker), str(start), str(end))
+                render_delta_drift_surface(drift)
+            except Exception:
+                st.error("Could not render the Delta Drift surface.")
         st.subheader("Surface evolution")
         stamp = st.select_slider("Snapshot", options=snapshots, value=snapshots[-1], key=f"tm_scrub_{ticker}")
         try:

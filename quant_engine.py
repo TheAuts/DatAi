@@ -684,12 +684,15 @@ class DataRepository:
             records = data.get("data")
         else:
             records = data
+        frame = self._records_to_frame(records)
+        surface = self._delta_surface_payload(frame)
         return {
             "version": self.VERSION,
             "ticker": str(ticker or "").strip().upper(),
             "saved_at": time.time(),
             "stamp": self._history_stamp(),
             "data": records,
+            "delta_surface": surface,
         }
 
     def _prune_history(self, ticker: str) -> None:
@@ -749,6 +752,44 @@ class DataRepository:
         found.sort(key=lambda item: (item[0], item[1]))
         return [stamp for _, stamp in found]
 
+    def _fill_missing_delta(self, frame: pd.DataFrame) -> np.ndarray:
+        n = len(frame.index)
+        delta_col = _sentiment_column(frame, "Delta", "delta")
+        if delta_col is None:
+            deltas = np.full(n, np.nan, dtype=np.float64)
+        else:
+            deltas = np.array(pd.to_numeric(delta_col, errors="coerce").to_numpy(dtype=np.float64), copy=True)
+        need = ~np.isfinite(deltas)
+        if not np.any(need):
+            return deltas
+        s_col = _sentiment_column(frame, "S", "underlyingPrice", "Price")
+        k_col = _sentiment_column(frame, "K", "strike", "Strike")
+        t_col = _sentiment_column(frame, "T")
+        type_col = _sentiment_column(frame, "option_type", "type")
+        iv = _sentiment_iv_series(frame).to_numpy(dtype=np.float64)
+        spots = np.array(pd.to_numeric(s_col, errors="coerce").to_numpy(dtype=np.float64), copy=True) if s_col is not None else np.full(n, np.nan)
+        strikes = np.array(pd.to_numeric(k_col, errors="coerce").to_numpy(dtype=np.float64), copy=True) if k_col is not None else np.full(n, np.nan)
+        if t_col is None:
+            tenors = _sentiment_tenor_days(frame) / DAYS_PER_YEAR
+        else:
+            tenors = np.array(pd.to_numeric(t_col, errors="coerce").to_numpy(dtype=np.float64), copy=True)
+        types = ["call"] * n if type_col is None else type_col.astype(str).tolist()
+        for i in np.flatnonzero(need):
+            packed = calculate_greeks(
+                {
+                    "S": spots[i] if i < spots.size else float("nan"),
+                    "K": strikes[i] if i < strikes.size else float("nan"),
+                    "T": tenors[i] if i < tenors.size else float("nan"),
+                    "r": DEFAULT_RATE,
+                    "sigma": iv[i] if i < iv.size else float("nan"),
+                    "option_type": types[i] if i < len(types) else "call",
+                }
+            )
+            value = packed.get("Delta")
+            if value is not None and np.isfinite(value):
+                deltas[i] = float(value)
+        return deltas
+
     def _delta_points(self, frame: pd.DataFrame) -> pd.DataFrame:
         empty = pd.DataFrame(columns=["Strike", "DaysToExpiry", "Delta"])
         if frame is None or not isinstance(frame, pd.DataFrame) or frame.empty:
@@ -758,11 +799,7 @@ class DataRepository:
             return empty
         strikes = np.array(pd.to_numeric(strike_col, errors="coerce").to_numpy(dtype=np.float64), copy=True)
         dtes = np.array(_sentiment_tenor_days(frame), dtype=np.float64, copy=True)
-        delta_col = _sentiment_column(frame, "Delta", "delta")
-        if delta_col is None:
-            deltas = np.full(len(frame.index), np.nan, dtype=np.float64)
-        else:
-            deltas = np.array(pd.to_numeric(delta_col, errors="coerce").to_numpy(dtype=np.float64), copy=True)
+        deltas = self._fill_missing_delta(frame)
         mask = np.isfinite(strikes) & np.isfinite(dtes) & np.isfinite(deltas) & (strikes > 0) & (dtes > 0)
         if not np.any(mask):
             return empty
@@ -798,7 +835,27 @@ class DataRepository:
         except Exception:
             return blank
 
-    def _snapshot_frame(self, ticker: str, timestamp: Any) -> pd.DataFrame:
+    def _delta_surface_payload(self, frame: pd.DataFrame) -> dict[str, Any]:
+        empty = {"Strike": [], "DaysToExpiry": [], "Delta": []}
+        points = self._delta_points(frame)
+        if points.empty:
+            return empty
+        x_min, x_max = float(points["Strike"].min()), float(points["Strike"].max())
+        y_min, y_max = float(points["DaysToExpiry"].min()), float(points["DaysToExpiry"].max())
+        nx = int(max(2, min(VOL_SURFACE_STRIKE_POINTS, max(points["Strike"].nunique(), 8))))
+        ny = int(max(2, min(VOL_SURFACE_DTE_POINTS, max(points["DaysToExpiry"].nunique(), 8))))
+        strike_axis = np.linspace(x_min, x_max if x_max > x_min else x_min + 1e-6, nx, dtype=np.float64)
+        dte_axis = np.linspace(y_min, y_max if y_max > y_min else y_min + 1e-6, ny, dtype=np.float64)
+        grid = self._interpolate_delta_grid(points, strike_axis, dte_axis)
+        grid_x, grid_y = np.meshgrid(strike_axis, dte_axis)
+        z = np.asarray(grid, dtype=np.float64).ravel()
+        return {
+            "Strike": np.asarray(grid_x, dtype=np.float64).ravel().tolist(),
+            "DaysToExpiry": np.asarray(grid_y, dtype=np.float64).ravel().tolist(),
+            "Delta": [None if not np.isfinite(v) else float(v) for v in z],
+        }
+
+    def _snapshot_payload(self, ticker: str, timestamp: Any) -> dict[str, Any] | None:
         text = str(timestamp or "").strip()
         candidates = [Path(text), self.history_dir / text, self.history_dir / f"{self._safe_ticker(ticker)}_{text}.json"]
         path = next((item for item in candidates if item.is_file()), None)
@@ -809,7 +866,10 @@ class DataRepository:
                 if stamp in name or name.endswith(f"{stamp}.json"):
                     path = Path(item)
                     break
-        payload = self._read_json(path) if path is not None else None
+        return self._read_json(path) if path is not None else None
+
+    def _snapshot_frame(self, ticker: str, timestamp: Any) -> pd.DataFrame:
+        payload = self._snapshot_payload(ticker, timestamp)
         if not payload:
             return pd.DataFrame()
         return self._records_to_frame(payload.get("data"))
@@ -877,8 +937,16 @@ class DataRepository:
 
     def calculate_delta_drift(self, ticker: str, ts_a: Any, ts_b: Any) -> pd.DataFrame:
         empty = pd.DataFrame(columns=["Strike", "DaysToExpiry", "Delta"])
-        frame_a = self._snapshot_frame(ticker, ts_a)
-        frame_b = self._snapshot_frame(ticker, ts_b)
+        payload_a = self._snapshot_payload(ticker, ts_a) or {}
+        payload_b = self._snapshot_payload(ticker, ts_b) or {}
+        keys_a = list(payload_a.keys())
+        keys_b = list(payload_b.keys())
+        print("ts_a keys:", keys_a)
+        print("ts_b keys:", keys_b)
+        if "delta_surface" not in payload_a or "delta_surface" not in payload_b:
+            print("Delta surface missing from snapshot!")
+        frame_a = self._records_to_frame(payload_a.get("data"))
+        frame_b = self._records_to_frame(payload_b.get("data"))
         if frame_a.empty or frame_b.empty:
             return empty
         pts_a = self._delta_points(frame_a)
@@ -966,6 +1034,59 @@ class DataRepository:
         except Exception as exc:
             _LOG.warning("DataRepository fetch failed ticker=%s expiry=%s error=%s", ticker, expiry, exc)
             return pd.DataFrame()
+
+
+def inspect_snapshot(filename: str) -> dict[str, Any]:
+    raw = str(filename or "").strip()
+    path = Path(raw)
+    if not path.is_file():
+        path = Path(os.path.join("data_history", os.path.basename(raw)))
+    keys: list[str] = []
+    payload: dict[str, Any] = {}
+    if not path.is_file():
+        print("inspect_snapshot missing file:", raw)
+        print("keys:", keys)
+        print("Delta surface missing from snapshot!")
+        return payload
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            loaded = json.load(handle)
+    except (OSError, ValueError, TypeError) as exc:
+        print("inspect_snapshot failed:", path.name, exc)
+        print("keys:", keys)
+        print("Delta surface missing from snapshot!")
+        return payload
+    if not isinstance(loaded, dict):
+        print("inspect_snapshot not a JSON object:", path.name)
+        print("keys:", keys)
+        print("Delta surface missing from snapshot!")
+        return payload
+    payload = loaded
+    keys = list(payload.keys())
+    print("inspect_snapshot", path.name)
+    print("keys:", keys)
+    rows = payload.get("data")
+    if isinstance(rows, list):
+        print("rows:", len(rows))
+        if rows and isinstance(rows[0], dict):
+            print("row_keys:", list(rows[0].keys()))
+    surface = payload.get("delta_surface")
+    if not isinstance(surface, dict) or "delta_surface" not in payload:
+        print("Delta surface missing from snapshot!")
+    else:
+        print("delta_surface_keys:", list(surface.keys()))
+        delta_vals = surface.get("Delta") or []
+        n = len(delta_vals) if isinstance(delta_vals, list) else 0
+        finite = 0
+        if isinstance(delta_vals, list):
+            for item in delta_vals:
+                try:
+                    if item is not None and np.isfinite(float(item)):
+                        finite += 1
+                except (TypeError, ValueError):
+                    continue
+        print("delta_surface_points:", n, "finite:", finite)
+    return payload
 
 
 def generate_greek_curve(
