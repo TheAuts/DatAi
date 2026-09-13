@@ -356,6 +356,43 @@ def test_calculate_portfolio_risk_net_greeks_and_concentration() -> None:
     assert by_ticker["QQQ"] == pytest.approx(-float(short_put["Delta"]) * size)
 
 
+def test_calculate_portfolio_risk_fills_premium_and_spot(monkeypatch) -> None:
+    monkeypatch.setattr("data_ingestion.get_current_price", lambda ticker: {"SPY": 580.0, "AAPL": 230.0}.get(ticker, 0.0))
+    book = pd.DataFrame(
+        {
+            "Ticker": ["SPY", "AAPL"],
+            "Strike": [580.0, 230.0],
+            "Expiry": ["2026-10-16", "2026-11-20"],
+            "Side": ["Call", "Put"],
+            "Quantity": [10.0, 5.0],
+            "EntryPrice": [5.50, 3.20],
+        }
+    )
+    out = calculate_portfolio_risk(book)
+    filled = out["Positions"]
+    assert list(filled["S"]) == [580.0, 230.0]
+    assert list(filled["premium"]) == [10.0 * 5.50 * 100.0, 5.0 * 3.20 * 100.0]
+    assert out["TickerConcentration"] == pytest.approx(100.0 * 5500.0 / (5500.0 + 1600.0))
+    missing = pd.DataFrame({"Ticker": ["ZZZ"], "Strike": [float("nan")], "Quantity": [float("nan")], "Side": ["Call"]})
+    monkeypatch.setattr("data_ingestion.get_current_price", lambda ticker: None)
+    zeros = calculate_portfolio_risk(missing)
+    assert float(zeros["Positions"]["S"].iloc[0]) == 0.0
+    assert float(zeros["Positions"]["premium"].iloc[0]) == 0.0
+    source = pd.DataFrame(
+        {
+            "Ticker": ["SPY"],
+            "Strike": [100.0],
+            "Quantity": [1.0],
+            "Side": ["Call"],
+            "EntryPrice": [2.0],
+        }
+    )
+    before = source.copy()
+    monkeypatch.setattr("data_ingestion.get_current_price", lambda ticker: 101.0)
+    calculate_portfolio_risk(source)
+    assert source.equals(before)
+
+
 def test_data_repository_ttl_version_and_atomic_cache(tmp_path) -> None:
     calls = {"n": 0}
 

@@ -2407,6 +2407,7 @@ def _portfolio_empty() -> dict[str, Any]:
         "ConcentratedTicker": None,
         "DaysToExpiration": None,
         "DeltaByTicker": [],
+        "Positions": pd.DataFrame(),
     }
 
 
@@ -2461,6 +2462,30 @@ def _position_is_put(side: Any, option_type: Any) -> bool:
     return False
 
 
+def _spot_for_ticker(ticker: str, cache: dict[str, float]) -> float:
+    symbol = str(ticker or "").strip().upper()
+    if not symbol or symbol in {"?", "NAN", "NONE"}:
+        return 0.0
+    if symbol in cache:
+        return cache[symbol]
+    try:
+        from data_ingestion import get_current_price
+
+        raw = get_current_price(symbol)
+        price = float(raw) if raw is not None else 0.0
+    except Exception:
+        price = 0.0
+    if not np.isfinite(price) or price < 0:
+        price = 0.0
+    cache[symbol] = price
+    return price
+
+
+def _finite_or_zero(values: np.ndarray) -> np.ndarray:
+    arr = np.array(values, dtype=np.float64, copy=True)
+    return np.array(np.where(np.isfinite(arr), arr, 0.0), dtype=np.float64, copy=True)
+
+
 def calculate_portfolio_risk(positions_df: pd.DataFrame | None) -> dict[str, Any]:
     """Net Delta, Gamma, Theta, Vega, concentration, and nearest DTE for a book.
 
@@ -2472,34 +2497,35 @@ def calculate_portfolio_risk(positions_df: pd.DataFrame | None) -> dict[str, Any
 
     Args:
         positions_df: Positions with Strike/Expiry/Side/Quantity and optional
-            S, sigma, premium, and option_type.
+            S, sigma, premium, EntryPrice, and option_type.
 
     Returns:
-        Dict with ``Delta``, ``Gamma``, ``Theta``, ``Vega``, ``LargestPosition``
-        (percent), ``TickerConcentration`` (percent), ``DaysToExpiration``,
-        and ``DeltaByTicker``.
+        Dict with net Greeks, concentration, ``DeltaByTicker``, and a
+        ``Positions`` frame with filled Spot and Premium.
     """
     if positions_df is None or not isinstance(positions_df, pd.DataFrame) or positions_df.empty:
         return _portfolio_empty()
-    n = len(positions_df.index)
-    strike_col = _sentiment_column(positions_df, "Strike", "strike", "K")
-    expiry_col = _sentiment_column(positions_df, "Expiry", "expiry", "expiration", "Expiration")
-    side_col = _sentiment_column(positions_df, "Side", "side")
-    qty_col = _sentiment_column(positions_df, "Quantity", "quantity", "qty", "contracts")
-    type_col = _sentiment_column(positions_df, "option_type", "type", "Type")
-    spot_col = _sentiment_column(positions_df, "S", "spot", "underlyingPrice", "Price")
-    sigma_col = _sentiment_column(positions_df, "sigma", "impliedVolatility", "IV")
-    rate_col = _sentiment_column(positions_df, "r", "rate")
-    prem_col = _sentiment_column(positions_df, "premium", "lastPrice", "mark", "mid", "option_price")
-    t_col = _sentiment_column(positions_df, "T")
-    dte_col = _sentiment_column(positions_df, "DaysToExpiry", "dte", "days_to_expiry")
-    size_col = _sentiment_column(positions_df, "contractSize", "multiplier", "contract_size")
-    ticker_col = _sentiment_column(positions_df, "Ticker", "ticker", "symbol", "underlying")
+    working = positions_df.copy()
+    n = len(working.index)
+    strike_col = _sentiment_column(working, "Strike", "strike", "K")
+    expiry_col = _sentiment_column(working, "Expiry", "expiry", "expiration", "Expiration")
+    side_col = _sentiment_column(working, "Side", "side")
+    qty_col = _sentiment_column(working, "Quantity", "quantity", "qty", "contracts")
+    type_col = _sentiment_column(working, "option_type", "type", "Type")
+    spot_col = _sentiment_column(working, "S", "spot", "underlyingPrice", "Price")
+    sigma_col = _sentiment_column(working, "sigma", "impliedVolatility", "IV")
+    rate_col = _sentiment_column(working, "r", "rate")
+    prem_col = _sentiment_column(working, "premium", "lastPrice", "mark", "mid", "option_price")
+    entry_col = _sentiment_column(working, "EntryPrice", "entry_price", "entry", "entryprice")
+    t_col = _sentiment_column(working, "T")
+    dte_col = _sentiment_column(working, "DaysToExpiry", "dte", "days_to_expiry")
+    size_col = _sentiment_column(working, "contractSize", "multiplier", "contract_size")
+    ticker_col = _sentiment_column(working, "Ticker", "ticker", "symbol", "underlying")
 
     def _num(col: pd.Series | None, default: float = float("nan")) -> np.ndarray:
         if col is None:
             return np.full(n, default, dtype=np.float64)
-        return pd.to_numeric(col, errors="coerce").to_numpy(dtype=np.float64)
+        return np.array(pd.to_numeric(col, errors="coerce").to_numpy(dtype=np.float64), dtype=np.float64, copy=True)
 
     strikes = _num(strike_col)
     spots = _num(spot_col)
@@ -2507,8 +2533,9 @@ def calculate_portfolio_risk(positions_df: pd.DataFrame | None) -> dict[str, Any
     rates = _num(rate_col, DEFAULT_RATE)
     qtys = _num(qty_col, 0.0)
     premiums = _num(prem_col)
+    entries = _num(entry_col)
     sizes = _num(size_col, float(OPTIONS_CONTRACT_SIZE))
-    sizes = np.where(np.isfinite(sizes) & (sizes > 0), sizes, float(OPTIONS_CONTRACT_SIZE))
+    sizes = np.array(np.where(np.isfinite(sizes) & (sizes > 0), sizes, float(OPTIONS_CONTRACT_SIZE)), dtype=np.float64, copy=True)
     tenors = _num(t_col)
     dtes = _num(dte_col)
     sides = side_col.astype(str).tolist() if side_col is not None else [""] * n
@@ -2517,22 +2544,57 @@ def calculate_portfolio_risk(positions_df: pd.DataFrame | None) -> dict[str, Any
     if ticker_col is None:
         tickers = np.array(["?"] * n, dtype=object)
     else:
-        tickers = ticker_col.astype(str).str.strip().str.upper().to_numpy(dtype=object)
-        tickers = np.where(pd.notna(ticker_col) & (tickers != "") & (tickers != "NAN"), tickers, "?")
+        tickers = np.array(ticker_col.astype(str).str.strip().str.upper().to_numpy(dtype=object), copy=True)
+        tickers = np.array(np.where(pd.notna(ticker_col) & (tickers != "") & (tickers != "NAN"), tickers, "?"), copy=True)
 
-    missing_t = ~np.isfinite(tenors) | (tenors <= 0)
+    spots = np.array(spots, dtype=np.float64, copy=True)
+    tenors = np.array(tenors, dtype=np.float64, copy=True)
+    dtes = np.array(dtes, dtype=np.float64, copy=True)
+    qtys = _finite_or_zero(qtys)
+    entries = _finite_or_zero(entries)
+    strikes = _finite_or_zero(strikes)
+    spot_cache: dict[str, float] = {}
+    filled_spots = np.array(spots, dtype=np.float64, copy=True)
+    for i in range(n):
+        if not np.isfinite(filled_spots[i]) or filled_spots[i] <= 0:
+            filled_spots[i] = _spot_for_ticker(str(tickers[i]), spot_cache)
+    spots = _finite_or_zero(filled_spots)
+    missing_prem = np.array((~np.isfinite(premiums)) | (premiums < 0), copy=True)
+    premiums = np.array(
+        np.where(
+            missing_prem,
+            np.abs(qtys) * entries * float(OPTIONS_CONTRACT_SIZE),
+            premiums,
+        ),
+        dtype=np.float64,
+        copy=True,
+    )
+    premium_is_total = missing_prem
+    premiums = _finite_or_zero(premiums)
+    sigmas = _finite_or_zero(sigmas)
+    rates = _finite_or_zero(rates)
+
+    filled_tenors = np.array(tenors, dtype=np.float64, copy=True)
+    missing_t = ~np.isfinite(filled_tenors) | (filled_tenors <= 0)
     if np.any(missing_t) and expiry_col is not None:
         for i in np.flatnonzero(missing_t):
             years = _time_to_expiry_years(expiries[i])
             if np.isfinite(years) and years > 0:
-                tenors[i] = years
+                filled_tenors[i] = years
+    tenors = filled_tenors
     missing_dte = ~np.isfinite(dtes) | (dtes <= 0)
-    dtes = np.where(missing_dte & np.isfinite(tenors) & (tenors > 0), tenors * DAYS_PER_YEAR, dtes)
+    dtes = np.array(
+        np.where(missing_dte & np.isfinite(tenors) & (tenors > 0), tenors * DAYS_PER_YEAR, dtes),
+        dtype=np.float64,
+        copy=True,
+    )
     if np.any(missing_dte) and expiry_col is not None:
         for i in np.flatnonzero(~np.isfinite(dtes) | (dtes <= 0)):
             iso = _normalize_expiry_iso(expiries[i])
             if iso:
                 dtes[i] = _expiry_days_to_go(iso)
+    tenors = _finite_or_zero(tenors)
+    dtes = _finite_or_zero(dtes)
 
     net_delta = 0.0
     net_gamma = 0.0
@@ -2565,16 +2627,9 @@ def calculate_portfolio_risk(positions_df: pd.DataFrame | None) -> dict[str, Any
         if greeks.get("Vega") is not None:
             net_vega += float(greeks["Vega"]) * multiplier
         prem = premiums[i]
-        if not np.isfinite(prem) or prem < 0:
-            prem = _black_scholes_price(
-                float(spots[i]),
-                float(strikes[i]),
-                float(tenors[i]),
-                float(rates[i]),
-                float(sigmas[i]),
-                is_put,
-            )
-        if np.isfinite(prem):
+        if premium_is_total[i]:
+            notionals[i] = abs(float(prem))
+        else:
             notionals[i] = abs(float(prem) * abs(signed) * float(sizes[i]))
 
     total_prem = float(np.nansum(notionals))
@@ -2598,6 +2653,13 @@ def calculate_portfolio_risk(positions_df: pd.DataFrame | None) -> dict[str, Any
     delta_by_ticker["Ticker"] = delta_by_ticker["Ticker"].astype(str)
     finite_dte = dtes[np.isfinite(dtes) & (dtes >= 0)]
     nearest = float(np.min(finite_dte)) if finite_dte.size else None
+    filled = working.copy()
+    filled.loc[:, "S"] = np.array(spots, dtype=np.float64, copy=True)
+    filled.loc[:, "premium"] = np.array(premiums, dtype=np.float64, copy=True)
+    if "EntryPrice" not in filled.columns:
+        filled.loc[:, "EntryPrice"] = np.array(entries, dtype=np.float64, copy=True)
+    if filled.empty:
+        return _portfolio_empty()
     return {
         "Delta": float(net_delta),
         "Gamma": float(net_gamma),
@@ -2608,4 +2670,5 @@ def calculate_portfolio_risk(positions_df: pd.DataFrame | None) -> dict[str, Any
         "ConcentratedTicker": concentrated_ticker,
         "DaysToExpiration": nearest,
         "DeltaByTicker": delta_by_ticker.to_dict(orient="records"),
+        "Positions": filled,
     }

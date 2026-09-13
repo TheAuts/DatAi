@@ -69,6 +69,7 @@ PORTFOLIO_COLUMNS = (
     "S",
     "sigma",
     "premium",
+    "EntryPrice",
 )
 
 
@@ -84,6 +85,7 @@ def _empty_portfolio_positions() -> pd.DataFrame:
             "S": pd.Series([np.nan], dtype="float64"),
             "sigma": pd.Series([float(DEFAULT_SIGMA)], dtype="float64"),
             "premium": pd.Series([np.nan], dtype="float64"),
+            "EntryPrice": pd.Series([np.nan], dtype="float64"),
         }
     )
 
@@ -117,12 +119,22 @@ def _normalize_portfolio_frame(frame: pd.DataFrame) -> pd.DataFrame:
         "premium": "premium",
         "lastprice": "premium",
         "mark": "premium",
+        "entryprice": "EntryPrice",
+        "entry_price": "EntryPrice",
+        "entry": "EntryPrice",
     }
     for key, dest in aliases.items():
         if dest not in out.columns and key in lookup:
             rename[lookup[key]] = dest
     if rename:
         out = out.rename(columns=rename)
+    if "Side" in out.columns:
+        side_text = out["Side"].astype(str).str.strip().str.lower()
+        is_cp = side_text.str.startswith("p") | side_text.str.startswith("c")
+        if bool(is_cp.any()):
+            if "option_type" not in out.columns:
+                out["option_type"] = "call"
+            out.loc[is_cp, "option_type"] = np.where(side_text.loc[is_cp].str.startswith("p"), "put", "call")
     for column in PORTFOLIO_COLUMNS:
         if column not in out.columns:
             template = _empty_portfolio_positions()[column]
@@ -1865,12 +1877,13 @@ def add_portfolio_risk_tab(tab: Any) -> None:
                 "Ticker": st.column_config.TextColumn("Ticker"),
                 "Strike": st.column_config.NumberColumn("Strike", format="%.2f"),
                 "Expiry": st.column_config.TextColumn("Expiry"),
-                "Side": st.column_config.SelectboxColumn("Side", options=["long", "short"]),
+                "Side": st.column_config.SelectboxColumn("Side", options=["long", "short", "Call", "Put"]),
                 "Quantity": st.column_config.NumberColumn("Quantity", format="%.2f"),
                 "option_type": st.column_config.SelectboxColumn("Type", options=["call", "put"]),
                 "S": st.column_config.NumberColumn("Spot", format="%.2f"),
                 "sigma": st.column_config.NumberColumn("IV", format="%.4f"),
                 "premium": st.column_config.NumberColumn("Premium", format="%.2f"),
+                "EntryPrice": st.column_config.NumberColumn("Entry price", format="%.2f"),
             },
         )
         st.session_state.portfolio_positions = edited
@@ -1893,6 +1906,12 @@ def add_portfolio_risk_tab(tab: Any) -> None:
             st.metric("Net Gamma", _format_greek_metric(risk.get("Gamma")), border=True)
             st.metric("Net Theta", _format_greek_metric(risk.get("Theta")), border=True)
             st.metric("Net Vega", _format_greek_metric(risk.get("Vega")), border=True)
+        filled = risk.get("Positions")
+        if isinstance(filled, pd.DataFrame) and not filled.empty:
+            show_cols = [c for c in ("Ticker", "Strike", "Expiry", "Side", "Quantity", "EntryPrice", "S", "premium") if c in filled.columns]
+            with st.container(border=True):
+                st.markdown("**Computed spots and premiums**")
+                st.dataframe(filled.loc[:, show_cols] if show_cols else filled, hide_index=True, width="stretch")
         concentration = risk.get("TickerConcentration")
         if concentration is None:
             concentration = risk.get("LargestPosition")
