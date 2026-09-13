@@ -646,6 +646,13 @@ class DataRepository:
             payload.setdefault(key, {"Strike": [], "DaysToExpiry": [], value_key: []})
         payload.setdefault("snapshot_id", uuid.uuid4().hex)
         payload.setdefault("spot", self._spot_from_frame(frame))
+        previous_path = self._latest_snapshot_path(ticker)
+        if previous_path is not None:
+            previous = self._read_json(previous_path) or {}
+            if self._delta_surfaces_identical(previous.get("delta_surface"), payload.get("delta_surface")):
+                print("Snapshot identical to previous—not saving.")
+                _LOG.info("Snapshot for %s identical to %s; skipped.", ticker, previous_path.name)
+                return previous_path
         live = self._atomic_json_write(self._cache_path(ticker), payload)
         history = self._atomic_json_write(self._history_path(ticker, str(payload["stamp"])), payload)
         self._prune_history(ticker)
@@ -654,6 +661,33 @@ class DataRepository:
         print("Snapshot saved to data_history/")
         print(f"Successfully saved {saved_keys} to snapshot.")
         return live if live else history
+
+    def _latest_snapshot_path(self, ticker: str) -> Path | None:
+        snapshots = self.get_historical_snapshots(ticker)
+        return Path(snapshots[-1]) if snapshots else None
+
+    @staticmethod
+    def _delta_surfaces_identical(previous: Any, current: Any, *, atol: float = 1e-9) -> bool:
+        """NaN-aware equality of two stored delta surfaces (same length, allclose values).
+
+        Empty/missing surfaces are never treated as identical so a real capture
+        is not suppressed by a corrupt predecessor.
+        """
+        if not isinstance(previous, dict) or not isinstance(current, dict):
+            return False
+        prev_vals, cur_vals = previous.get("Delta"), current.get("Delta")
+        if not isinstance(prev_vals, list) or not isinstance(cur_vals, list):
+            return False
+        if not prev_vals or len(prev_vals) != len(cur_vals):
+            return False
+        try:
+            a = np.asarray([np.nan if v is None else float(v) for v in prev_vals], dtype=np.float64)
+            b = np.asarray([np.nan if v is None else float(v) for v in cur_vals], dtype=np.float64)
+        except (TypeError, ValueError):
+            return False
+        if not np.isfinite(a).any() or not np.isfinite(b).any():
+            return False
+        return bool(np.allclose(a, b, rtol=0.0, atol=atol, equal_nan=True))
 
     def _atomic_json_write(self, path: Path, payload: dict[str, Any]) -> Path:
         path.parent.mkdir(parents=True, exist_ok=True)
