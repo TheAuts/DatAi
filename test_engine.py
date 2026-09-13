@@ -495,6 +495,45 @@ def test_data_repository_delta_drift_and_snapshots(tmp_path) -> None:
     assert mixed["Delta"].notna().any()
 
 
+def test_calculate_delta_drift_mismatched_metadata_short_circuits(tmp_path) -> None:
+    """Mismatched contract metadata must not produce a drift surface."""
+    repo = DataRepository(cache_dir=tmp_path, history_dir=tmp_path / "data_history", status_probe=lambda: {"ok": True})
+    base = pd.DataFrame(
+        {
+            "Strike": [90.0, 100.0, 110.0, 90.0, 100.0, 110.0],
+            "DaysToExpiry": [7.0, 7.0, 7.0, 30.0, 30.0, 30.0],
+            "Delta": [0.80, 0.50, 0.20, 0.70, 0.50, 0.30],
+        }
+    )
+    later = base.copy()
+    later["Delta"] = base["Delta"] + 0.10
+    repo.save_to_cache(
+        "SPY",
+        base,
+        metadata={"ticker": "SPY", "strike": 100.0, "expiry": "2026-12-18"},
+    )
+    ts_a = repo.get_available_snapshots("SPY")[-1]
+    repo.save_to_cache(
+        "SPY",
+        later,
+        metadata={"ticker": "SPY", "strike": 110.0, "expiry": "2026-12-18"},
+    )
+    ts_b = repo.get_available_snapshots("SPY")[-1]
+    assert ts_a != ts_b
+    payload_a = repo._snapshot_payload("SPY", ts_a) or {}
+    payload_b = repo._snapshot_payload("SPY", ts_b) or {}
+    matched, message = DataRepository.validate_snapshot_match(payload_a, payload_b)
+    assert matched is False
+    assert "strike" in message
+    drift = repo.calculate_delta_drift("SPY", ts_a, ts_b)
+    assert drift.empty
+    assert list(drift.columns) == ["Strike", "DaysToExpiry", "Delta"]
+    strike_axis, dte_axis, z = repo.calculate_delta_drift_grid("SPY", ts_a, ts_b)
+    assert strike_axis.size == 0
+    assert dte_axis.size == 0
+    assert z.size == 0
+
+
 def test_snapshot_vol_surface_from_history(tmp_path) -> None:
     repo = DataRepository(cache_dir=tmp_path, history_dir=tmp_path / "data_history")
     rows = []

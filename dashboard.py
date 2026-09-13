@@ -2477,9 +2477,12 @@ def add_time_machine_tab(tab: Any, ticker: str) -> None:
             st.error("Snapshot data is corrupt/empty.")
         elif str(start) == str(end):
             st.error("Start and End snapshots are identical; delta drift is zero everywhere. Pick two different snapshots.")
-        elif not (match := DataRepository.validate_snapshot_match(payload_a, payload_b))[0]:
-            st.error(match[1])
+        elif not DataRepository.validate_snapshot_match(payload_a, payload_b)[0]:
+            st.warning(
+                "Invalid Comparison: You must select snapshots of the same contract to calculate Delta Drift."
+            )
         else:
+            st.success("Valid Contract Pair: Calculating Drift...")
             try:
                 grid = cached_delta_drift_grid(str(ticker), str(start), str(end))
                 drift = cached_delta_drift(str(ticker), str(start), str(end))

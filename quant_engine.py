@@ -1250,8 +1250,13 @@ class DataRepository:
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Delta drift between two snapshots as a 2D grid: ``later - earlier``.
 
+        Contract gate: when both payloads carry comparable ``metadata`` (ticker /
+        strike / expiry), a mismatch short-circuits to an empty grid so callers
+        never render a flat plane for an invalid pair.
+
         Returns ``(strike_axis, dte_axis, Z)`` with ``Z.shape == (len(dte_axis), len(strike_axis))``
-        and ``Z.dtype == float``. All three arrays are empty when either snapshot lacks usable data.
+        and ``Z.dtype == float``. All three arrays are empty when metadata mismatches,
+        either snapshot lacks usable data, or the grid cannot be built.
         """
         empty = (np.empty(0, dtype=float), np.empty(0, dtype=float), np.empty((0, 0), dtype=float))
         payload_a = self._snapshot_payload(ticker, ts_a) or {}
@@ -1266,11 +1271,11 @@ class DataRepository:
             print("Both timestamps resolve to the same snapshot_id; drift will be zero.")
         if "delta_surface" not in payload_a or "delta_surface" not in payload_b:
             print("Delta surface missing from snapshot!")
-        if payload_a and payload_b:
-            matched, message = self.validate_snapshot_match(payload_a, payload_b)
-            if not matched:
-                print(message)
-                return empty
+        # Metadata must match before any interpolation / surface math runs.
+        matched, message = self.validate_snapshot_match(payload_a, payload_b)
+        if not matched:
+            print(message)
+            return empty
         frame_a = self._records_to_frame(payload_a.get("data"))
         frame_b = self._records_to_frame(payload_b.get("data"))
         if frame_a.empty or frame_b.empty:
@@ -1304,8 +1309,11 @@ class DataRepository:
     def calculate_delta_drift(self, ticker: str, ts_a: Any, ts_b: Any) -> pd.DataFrame:
         """Long-format ``Strike``/``DaysToExpiry``/``Delta`` drift frame (``ts_b - ts_a``).
 
-        Thin wrapper over :meth:`calculate_delta_drift_grid`; the 2D grid is also
-        exposed via ``frame.attrs["Z"]``, ``["X"]`` and ``["Y"]`` for direct Plotly use.
+        Thin wrapper over :meth:`calculate_delta_drift_grid`. Contract metadata
+        mismatches (and other empty-grid cases) yield an empty frame with the
+        usual columns so callers stay compatible and skip surface rendering.
+        The 2D grid is also exposed via ``frame.attrs["Z"]``, ``["X"]`` and
+        ``["Y"]`` for direct Plotly use when drift is non-empty.
         """
         empty = pd.DataFrame(columns=["Strike", "DaysToExpiry", "Delta"])
         strike_axis, dte_axis, drift = self.calculate_delta_drift_grid(ticker, ts_a, ts_b)
