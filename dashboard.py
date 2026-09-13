@@ -28,6 +28,7 @@ from quant_engine import (
     DEFAULT_HESTON_V0,
     DEFAULT_RATE,
     DEFAULT_SIGMA,
+    EVENT_INSUFFICIENT_COVERAGE,
     GAMMA_FLIP_NEAR_PCT,
     MODEL_BLACK_SCHOLES,
     MODEL_HESTON,
@@ -1292,8 +1293,12 @@ def cached_vol_risk_outlook(ticker: str) -> dict[str, Any]:
 
 
 @st.cache_data(ttl=120, show_spinner="Scoring event outlook…")
-def cached_event_outlook(ticker: str) -> dict[str, Any]:
-    return analyze_event_outlook(cached_analyst_chain(ticker))
+def cached_event_outlook(ticker: str, selected_expiry: str = "") -> dict[str, Any]:
+    return analyze_event_outlook(
+        cached_analyst_chain(ticker),
+        ticker=ticker,
+        selected_expiry=selected_expiry or None,
+    )
 
 
 def _format_iv_metric(value: Any) -> str:
@@ -1614,7 +1619,7 @@ def _sentiment_metric_style(flag: str) -> tuple[str, str]:
     return "Neutral", "off"
 
 
-def add_market_analyst_tab(tab: Any, ticker: str, current_price: float = 0.0) -> None:
+def add_market_analyst_tab(tab: Any, ticker: str, current_price: float = 0.0, expiry: Any = None) -> None:
     with tab:
         try:
             report = cached_market_sentiment(str(ticker).strip().upper())
@@ -1661,7 +1666,10 @@ def add_market_analyst_tab(tab: Any, ticker: str, current_price: float = 0.0) ->
                     "Market is sensitive to volatility changes; expect potential adjustments in Delta and Vega."
                 )
         try:
-            event = cached_event_outlook(str(ticker).strip().upper())
+            event = cached_event_outlook(
+                str(ticker).strip().upper(),
+                str(expiry) if expiry is not None else "",
+            )
         except Exception as error:
             st.exception(error)
             return
@@ -1678,10 +1686,12 @@ def add_market_analyst_tab(tab: Any, ticker: str, current_price: float = 0.0) ->
             if np.isfinite(short_n) and np.isfinite(long_n):
                 spread = short_n - long_n
         with st.expander("Event Outlook (Term Structure)", expanded=True):
-            with st.container(horizontal=True):
-                st.metric("Short-Term IV", _format_iv_metric(short_iv), border=True)
-                st.metric("Long-Term IV", _format_iv_metric(long_iv), border=True)
-                st.metric("IV Spread", _format_iv_metric(spread), border=True)
+            coverage_ok = str(event.get("Outlook", "")) != EVENT_INSUFFICIENT_COVERAGE
+            if coverage_ok:
+                with st.container(horizontal=True):
+                    st.metric("Short-Term IV", _format_iv_metric(short_iv), border=True)
+                    st.metric("Long-Term IV", _format_iv_metric(long_iv), border=True)
+                    st.metric("IV Spread", _format_iv_metric(spread), border=True)
             st.write(str(event.get("Summary", event.get("Outlook", ""))))
             if bool(event.get("EventRisk")):
                 st.warning(
@@ -2246,7 +2256,7 @@ def main() -> None:
         )
 
     if analyst_tab.open:
-        add_market_analyst_tab(analyst_tab, ticker, float(current_price))
+        add_market_analyst_tab(analyst_tab, ticker, float(current_price), expiry)
 
 
 if __name__ == "__main__":

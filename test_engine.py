@@ -24,6 +24,7 @@ from quant_engine import (
     calculate_vomma,
     calculate_zomma,
     generate_pro_surface_data,
+    EVENT_INSUFFICIENT_COVERAGE,
     analyze_event_outlook,
     analyze_gex_outlook,
     analyze_market_sentiment,
@@ -271,7 +272,7 @@ def test_analyze_volatility_risk_outlook() -> None:
     assert "unavailable" in analyze_volatility_risk_outlook(no_iv)["Outlook"]
 
 
-def test_analyze_event_outlook_catalyst_and_thin_chain() -> None:
+def test_analyze_event_outlook_catalyst_and_thin_chain(monkeypatch, caplog) -> None:
     frame = pd.DataFrame(
         {
             "impliedVolatility": [0.36, 0.36, 0.20, 0.20, 0.18, 0.18],
@@ -279,19 +280,33 @@ def test_analyze_event_outlook_catalyst_and_thin_chain() -> None:
             "expiration": ["2026-09-18", "2026-09-18", "2026-10-16", "2026-10-16", "2026-12-18", "2026-12-18"],
         }
     )
-    out = analyze_event_outlook(frame)
+    out = analyze_event_outlook(frame, selected_expiry="2026-09-18")
     assert out["EventRisk"] is True
     assert out["Outlook"] == "High Event Risk / Catalyst Detected."
     assert "2026-09-18" in out["Summary"]
     assert "catalyst" in out["Summary"]
     assert "elevated by" in out["Summary"]
+    far = analyze_event_outlook(frame, selected_expiry="2026-12-18")
+    assert far["ShortIV"] == pytest.approx(0.20)
+    assert far["LongIV"] == pytest.approx(0.18)
     calm = frame.copy()
     calm["impliedVolatility"] = [0.20, 0.20, 0.20, 0.20, 0.19, 0.19]
-    quiet = analyze_event_outlook(calm)
+    quiet = analyze_event_outlook(calm, selected_expiry="2026-09-18")
     assert quiet["EventRisk"] is False
     assert quiet["Outlook"] == "Stable Event Outlook"
     empty = analyze_event_outlook(pd.DataFrame())
     assert empty["EventRisk"] is False
-    assert "unavailable" in empty["Summary"]
-    thin = pd.DataFrame({"impliedVolatility": [0.40, 0.41], "DaysToExpiry": [5.0, 8.0]})
-    assert "unavailable" in analyze_event_outlook(thin)["Outlook"]
+    assert empty["Summary"] == EVENT_INSUFFICIENT_COVERAGE
+    thin = pd.DataFrame(
+        {
+            "impliedVolatility": [0.40, 0.41],
+            "DaysToExpiry": [5.0, 5.0],
+            "expiration": ["2026-09-18", "2026-09-18"],
+        }
+    )
+    assert analyze_event_outlook(thin)["Outlook"] == EVENT_INSUFFICIENT_COVERAGE
+    monkeypatch.setattr("quant_engine._event_listed_expirations", lambda ticker: ["2026-12-18"])
+    sparse = analyze_event_outlook(frame, ticker="THIN", selected_expiry="2026-12-18")
+    assert sparse["Outlook"] == EVENT_INSUFFICIENT_COVERAGE
+    assert "THIN" in caplog.text
+    assert "2026-12-18" in caplog.text

@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from datetime import date, datetime, timezone
+import logging
+from datetime import date, datetime, timedelta, timezone
 from functools import lru_cache
 from typing import Any, Iterable, Mapping
 
@@ -39,7 +40,10 @@ OPTIONS_CONTRACT_SIZE = 100
 GAMMA_FLIP_NEAR_PCT = 0.01
 EVENT_SHORT_DTE = 15.0
 EVENT_MEDIUM_DTE = 60.0
+EVENT_LIQUID_DTE = 30.0
 EVENT_IV_RATIO = 1.2
+EVENT_INSUFFICIENT_COVERAGE = "Insufficient expiration coverage for term structure analysis"
+_LOG = logging.getLogger("datiai.quant")
 MODEL_BLACK_SCHOLES = "black-scholes"
 MODEL_HESTON = "heston"
 _EMPTY_GREEKS: dict[str, float | None] = {
@@ -1998,10 +2002,11 @@ def analyze_volatility_risk_outlook(df: pd.DataFrame | None) -> dict[str, Any]:
     )
 
 
-def _event_outlook_unavailable() -> dict[str, Any]:
+def _event_outlook_unavailable(message: str | None = None) -> dict[str, Any]:
+    text = message or EVENT_INSUFFICIENT_COVERAGE
     return {
-        "Outlook": "Event outlook is unavailable: expiration coverage is too thin to compare short-, medium-, and long-dated implied volatility.",
-        "Summary": "Event outlook is unavailable: expiration coverage is too thin to compare short-, medium-, and long-dated implied volatility.",
+        "Outlook": text,
+        "Summary": text,
         "EventRisk": False,
         "ShortIV": None,
         "MediumIV": None,
@@ -2009,66 +2014,213 @@ def _event_outlook_unavailable() -> dict[str, Any]:
     }
 
 
-def _event_expiry_label(frame: pd.DataFrame, dtes: np.ndarray, mask: np.ndarray) -> str:
-    """Label the nearest expiry in ``mask`` from an expiration column or DTE."""
-    picked = np.isfinite(dtes) & mask
-    if not np.any(picked):
-        picked = np.isfinite(dtes) & (dtes > 0)
-    if not np.any(picked):
-        return "nearest"
-    idx = int(np.nanargmin(np.where(picked, dtes, np.inf)))
+def _warn_thin_event_data(ticker: str | None, expiry: str | None, detail: str) -> None:
+    _LOG.warning(
+        "Thin event-outlook data ticker=%s expiry=%s detail=%s",
+        ticker or "?",
+        expiry or "?",
+        detail,
+    )
+
+
+def _normalize_expiry_iso(value: Any) -> str | None:
+    if value is None or (isinstance(value, float) and not np.isfinite(value)):
+        return None
+    if isinstance(value, datetime):
+        return value.date().isoformat()
+    if isinstance(value, date):
+        return value.isoformat()
+    text = str(value).strip()
+    if not text or text.lower() in {"nan", "none", "nat"}:
+        return None
+    if len(text) >= 10:
+        try:
+            return date.fromisoformat(text[:10]).isoformat()
+        except ValueError:
+            pass
+    try:
+        parsed = pd.to_datetime(text, errors="coerce")
+    except (TypeError, ValueError):
+        return None
+    if pd.isna(parsed):
+        return None
+    return parsed.date().isoformat()
+
+
+def _expiry_days_to_go(expiry_iso: str) -> float:
+    try:
+        target = date.fromisoformat(expiry_iso[:10])
+    except (TypeError, ValueError):
+        return float("nan")
+    return float((target - datetime.now(timezone.utc).date()).days)
+
+
+def _frame_expiry_dates(frame: pd.DataFrame) -> list[str]:
     expiry = _sentiment_column(frame, "expiration", "expiry", "Expiration", "Expiry")
-    if expiry is not None:
-        raw = expiry.iloc[idx]
-        if isinstance(raw, datetime):
-            return raw.date().isoformat()
-        if isinstance(raw, date):
-            return raw.isoformat()
-        text = str(raw).strip()
-        if len(text) >= 10:
-            try:
-                return date.fromisoformat(text[:10]).isoformat()
-            except ValueError:
-                pass
-        if text:
-            return text
-    dte = float(dtes[idx])
-    if np.isfinite(dte) and dte > 0:
-        return f"{dte:.0f} DTE"
-    return "nearest"
+    if expiry is None:
+        dtes = _sentiment_tenor_days(frame)
+        today = datetime.now(timezone.utc).date()
+        out: list[str] = []
+        for dte in dtes:
+            if np.isfinite(dte) and dte > 0:
+                out.append((today + timedelta(days=int(round(float(dte))))).isoformat())
+        return sorted(dict.fromkeys(out))
+    found: list[str] = []
+    for raw in expiry.tolist():
+        iso = _normalize_expiry_iso(raw)
+        if iso:
+            found.append(iso)
+    return sorted(dict.fromkeys(found))
 
 
-def analyze_event_outlook(df: pd.DataFrame | None) -> dict[str, Any]:
-    """Flag a near-term catalyst from the implied-vol term structure.
+def _event_listed_expirations(ticker: str) -> list[str]:
+    from data_ingestion import get_available_expirations
 
-    Mean IV is taken over short-dated options (DTE < 15), medium-dated
-    (15–60), and long-dated (> 60). Short IV > 1.2 × medium IV is treated as
-    high event risk. Limited expiry coverage returns an unavailable result
-    instead of a false catalyst.
+    try:
+        listed = list(get_available_expirations(ticker) or [])
+    except Exception as exc:
+        _warn_thin_event_data(ticker, None, f"expiration lookup failed ({exc})")
+        return []
+    out: list[str] = []
+    for item in listed:
+        iso = _normalize_expiry_iso(item)
+        if iso:
+            out.append(iso)
+    return sorted(dict.fromkeys(out))
+
+
+def _event_fetch_chain(ticker: str, expiry: str) -> pd.DataFrame:
+    from data_ingestion import fetch_option_chain
+
+    try:
+        frame = fetch_option_chain(ticker, expiry)
+    except Exception as exc:
+        _warn_thin_event_data(ticker, expiry, f"chain fetch failed ({exc})")
+        return pd.DataFrame()
+    if not isinstance(frame, pd.DataFrame) or frame.empty:
+        return pd.DataFrame()
+    return frame
+
+
+def _select_event_buckets(expiries: list[str], selected_expiry: Any = None) -> tuple[str | None, str | None]:
+    dated = [(iso, _expiry_days_to_go(iso)) for iso in expiries]
+    dated = [(iso, dte) for iso, dte in dated if np.isfinite(dte) and dte > 0]
+    if len(dated) < 2:
+        return None, None
+    dated.sort(key=lambda item: item[1])
+    long_iso = dated[-1][0]
+    liquid_iso = min(dated, key=lambda item: abs(item[1] - EVENT_LIQUID_DTE))[0]
+    selected_iso = _normalize_expiry_iso(selected_expiry)
+    selected_dte = _expiry_days_to_go(selected_iso) if selected_iso else float("nan")
+    listed = {iso for iso, _ in dated}
+    too_far = (
+        selected_iso is None
+        or selected_iso not in listed
+        or not np.isfinite(selected_dte)
+        or selected_dte > EVENT_MEDIUM_DTE
+        or selected_iso == long_iso
+    )
+    short_iso = liquid_iso if too_far else selected_iso
+    if short_iso == long_iso:
+        short_iso = dated[0][0]
+    if short_iso == long_iso:
+        return None, None
+    return short_iso, long_iso
+
+
+def _expiry_row_mask(frame: pd.DataFrame, expiry_iso: str) -> np.ndarray:
+    n = len(frame.index)
+    col = _sentiment_column(frame, "expiration", "expiry", "Expiration", "Expiry")
+    if col is not None:
+        labels = np.array([_normalize_expiry_iso(v) for v in col.tolist()], dtype=object)
+        return labels == expiry_iso
+    dtes = _sentiment_tenor_days(frame)
+    target = _expiry_days_to_go(expiry_iso)
+    if not np.isfinite(target):
+        return np.zeros(n, dtype=bool)
+    return np.isfinite(dtes) & (np.abs(dtes - target) <= 1.5)
+
+
+def _pad_event_chain(frame: pd.DataFrame, ticker: str | None, expiry_iso: str) -> pd.DataFrame:
+    if np.any(_expiry_row_mask(frame, expiry_iso)):
+        return frame
+    _warn_thin_event_data(ticker, expiry_iso, "missing chain rows; padding from API")
+    if not ticker:
+        return frame
+    extra = _event_fetch_chain(ticker, expiry_iso)
+    if extra.empty:
+        _warn_thin_event_data(ticker, expiry_iso, "padding fetch returned no rows")
+        return frame
+    return pd.concat([frame, extra], ignore_index=True)
+
+
+def _mean_iv_for_expiry(frame: pd.DataFrame, expiry_iso: str) -> float:
+    iv = _sentiment_iv_series(frame).to_numpy(dtype=np.float64)
+    iv = np.where(np.isfinite(iv) & (iv > SIGMA_MIN), iv, np.nan)
+    mask = _expiry_row_mask(frame, expiry_iso) & np.isfinite(iv)
+    return _finite_mean(iv[mask])
+
+
+def analyze_event_outlook(
+    df: pd.DataFrame | None,
+    ticker: str | None = None,
+    selected_expiry: Any = None,
+) -> dict[str, Any]:
+    """Flag a near-term catalyst from listed expiries and implied vol.
+
+    Discovers available expirations for ``ticker`` (lazy MarketData lookup).
+    Short-term IV uses the selected expiry when it is near-dated; otherwise the
+    nearest liquid expiry around ``EVENT_LIQUID_DTE`` (30). Long-term IV uses
+    the furthest listed expiry. Short IV > 1.2× the comparison tenor is event risk.
 
     Args:
         df: Option chain with implied volatility and tenor or expiration.
+        ticker: Underlying symbol used to fetch the full expiration calendar.
+        selected_expiry: Dashboard expiry; ignored when too far out to compare.
 
     Returns:
         Dict with ``Outlook``, ``Summary``, ``EventRisk``, and bucket IVs.
     """
-    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
-        return _event_outlook_unavailable()
-    iv = _sentiment_iv_series(df).to_numpy(dtype=np.float64)
+    frame = df if isinstance(df, pd.DataFrame) else pd.DataFrame()
+    symbol = str(ticker).strip().upper() if ticker else ""
+    if not symbol:
+        ticker_col = _sentiment_column(frame, "ticker", "underlying", "symbol") if not frame.empty else None
+        if ticker_col is not None and len(ticker_col):
+            symbol = str(ticker_col.iloc[0]).strip().upper()
+    listed: list[str] = []
+    if symbol:
+        listed = _event_listed_expirations(symbol)
+        if len(listed) < 2:
+            _warn_thin_event_data(symbol, _normalize_expiry_iso(selected_expiry), "API returned fewer than 2 expirations")
+            return _event_outlook_unavailable(EVENT_INSUFFICIENT_COVERAGE)
+    else:
+        listed = _frame_expiry_dates(frame)
+        if len(listed) < 2:
+            _warn_thin_event_data(None, _normalize_expiry_iso(selected_expiry), "fewer than 2 expirations")
+            return _event_outlook_unavailable(EVENT_INSUFFICIENT_COVERAGE)
+    short_iso, long_iso = _select_event_buckets(listed, selected_expiry)
+    if short_iso is None or long_iso is None:
+        _warn_thin_event_data(symbol or None, _normalize_expiry_iso(selected_expiry), "could not form short/long buckets")
+        return _event_outlook_unavailable(EVENT_INSUFFICIENT_COVERAGE)
+    if frame.empty:
+        frame = pd.DataFrame()
+    frame = _pad_event_chain(frame, symbol or None, short_iso)
+    frame = _pad_event_chain(frame, symbol or None, long_iso)
+    if frame.empty:
+        _warn_thin_event_data(symbol or None, short_iso, "no chain after padding")
+        return _event_outlook_unavailable(EVENT_INSUFFICIENT_COVERAGE)
+    iv = _sentiment_iv_series(frame).to_numpy(dtype=np.float64)
     iv = np.where(np.isfinite(iv) & (iv > SIGMA_MIN), iv, np.nan)
-    dtes = _sentiment_tenor_days(df)
+    dtes = _sentiment_tenor_days(frame)
     valid = np.isfinite(iv) & np.isfinite(dtes) & (dtes > 0)
-    if not np.any(valid):
-        return _event_outlook_unavailable()
-    short_mask = valid & (dtes < EVENT_SHORT_DTE)
+    short_iv = _mean_iv_for_expiry(frame, short_iso)
+    long_iv = _mean_iv_for_expiry(frame, long_iso)
     medium_mask = valid & (dtes >= EVENT_SHORT_DTE) & (dtes <= EVENT_MEDIUM_DTE)
-    long_mask = valid & (dtes > EVENT_MEDIUM_DTE)
-    short_iv = _finite_mean(iv[short_mask])
     medium_iv = _finite_mean(iv[medium_mask])
-    long_iv = _finite_mean(iv[long_mask])
     compare_iv = medium_iv if np.isfinite(medium_iv) else long_iv
     if not np.isfinite(short_iv) or not np.isfinite(compare_iv) or compare_iv <= SIGMA_MIN:
-        return _event_outlook_unavailable()
+        _warn_thin_event_data(symbol or None, short_iso, "missing short/long IV after padding")
+        return _event_outlook_unavailable(EVENT_INSUFFICIENT_COVERAGE)
     trend_iv = long_iv if np.isfinite(long_iv) and long_iv > SIGMA_MIN else compare_iv
     with np.errstate(divide="ignore", invalid="ignore"):
         event = bool(short_iv > EVENT_IV_RATIO * compare_iv)
@@ -2085,11 +2237,10 @@ def analyze_event_outlook(df: pd.DataFrame | None) -> dict[str, Any]:
             "MediumIV": medium_iv if np.isfinite(medium_iv) else None,
             "LongIV": long_iv if np.isfinite(long_iv) else None,
         }
-    expiry_label = _event_expiry_label(df, dtes, short_mask)
     return {
         "Outlook": "High Event Risk / Catalyst Detected.",
         "Summary": (
-            f"The market is pricing in a catalyst for the {expiry_label} expiry, "
+            f"The market is pricing in a catalyst for the {short_iso} expiry, "
             f"with IV elevated by {lift_pct:.0f}% compared to the long-term trend."
         ),
         "EventRisk": True,
