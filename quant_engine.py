@@ -7117,3 +7117,554 @@ def calculate_sentiment_alpha(
             "uoa_flag": bool(fourchan_block.get("uoa_flag")),
         },
     }
+
+
+# ---------------------------------------------------------------------------
+# Microstructure Lab — VPIN & Order Book Imbalance (isolated sandbox)
+# ---------------------------------------------------------------------------
+TOXICITY_ALERT_MSG = "Toxicity Alert"
+LIQUIDITY_TRAP_MSG = "Liquidity Trap"
+HIGH_ADVERSE_SELECTION_MSG = (
+    "High Adverse Selection Risk: Market Makers are widening spreads."
+)
+OBI_HEATMAP_UNSTABLE_MSG = "Order-book heatmap unstable: render halted."
+VPIN_HIGH_THRESHOLD = 0.6
+OBI_EXTREME_THRESHOLD = 0.8
+OBI_TOP_LEVELS = 5
+VPIN_DEFAULT_BUCKETS = 50
+VPIN_LEVEL_DECAY = 0.70
+
+
+def _micro_num_column(frame: pd.DataFrame, *names: str, default: float = float("nan")) -> np.ndarray:
+    """Copied float64 column (``default`` fill when missing)."""
+    return _flow_num_column(frame, *names, default=default)
+
+
+def _vpin_classify_volumes(frame: pd.DataFrame) -> tuple[np.ndarray, np.ndarray, bool]:
+    """Per-row buy/sell volume (Lee–Ready); call/put proxy when L2/tick sparse.
+
+    Returns ``(buy_vol, sell_vol, proxy_used)``. Always copies.
+    """
+    working = frame.copy()
+    mid = _flow_mid_prices(working)
+    volume = _flow_trade_volumes(working)
+    buy_mask, sell_mask = _flow_buy_sell_masks(working, mid)
+    n = len(working.index)
+    buy_vol = np.zeros(n, dtype=np.float64)
+    sell_vol = np.zeros(n, dtype=np.float64)
+    valid = np.isfinite(volume) & (volume > 0)
+    buy_vol = np.where(valid & buy_mask, volume, 0.0)
+    sell_vol = np.where(valid & sell_mask, volume, 0.0)
+    both = valid & ~(buy_mask | sell_mask)
+    if np.any(both):
+        half = 0.5 * volume
+        buy_vol = np.where(both, half, buy_vol)
+        sell_vol = np.where(both, half, sell_vol)
+    proxy = not (
+        _sentiment_column(working, "bid", "Bid") is not None
+        and _sentiment_column(working, "ask", "Ask") is not None
+        and _sentiment_column(working, "volume", "Volume", "totalVolume") is not None
+    )
+    return (
+        np.array(buy_vol, dtype=np.float64, copy=True),
+        np.array(sell_vol, dtype=np.float64, copy=True),
+        bool(proxy),
+    )
+
+
+def _vpin_equal_volume_buckets(
+    buy_vol: np.ndarray,
+    sell_vol: np.ndarray,
+    *,
+    n_buckets: int = VPIN_DEFAULT_BUCKETS,
+) -> tuple[np.ndarray, float]:
+    """Fill equal-volume buckets; return per-bucket ``|Vb−Vs|/V`` and bucket size ``V``.
+
+    Volume is synchronized: trades (rows) accumulate until each bucket holds
+    approximately ``V = total_volume / n_buckets`` contracts. Numpy-vectorized
+    bucket assignment via cumulative volume searchsorted.
+    """
+    buy = np.asarray(buy_vol, dtype=np.float64).reshape(-1).copy()
+    sell = np.asarray(sell_vol, dtype=np.float64).reshape(-1).copy()
+    buy = np.where(np.isfinite(buy) & (buy > 0), buy, 0.0)
+    sell = np.where(np.isfinite(sell) & (sell > 0), sell, 0.0)
+    total = buy + sell
+    grand = float(np.nansum(total))
+    n_b = max(int(n_buckets), 1)
+    if grand <= 0.0:
+        return np.array([], dtype=np.float64), 0.0
+    # Cap buckets so each has meaningful mass.
+    max_useful = max(1, int(np.count_nonzero(total)))
+    n_b = min(n_b, max_useful)
+    bucket_v = grand / float(n_b)
+    if bucket_v <= 0.0:
+        return np.array([], dtype=np.float64), 0.0
+    cum = np.cumsum(total)
+    # Bucket index for each row by trailing edge of cumulative volume.
+    edges = np.arange(1, n_b + 1, dtype=np.float64) * bucket_v
+    # searchsorted on cum → first index where cum >= edge (exclusive end).
+    ends = np.searchsorted(cum, edges, side="left")
+    ends = np.clip(ends, 0, total.size - 1)
+    starts = np.concatenate(([0], ends[:-1] + 1))
+    # Rows that straddle bucket boundaries are attributed to the later bucket
+    # via cumulative differencing of buy/sell (exact volume sync).
+    buy_cum = np.cumsum(buy)
+    sell_cum = np.cumsum(sell)
+    buy_ends = buy_cum[ends]
+    sell_ends = sell_cum[ends]
+    buy_starts = np.concatenate(([0.0], buy_ends[:-1]))
+    sell_starts = np.concatenate(([0.0], sell_ends[:-1]))
+    vb = buy_ends - buy_starts
+    vs = sell_ends - sell_starts
+    with np.errstate(invalid="ignore", divide="ignore"):
+        imbalance = np.abs(vb - vs) / bucket_v
+    imbalance = np.where(np.isfinite(imbalance), imbalance, 0.0)
+    # Conceptually [0, 1]; do not clip here so auditor can surface Toxicity Alert.
+    return np.array(imbalance, dtype=np.float64, copy=True), float(bucket_v)
+
+
+def audit_vpin(vpin: Any) -> dict[str, Any]:
+    """Auditor: VPIN must be finite and conceptually in ``[0, 1]``.
+
+    If the score exceeds 1 → surface ``TOXICITY_ALERT_MSG`` and halt.
+    """
+    try:
+        score = float(vpin)
+    except (TypeError, ValueError):
+        score = float("nan")
+    if not np.isfinite(score):
+        return {
+            "ok": False,
+            "message": TOXICITY_ALERT_MSG,
+            "vpin": score,
+            "toxicity_alert": True,
+            "halt_render": True,
+        }
+    if score > 1.0 + 1e-12:
+        return {
+            "ok": False,
+            "message": TOXICITY_ALERT_MSG,
+            "vpin": score,
+            "toxicity_alert": True,
+            "halt_render": True,
+        }
+    if score < -1e-12:
+        return {
+            "ok": False,
+            "message": TOXICITY_ALERT_MSG,
+            "vpin": score,
+            "toxicity_alert": True,
+            "halt_render": True,
+        }
+    clipped = float(np.clip(score, 0.0, 1.0))
+    return {
+        "ok": True,
+        "message": "ok",
+        "vpin": clipped,
+        "toxicity_alert": False,
+        "halt_render": False,
+    }
+
+
+def calculate_vpin(
+    ticker: str,
+    *,
+    repo: DataRepository | None = None,
+    frame: pd.DataFrame | None = None,
+    n_buckets: int = VPIN_DEFAULT_BUCKETS,
+) -> dict[str, Any]:
+    """Volume-Synchronized Probability of Informed Trading (equal-volume buckets).
+
+    Classifies aggressor side (Lee–Ready last-vs-mid; call/put proxy when quotes
+    are sparse), fills equal-volume buckets of size
+    ``V = total_volume / n_buckets``, then averages ``|V_buy − V_sell| / V``.
+    Score is conceptually in ``[0, 1]``. Values ``> 1`` trigger a Toxicity Alert
+    via ``audit_vpin`` (not silently clipped in the raw mean).
+
+    Sparse L2/tick degrade: option-chain volume + OI-scaled volume proxy and
+    call/put signed pressure (documented). Inputs always ``.copy()``'d.
+
+    Args:
+        ticker: Underlying symbol.
+        repo: Optional DataRepository override.
+        frame: Optional chain DataFrame (caller untouched).
+        n_buckets: Target equal-volume bucket count.
+
+    Returns:
+        Dict with ``vpin``, bucket series, audit, and proxy flag.
+    """
+    symbol = str(ticker or "").strip().upper()
+    repository = repo if repo is not None else DataRepository()
+    if frame is None:
+        chain, _spot = _snapshot_chain_frame(symbol, repo=repository)
+    else:
+        chain = frame.copy() if isinstance(frame, pd.DataFrame) else pd.DataFrame()
+
+    if chain is None or not isinstance(chain, pd.DataFrame) or chain.empty:
+        audit = audit_vpin(float("nan"))
+        return {
+            "ticker": symbol,
+            "ok": False,
+            "vpin": float("nan"),
+            "vpin_raw": float("nan"),
+            "bucket_imbalances": np.array([], dtype=np.float64),
+            "bucket_volume": 0.0,
+            "n_buckets": 0,
+            "proxy_used": True,
+            "high_adverse_selection": False,
+            "toxicity_alert": True,
+            "message": TOXICITY_ALERT_MSG,
+            "audit": audit,
+        }
+
+    working = chain.copy()
+    # Stable volume order: strike ascending (spatial sync when no tick clock).
+    strikes = _micro_num_column(working, "strike", "K", "Strike", "Price")
+    if np.any(np.isfinite(strikes)):
+        order = np.argsort(np.where(np.isfinite(strikes), strikes, np.inf))
+        working = working.iloc[order].copy().reset_index(drop=True)
+
+    buy_vol, sell_vol, proxy = _vpin_classify_volumes(working)
+    imbalances, bucket_v = _vpin_equal_volume_buckets(buy_vol, sell_vol, n_buckets=n_buckets)
+    if imbalances.size == 0:
+        audit = audit_vpin(float("nan"))
+        return {
+            "ticker": symbol,
+            "ok": False,
+            "vpin": float("nan"),
+            "vpin_raw": float("nan"),
+            "bucket_imbalances": imbalances,
+            "bucket_volume": float(bucket_v),
+            "n_buckets": 0,
+            "proxy_used": True,
+            "high_adverse_selection": False,
+            "toxicity_alert": True,
+            "message": TOXICITY_ALERT_MSG,
+            "audit": audit,
+        }
+
+    raw = float(np.nanmean(imbalances))
+    if not np.isfinite(raw):
+        raw = float("nan")
+    audit = audit_vpin(raw)
+    # Display score clipped to [0, 1] when auditor is clean; raw preserved.
+    display = float(audit["vpin"]) if audit.get("ok") else raw
+    high = bool(np.isfinite(display) and display > VPIN_HIGH_THRESHOLD)
+    return {
+        "ticker": symbol,
+        "ok": bool(audit.get("ok")),
+        "vpin": display,
+        "vpin_raw": raw,
+        "bucket_imbalances": np.array(imbalances, dtype=np.float64, copy=True),
+        "bucket_volume": float(bucket_v),
+        "n_buckets": int(imbalances.size),
+        "proxy_used": bool(proxy),
+        "high_adverse_selection": high,
+        "toxicity_alert": bool(audit.get("toxicity_alert")),
+        "message": str(audit.get("message") or "ok"),
+        "audit": audit,
+    }
+
+
+def _obi_top5_levels_from_frame(frame: pd.DataFrame) -> tuple[np.ndarray, np.ndarray, bool]:
+    """Build top-5 bid/ask size ladders. Copies; synthetic depth when L2 sparse.
+
+    Prefer explicit ``bidSize1..5`` / ``askSize1..5`` (or ``bid_sz_l*``) columns.
+    Else use aggregate ``bidSize``/``askSize`` (or mid-proxied quote sizes) and
+    decay deeper levels by ``VPIN_LEVEL_DECAY`` (documented L2 proxy).
+    """
+    working = frame.copy()
+    n_levels = int(OBI_TOP_LEVELS)
+    bid_lv = np.full(n_levels, np.nan, dtype=np.float64)
+    ask_lv = np.full(n_levels, np.nan, dtype=np.float64)
+    found_explicit = False
+    for i in range(n_levels):
+        lvl = i + 1
+        b = _micro_num_column(
+            working,
+            f"bidSize{lvl}",
+            f"bid_size_{lvl}",
+            f"bid_sz_l{lvl}",
+            f"BidSize{lvl}",
+        )
+        a = _micro_num_column(
+            working,
+            f"askSize{lvl}",
+            f"ask_size_{lvl}",
+            f"ask_sz_l{lvl}",
+            f"AskSize{lvl}",
+        )
+        if np.any(np.isfinite(b)) or np.any(np.isfinite(a)):
+            found_explicit = True
+            bid_lv[i] = float(np.nansum(np.where(np.isfinite(b) & (b > 0), b, 0.0)))
+            ask_lv[i] = float(np.nansum(np.where(np.isfinite(a) & (a > 0), a, 0.0)))
+
+    if found_explicit and np.any(np.isfinite(bid_lv) | np.isfinite(ask_lv)):
+        bid_lv = np.where(np.isfinite(bid_lv) & (bid_lv > 0), bid_lv, 0.0)
+        ask_lv = np.where(np.isfinite(ask_lv) & (ask_lv > 0), ask_lv, 0.0)
+        return (
+            np.array(bid_lv, dtype=np.float64, copy=True),
+            np.array(ask_lv, dtype=np.float64, copy=True),
+            False,
+        )
+
+    # Aggregate top-of-book sizes across chain; decay to synthesize L2–L5.
+    bid_sz = _micro_num_column(working, "bidSize", "bid_size", "BidSize", "bid_sz")
+    ask_sz = _micro_num_column(working, "askSize", "ask_size", "AskSize", "ask_sz")
+    bid_top = float(np.nansum(np.where(np.isfinite(bid_sz) & (bid_sz > 0), bid_sz, 0.0)))
+    ask_top = float(np.nansum(np.where(np.isfinite(ask_sz) & (ask_sz > 0), ask_sz, 0.0)))
+    proxy = True
+    if bid_top <= 0.0 and ask_top <= 0.0:
+        # Final proxy: open-interest / volume mass split by call(buy)/put(sell).
+        oi = _micro_num_column(working, "openInterest", "open_interest", "OI", "oi", default=0.0)
+        vol = _flow_trade_volumes(working)
+        mass = np.where(np.isfinite(oi) & (oi > 0), oi, 0.0) + np.where(
+            np.isfinite(vol) & (vol > 0), vol, 0.0
+        )
+        is_call, is_put = _sentiment_type_mask(working)
+        bid_top = float(np.nansum(np.where(is_call, mass, 0.0)))
+        ask_top = float(np.nansum(np.where(is_put, mass, 0.0)))
+        if bid_top <= 0.0 and ask_top <= 0.0:
+            bid_top = 1.0
+            ask_top = 1.0
+    decay = float(VPIN_LEVEL_DECAY)
+    for i in range(n_levels):
+        scale = decay**i
+        bid_lv[i] = bid_top * scale
+        ask_lv[i] = ask_top * scale
+    return (
+        np.array(bid_lv, dtype=np.float64, copy=True),
+        np.array(ask_lv, dtype=np.float64, copy=True),
+        proxy,
+    )
+
+
+def shape_obi_heatmap(
+    bid_sizes: Any,
+    ask_sizes: Any,
+    *,
+    n_levels: int = OBI_TOP_LEVELS,
+) -> dict[str, Any]:
+    """Shape top-N book levels into a Plotly ``go.Heatmap``-ready grid.
+
+    ``z`` has shape ``(2, n_levels)``: row 0 = bid (buy-side, positive),
+    row 1 = −ask (sell-side, negative) so RdBu maps Blue=Buy / Red=Sell.
+    Always copies arrays.
+    """
+    n = max(int(n_levels), 1)
+    bid = np.asarray(bid_sizes, dtype=np.float64).reshape(-1).copy()
+    ask = np.asarray(ask_sizes, dtype=np.float64).reshape(-1).copy()
+    if bid.size < n:
+        bid = np.pad(bid, (0, n - bid.size), constant_values=np.nan)
+    if ask.size < n:
+        ask = np.pad(ask, (0, n - ask.size), constant_values=np.nan)
+    bid = bid[:n].copy()
+    ask = ask[:n].copy()
+    bid = np.where(np.isfinite(bid) & (bid >= 0), bid, np.nan)
+    ask = np.where(np.isfinite(ask) & (ask >= 0), ask, np.nan)
+    z = np.vstack([bid, -ask]).astype(np.float64, copy=True)
+    x_labels = [f"L{i + 1}" for i in range(n)]
+    y_labels = ["Bid (Buy)", "Ask (Sell)"]
+    with np.errstate(invalid="ignore", divide="ignore"):
+        level_obi = (bid - ask) / (bid + ask)
+    level_obi = np.where(np.isfinite(level_obi), level_obi, 0.0)
+    return {
+        "z": z,
+        "x": x_labels,
+        "y": y_labels,
+        "bid_sizes": bid,
+        "ask_sizes": ask,
+        "level_imbalances": np.array(level_obi, dtype=np.float64, copy=True),
+        "n_levels": n,
+    }
+
+
+def audit_obi_heatmap(heatmap: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Auditor: halt heatmap render if shape/values are unstable (NaN/Inf/wrong dims)."""
+    if not isinstance(heatmap, Mapping):
+        return {
+            "ok": False,
+            "message": OBI_HEATMAP_UNSTABLE_MSG,
+            "halt_render": True,
+            "z": np.zeros((0, 0), dtype=np.float64),
+        }
+    z = np.array(heatmap.get("z"), dtype=np.float64, copy=True)
+    n = int(heatmap.get("n_levels") or OBI_TOP_LEVELS)
+    if z.ndim != 2 or z.shape != (2, n) or n != OBI_TOP_LEVELS:
+        return {
+            "ok": False,
+            "message": OBI_HEATMAP_UNSTABLE_MSG,
+            "halt_render": True,
+            "z": z,
+        }
+    if not np.all(np.isfinite(z)):
+        return {
+            "ok": False,
+            "message": OBI_HEATMAP_UNSTABLE_MSG,
+            "halt_render": True,
+            "z": z,
+        }
+    # Bid row must be ≥ 0; ask row must be ≤ 0 (signed sell).
+    if float(np.nanmin(z[0])) < -1e-12 or float(np.nanmax(z[1])) > 1e-12:
+        return {
+            "ok": False,
+            "message": OBI_HEATMAP_UNSTABLE_MSG,
+            "halt_render": True,
+            "z": z,
+        }
+    return {
+        "ok": True,
+        "message": "ok",
+        "halt_render": False,
+        "z": z,
+    }
+
+
+def detect_liquidity_trap(
+    vpin: Any,
+    imbalance: Any,
+    *,
+    vpin_high: float = VPIN_HIGH_THRESHOLD,
+    obi_extreme: float = OBI_EXTREME_THRESHOLD,
+) -> dict[str, Any]:
+    """Flag Liquidity Trap when OBI is >80% one-sided AND VPIN is high."""
+    try:
+        v = float(vpin)
+    except (TypeError, ValueError):
+        v = float("nan")
+    try:
+        imb = float(imbalance)
+    except (TypeError, ValueError):
+        imb = float("nan")
+    if not np.isfinite(v) or not np.isfinite(imb):
+        return {
+            "liquidity_trap": False,
+            "message": None,
+            "one_side_share": float("nan"),
+            "vpin_high": False,
+            "obi_extreme": False,
+        }
+    # |imbalance| in [0,1] → one-side share = 0.5 + 0.5*|OBI|
+    one_side = 0.5 + 0.5 * abs(imb)
+    one_side = float(np.clip(one_side, 0.0, 1.0))
+    v_high = bool(v > float(vpin_high))
+    extreme = bool(one_side > float(obi_extreme))
+    trap = bool(v_high and extreme)
+    return {
+        "liquidity_trap": trap,
+        "message": LIQUIDITY_TRAP_MSG if trap else None,
+        "one_side_share": one_side,
+        "vpin_high": v_high,
+        "obi_extreme": extreme,
+    }
+
+
+def calculate_order_book_imbalance(
+    ticker: str,
+    *,
+    repo: DataRepository | None = None,
+    frame: pd.DataFrame | None = None,
+) -> dict[str, Any]:
+    """Delta between bid-side and ask-side liquidity at the top 5 book levels.
+
+    Aggregate OBI = ``(Σ bid − Σ ask) / (Σ bid + Σ ask)`` ∈ ``[-1, 1]``.
+    Heatmap grid is shaped for ``go.Heatmap`` (Blue=Buy, Red=Sell) and gated
+    by ``audit_obi_heatmap`` before frontend render.
+
+    Sparse L2 degrade: decay top-of-book ``bidSize``/``askSize`` across five
+    synthetic levels, or call/put OI-volume mass when sizes are absent.
+
+    Args:
+        ticker: Underlying symbol.
+        repo: Optional DataRepository override.
+        frame: Optional chain DataFrame (caller untouched).
+
+    Returns:
+        Dict with aggregate imbalance, top-5 ladders, heatmap payload, and audit.
+    """
+    symbol = str(ticker or "").strip().upper()
+    repository = repo if repo is not None else DataRepository()
+    if frame is None:
+        chain, _spot = _snapshot_chain_frame(symbol, repo=repository)
+    else:
+        chain = frame.copy() if isinstance(frame, pd.DataFrame) else pd.DataFrame()
+
+    empty_heat = shape_obi_heatmap(
+        np.zeros(OBI_TOP_LEVELS), np.zeros(OBI_TOP_LEVELS), n_levels=OBI_TOP_LEVELS
+    )
+    if chain is None or not isinstance(chain, pd.DataFrame) or chain.empty:
+        # Zero book is mathematically stable but flagged sparse.
+        audit = audit_obi_heatmap(empty_heat)
+        return {
+            "ticker": symbol,
+            "ok": False,
+            "imbalance": 0.0,
+            "bid_total": 0.0,
+            "ask_total": 0.0,
+            "bid_sizes": empty_heat["bid_sizes"],
+            "ask_sizes": empty_heat["ask_sizes"],
+            "level_imbalances": empty_heat["level_imbalances"],
+            "heatmap": empty_heat,
+            "proxy_used": True,
+            "message": "Sparse order book",
+            "audit": audit,
+        }
+
+    working = chain.copy()
+    bid_lv, ask_lv, proxy = _obi_top5_levels_from_frame(working)
+    heatmap = shape_obi_heatmap(bid_lv, ask_lv, n_levels=OBI_TOP_LEVELS)
+    audit = audit_obi_heatmap(heatmap)
+    bid_total = float(np.nansum(heatmap["bid_sizes"]))
+    ask_total = float(np.nansum(heatmap["ask_sizes"]))
+    denom = bid_total + ask_total
+    if denom > 0:
+        imbalance = float((bid_total - ask_total) / denom)
+    else:
+        imbalance = 0.0
+    if not np.isfinite(imbalance):
+        imbalance = 0.0
+    imbalance = float(np.clip(imbalance, -1.0, 1.0))
+    return {
+        "ticker": symbol,
+        "ok": bool(audit.get("ok")) and denom > 0,
+        "imbalance": imbalance,
+        "bid_total": bid_total,
+        "ask_total": ask_total,
+        "bid_sizes": np.array(heatmap["bid_sizes"], dtype=np.float64, copy=True),
+        "ask_sizes": np.array(heatmap["ask_sizes"], dtype=np.float64, copy=True),
+        "level_imbalances": np.array(heatmap["level_imbalances"], dtype=np.float64, copy=True),
+        "heatmap": heatmap,
+        "proxy_used": bool(proxy),
+        "message": str(audit.get("message") or "ok"),
+        "audit": audit,
+    }
+
+
+def calculate_microstructure_lab(
+    ticker: str,
+    *,
+    repo: DataRepository | None = None,
+    frame: pd.DataFrame | None = None,
+    n_buckets: int = VPIN_DEFAULT_BUCKETS,
+) -> dict[str, Any]:
+    """Combined Microstructure Lab payload: VPIN + OBI + Liquidity Trap."""
+    symbol = str(ticker or "").strip().upper()
+    repository = repo if repo is not None else DataRepository()
+    if frame is None:
+        chain, _spot = _snapshot_chain_frame(symbol, repo=repository)
+        working = chain.copy() if isinstance(chain, pd.DataFrame) else pd.DataFrame()
+    else:
+        working = frame.copy() if isinstance(frame, pd.DataFrame) else pd.DataFrame()
+
+    vpin_out = calculate_vpin(symbol, repo=repository, frame=working, n_buckets=n_buckets)
+    obi_out = calculate_order_book_imbalance(symbol, repo=repository, frame=working)
+    trap = detect_liquidity_trap(vpin_out.get("vpin"), obi_out.get("imbalance"))
+    return {
+        "ticker": symbol,
+        "ok": bool(vpin_out.get("ok")) and bool(obi_out.get("ok")),
+        "vpin": vpin_out,
+        "obi": obi_out,
+        "liquidity_trap": trap,
+        "high_adverse_selection": bool(vpin_out.get("high_adverse_selection")),
+        "toxicity_alert": bool(vpin_out.get("toxicity_alert")),
+    }
