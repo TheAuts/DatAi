@@ -86,6 +86,9 @@ from quant_engine import (
     calculate_sentiment_alpha,
     audit_sentiment_normalized,
     SENTIMENT_UNSTABLE_MSG,
+    calculate_market_velocity,
+    audit_market_velocity,
+    FLOW_DATA_STALE_MSG,
 )
 
 DATA_REPO = DataRepository()
@@ -3676,6 +3679,254 @@ def add_risk_terminal_tab(tab: Any, ticker: str) -> None:
             render_council_view(council)
         except Exception:
             st.error("Could not render Council View.")
+
+        try:
+            render_market_flow_dynamics(str(ticker))
+        except Exception:
+            st.error("Could not render Market Flow Dynamics.")
+
+
+@st.cache_data(ttl=120, show_spinner="Computing market velocity…")
+def cached_market_velocity(ticker: str) -> dict[str, Any]:
+    """Cached Market Velocity / OFI payload for Risk Terminal."""
+    return calculate_market_velocity(str(ticker or "").strip().upper(), repo=DATA_REPO)
+
+
+def market_flow_build_velocity_wave(payload: Mapping[str, Any]) -> go.Figure:
+    """Line-area Velocity Wave: blue (selling) → green (buying)."""
+    wave = np.asarray(payload.get("velocity_wave_normalized"), dtype=float)
+    labels = list(payload.get("wave_labels") or [])
+    if wave.size == 0:
+        return go.Figure()
+    if len(labels) < int(wave.size):
+        labels = [str(i) for i in range(int(wave.size))]
+    else:
+        labels = labels[: int(wave.size)]
+    x = list(range(int(wave.size)))
+    # Dual fill: positive (buy/green) and negative (sell/blue).
+    pos = np.where(wave >= 0, wave, 0.0)
+    neg = np.where(wave < 0, wave, 0.0)
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter(
+            x=x,
+            y=pos,
+            mode="lines",
+            name="Buying velocity",
+            line={"color": "#2ecc71", "width": 2},
+            fill="tozeroy",
+            fillcolor="rgba(46, 204, 113, 0.35)",
+            hovertemplate="t=%{customdata}<br>vel=%{y:.3f}<extra>Buy</extra>",
+            customdata=labels,
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=x,
+            y=neg,
+            mode="lines",
+            name="Selling velocity",
+            line={"color": "#3498db", "width": 2},
+            fill="tozeroy",
+            fillcolor="rgba(52, 152, 219, 0.35)",
+            hovertemplate="t=%{customdata}<br>vel=%{y:.3f}<extra>Sell</extra>",
+            customdata=labels,
+        )
+    )
+    fig.add_hline(y=0.0, line={"color": TEXT, "width": 1, "dash": "dot"})
+    fig.update_layout(
+        template="plotly_dark",
+        paper_bgcolor=DARK_BG,
+        plot_bgcolor=PANEL_BG,
+        font={"color": TEXT},
+        height=320,
+        title={"text": "Velocity Wave", "x": 0.0, "xanchor": "left"},
+        xaxis_title="Flow path",
+        yaxis_title="Normalized velocity (−1 sell → +1 buy)",
+        yaxis={"range": [-1.05, 1.05]},
+        margin={"l": 48, "r": 24, "t": 48, "b": 48},
+        legend={"orientation": "h", "y": 1.08},
+        uirevision="market-flow-velocity-wave",
+    )
+    return fig
+
+
+def market_flow_build_net_gauge(payload: Mapping[str, Any]) -> go.Figure:
+    """Gauge of current Net Market Flow pressure (normalized via OFI proxy scale)."""
+    net = float(payload.get("net_flow") or 0.0)
+    gross = float(payload.get("gross_flow") or 0.0)
+    if gross > 0 and np.isfinite(net) and np.isfinite(gross):
+        pressure = float(np.clip(net / gross, -1.0, 1.0))
+    else:
+        ofi = float(payload.get("ofi") or 0.0)
+        pressure = float(np.clip(ofi if np.isfinite(ofi) else 0.0, -1.0, 1.0))
+    # Map −1…+1 → 0…100 for the indicator dial.
+    value = (pressure + 1.0) * 50.0
+    bar = "#2ecc71" if pressure >= 0.15 else ("#3498db" if pressure <= -0.15 else "#f39c12")
+    fig = go.Figure(
+        go.Indicator(
+            mode="gauge+number",
+            value=value,
+            number={"suffix": "", "valueformat": ".1f"},
+            title={"text": f"Net Market Flow · raw={net:.4g}"},
+            gauge={
+                "axis": {"range": [0, 100], "tickvals": [0, 50, 100], "ticktext": ["Sell", "Flat", "Buy"]},
+                "bar": {"color": bar},
+                "bgcolor": PANEL_BG,
+                "borderwidth": 1,
+                "bordercolor": TEXT,
+                "steps": [
+                    {"range": [0, 35], "color": "#1e2a3a"},
+                    {"range": [35, 65], "color": "#2a2a1e"},
+                    {"range": [65, 100], "color": "#1e3a2f"},
+                ],
+                "threshold": {
+                    "line": {"color": TEXT, "width": 2},
+                    "thickness": 0.75,
+                    "value": 50,
+                },
+            },
+        )
+    )
+    fig.update_layout(
+        template="plotly_dark",
+        paper_bgcolor=DARK_BG,
+        font={"color": TEXT},
+        height=280,
+        margin={"l": 24, "r": 24, "t": 64, "b": 24},
+        uirevision="market-flow-net-gauge",
+    )
+    return fig
+
+
+def market_flow_build_correlation_overlay(payload: Mapping[str, Any]) -> go.Figure:
+    """Velocity Wave + Gamma Flip reference — toward vs away from flip."""
+    wave = np.asarray(payload.get("velocity_wave_normalized"), dtype=float)
+    if wave.size == 0:
+        return go.Figure()
+    x = list(range(int(wave.size)))
+    flip = payload.get("gamma_flip")
+    spot = payload.get("spot")
+    dist = payload.get("flip_distance_pct")
+    toward = bool(payload.get("toward_gamma_flip"))
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter(
+            x=x,
+            y=wave,
+            mode="lines",
+            name="Velocity Wave",
+            line={"color": "#9b59b6", "width": 2},
+            fill="tozeroy",
+            fillcolor="rgba(155, 89, 182, 0.20)",
+        )
+    )
+    # Horizontal gamma-flip distance marker scaled into velocity space for overlay.
+    if dist is not None and np.isfinite(float(dist)):
+        flip_level = float(np.clip(float(dist) * 5.0, -1.0, 1.0))
+        fig.add_hline(
+            y=flip_level,
+            line={"color": "#e74c3c", "width": 2, "dash": "dash"},
+            annotation_text=(
+                f"Gamma Flip Δ={float(dist) * 100:.2f}% · "
+                f"{'toward' if toward else 'away'}"
+            ),
+            annotation_position="top left",
+            annotation_font={"color": "#e74c3c"},
+        )
+    flip_txt = f"{float(flip):.2f}" if flip is not None and np.isfinite(float(flip)) else "—"
+    spot_txt = f"{float(spot):.2f}" if spot is not None and np.isfinite(float(spot)) else "—"
+    fig.update_layout(
+        template="plotly_dark",
+        paper_bgcolor=DARK_BG,
+        plot_bgcolor=PANEL_BG,
+        font={"color": TEXT},
+        height=300,
+        title={
+            "text": f"Correlation Overlay — spot {spot_txt} · flip {flip_txt}",
+            "x": 0.0,
+            "xanchor": "left",
+        },
+        xaxis_title="Flow path",
+        yaxis_title="Velocity / Flip distance (scaled)",
+        yaxis={"range": [-1.1, 1.1]},
+        margin={"l": 48, "r": 24, "t": 48, "b": 48},
+        uirevision="market-flow-correlation-overlay",
+    )
+    return fig
+
+
+def render_market_flow_dynamics(ticker: str) -> None:
+    """Risk Terminal section: Wave, Net Flow gauge, Gamma Flip correlation overlay."""
+    st.subheader("Market Flow Dynamics")
+    st.caption(
+        "Gross/Net Flow, Flow Velocity, and Order Flow Imbalance "
+        "(`calculate_market_velocity`). Sparse bid/ask/volume → chain proxies."
+    )
+    try:
+        payload = cached_market_velocity(str(ticker))
+    except Exception:
+        st.error("Could not calculate market velocity.")
+        return
+    if not payload:
+        st.info(FLOW_DATA_STALE_MSG)
+        return
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Gross Flow", f"{float(payload.get('gross_flow') or 0.0):.4g}", border=True)
+    m2.metric("Net Flow", f"{float(payload.get('net_flow') or 0.0):.4g}", border=True)
+    m3.metric("Flow Velocity", f"{float(payload.get('flow_velocity') or 0.0):.4g}", border=True)
+    m4.metric("OFI", f"{float(payload.get('ofi') or 0.0):+.3f}", border=True)
+    if bool(payload.get("proxy_used")):
+        st.caption("Proxy mode: synthetic volume and/or call/put signed pressure.")
+
+    audit = payload.get("audit") or audit_market_velocity(
+        payload.get("velocity_wave"),
+        gross_flow=float(payload.get("gross_flow") or 0.0),
+    )
+    # Auditor gate — halt Wave render when flow stale / zero / unnormalized.
+    left, right = st.columns([1.35, 1.0], gap="large")
+    with left:
+        st.markdown("**Velocity Wave**")
+        if not audit.get("ok") or bool(audit.get("halt_render")):
+            st.error(str(audit.get("message") or FLOW_DATA_STALE_MSG))
+        else:
+            try:
+                st.plotly_chart(
+                    market_flow_build_velocity_wave(payload),
+                    use_container_width=True,
+                    config={"displayModeBar": False},
+                    key="market-flow-velocity-wave",
+                )
+            except Exception:
+                st.error("Could not render the Velocity Wave.")
+    with right:
+        st.markdown("**Flow Gauge**")
+        try:
+            st.plotly_chart(
+                market_flow_build_net_gauge(payload),
+                use_container_width=True,
+                config={"displayModeBar": False},
+                key="market-flow-net-gauge",
+            )
+        except Exception:
+            st.error("Could not render the Net Market Flow gauge.")
+
+    st.markdown("**Correlation Overlay**")
+    st.caption("Velocity Wave vs Gamma Flip distance (Liquidation Waterfall helpers).")
+    if bool(payload.get("toward_gamma_flip")):
+        st.warning("Flow velocity is moving **toward** the Gamma Flip.")
+    elif payload.get("gamma_flip") is not None:
+        st.info("Flow velocity is moving **away** from the Gamma Flip.")
+    try:
+        st.plotly_chart(
+            market_flow_build_correlation_overlay(payload),
+            use_container_width=True,
+            config={"displayModeBar": False},
+            key="market-flow-correlation-overlay",
+        )
+    except Exception:
+        st.error("Could not render the Correlation Overlay.")
 
 
 @st.cache_data(show_spinner=False)

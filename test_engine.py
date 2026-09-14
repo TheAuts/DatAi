@@ -108,6 +108,11 @@ from quant_engine import (
     compute_iv_rank_percentile,
     run_council_debate,
     calculate_sentiment_alpha,
+    calculate_market_velocity,
+    audit_market_velocity,
+    FLOW_DATA_STALE_MSG,
+    FLOW_OFI_BOUNDS,
+    FLOW_VELOCITY_BOUNDS,
 )
 
 STANDARD = {"S": 100.0, "K": 100.0, "T": 1.0, "r": 0.05, "sigma": 0.2, "option_type": "call"}
@@ -2194,3 +2199,121 @@ def test_sentiment_factor_wires_into_montecarlo() -> None:
     assert 0.0 <= float(tilted["pop"]) <= 1.0
     assert 0.0 <= float(tilted["pot"]) <= 1.0
     assert int(base["n_paths"]) >= MC_MIN_PATHS
+
+
+def _flow_chain_frame(*, buy_heavy: bool = True) -> pd.DataFrame:
+    """Minimal bid/ask/volume chain for market-velocity unit tests."""
+    spot = 100.0
+    rows: list[dict[str, Any]] = []
+    for i, (strike, opt, bid, ask, last, vol, oi) in enumerate(
+        [
+            (95.0, "call", 4.8, 5.2, 5.15 if buy_heavy else 4.85, 120.0, 400.0),
+            (100.0, "call", 2.4, 2.6, 2.55 if buy_heavy else 2.42, 200.0, 800.0),
+            (105.0, "call", 1.0, 1.2, 1.15 if buy_heavy else 1.02, 80.0, 300.0),
+            (95.0, "put", 0.8, 1.0, 0.82 if buy_heavy else 0.98, 40.0, 200.0),
+            (100.0, "put", 2.3, 2.5, 2.32 if buy_heavy else 2.48, 60.0 if buy_heavy else 220.0, 500.0),
+            (105.0, "put", 4.5, 4.9, 4.55 if buy_heavy else 4.85, 50.0, 350.0),
+        ]
+    ):
+        rows.append(
+            {
+                "S": spot,
+                "K": strike,
+                "strike": strike,
+                "T": 0.2,
+                "r": 0.05,
+                "sigma": 0.22,
+                "impliedVolatility": 0.22,
+                "option_type": opt,
+                "bid": bid,
+                "ask": ask,
+                "lastPrice": last,
+                "volume": vol,
+                "openInterest": oi,
+                "contractSize": 100.0,
+                "underlyingPrice": spot,
+                "bidSize": 10.0 + i if buy_heavy else 2.0,
+                "askSize": 2.0 if buy_heavy else 12.0 + i,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def test_calculate_market_velocity_outputs_finite_and_bounds() -> None:
+    frame = _flow_chain_frame(buy_heavy=True)
+    original = frame.copy()
+    out = calculate_market_velocity("FLOW", frame=frame, spot=100.0, gamma_flip=102.0)
+    pd.testing.assert_frame_equal(frame, original)
+    assert out["ok"] is True
+    for key in ("gross_flow", "net_flow", "flow_velocity", "ofi", "avg_deployed_capital"):
+        assert math.isfinite(float(out[key]))
+    assert float(out["gross_flow"]) > 0.0
+    assert float(out["buy_notional"]) + float(out["sell_notional"]) == pytest.approx(
+        float(out["gross_flow"]), rel=1e-9, abs=1e-6
+    )
+    assert float(out["net_flow"]) == pytest.approx(
+        float(out["buy_notional"]) - float(out["sell_notional"]), rel=1e-9, abs=1e-6
+    )
+    lo_o, hi_o = FLOW_OFI_BOUNDS
+    assert lo_o <= float(out["ofi"]) <= hi_o
+    wave = np.asarray(out["velocity_wave_normalized"], dtype=float)
+    assert wave.ndim == 1 and wave.size >= 1
+    assert np.all(np.isfinite(wave))
+    lo_v, hi_v = FLOW_VELOCITY_BOUNDS
+    assert float(np.min(wave)) >= lo_v - 1e-9
+    assert float(np.max(wave)) <= hi_v + 1e-9
+    assert out["audit"]["ok"] is True
+    assert out["audit"]["halt_render"] is False
+    assert out["gamma_flip"] == pytest.approx(102.0)
+
+
+def test_calculate_market_velocity_ofi_bounds_sell_pressure() -> None:
+    frame = _flow_chain_frame(buy_heavy=False)
+    out = calculate_market_velocity("SELL", frame=frame, spot=100.0, gamma_flip=98.0)
+    assert math.isfinite(float(out["ofi"]))
+    assert FLOW_OFI_BOUNDS[0] <= float(out["ofi"]) <= FLOW_OFI_BOUNDS[1]
+    assert math.isfinite(float(out["flow_velocity"]))
+    assert float(out["flow_velocity"]) >= 0.0
+    # Size-driven OFI should lean negative when ask size dominates.
+    assert float(out["ofi"]) < 0.0
+
+
+def test_calculate_market_velocity_sparse_proxy_degrade() -> None:
+    """Missing bid/ask/volume → documented OI / call-put proxies; still finite."""
+    frame = _flow_chain_frame(buy_heavy=True).drop(
+        columns=["bid", "ask", "volume", "bidSize", "askSize", "lastPrice"]
+    )
+    out = calculate_market_velocity("PROXY", frame=frame, spot=100.0, gamma_flip=100.0)
+    assert bool(out.get("proxy_used")) is True
+    assert math.isfinite(float(out["gross_flow"]))
+    assert math.isfinite(float(out["ofi"]))
+    assert FLOW_OFI_BOUNDS[0] <= float(out["ofi"]) <= FLOW_OFI_BOUNDS[1]
+
+
+def test_audit_market_velocity_stale_and_zero_gate() -> None:
+    ok = audit_market_velocity(np.array([0.2, -0.4, 0.6], dtype=float), gross_flow=1e6)
+    assert ok["ok"] is True
+    assert ok["halt_render"] is False
+    assert ok["message"] == "ok"
+    norm = np.asarray(ok["velocity_normalized"], dtype=float)
+    assert np.all(np.isfinite(norm))
+    assert float(np.max(np.abs(norm))) <= 1.0 + 1e-9
+
+    stale = audit_market_velocity(np.array([0.1, 0.2], dtype=float), gross_flow=0.0)
+    assert stale["ok"] is False
+    assert stale["halt_render"] is True
+    assert stale["message"] == FLOW_DATA_STALE_MSG
+
+    zero_wave = audit_market_velocity(np.zeros(5, dtype=float), gross_flow=100.0)
+    assert zero_wave["ok"] is False
+    assert zero_wave["halt_render"] is True
+    assert zero_wave["message"] == FLOW_DATA_STALE_MSG
+
+    flagged = audit_market_velocity(np.array([0.5], dtype=float), gross_flow=10.0, stale=True)
+    assert flagged["halt_render"] is True
+    assert flagged["message"] == FLOW_DATA_STALE_MSG
+
+    empty = calculate_market_velocity("EMPTY", frame=pd.DataFrame())
+    assert empty["ok"] is False
+    assert empty["audit"]["halt_render"] is True
+    assert empty["audit"]["message"] == FLOW_DATA_STALE_MSG
