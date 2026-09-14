@@ -4488,6 +4488,380 @@ def calculate_portfolio_risk(positions_df: pd.DataFrame | None) -> dict[str, Any
 
 
 # ---------------------------------------------------------------------------
+# What-If Scenario Engine — spot / IV stress on DataRepository snapshots
+# ---------------------------------------------------------------------------
+# spot_shift / iv_shift are percent moves (e.g. -10 → −10% spot, +20 → +20% IV).
+# Chain re-pricing uses vectorized Black–Scholes for real-time heatmaps. When
+# ``model=heston`` is requested, stressed IV still drives the closed-form BS
+# surface (same snappy path as Integrated Risk View); Heston MC is not run per
+# contract.
+
+
+def _stress_empty_impact(
+    *,
+    spot_shift: float = 0.0,
+    iv_shift: float = 0.0,
+    spot: float | None = None,
+) -> dict[str, Any]:
+    return {
+        "delta_change": 0.0,
+        "gamma_change": 0.0,
+        "vega_change": 0.0,
+        "net_pnl": 0.0,
+        "base_delta": 0.0,
+        "base_gamma": 0.0,
+        "base_vega": 0.0,
+        "stressed_delta": 0.0,
+        "stressed_gamma": 0.0,
+        "stressed_vega": 0.0,
+        "total_gamma": 0.0,
+        "negative_gamma": False,
+        "spot": spot,
+        "stressed_spot": spot,
+        "spot_shift": float(spot_shift),
+        "iv_shift": float(iv_shift),
+        "n_contracts": 0,
+    }
+
+
+def _snapshot_chain_frame(
+    ticker: str,
+    repo: DataRepository | None = None,
+) -> tuple[pd.DataFrame, float | None]:
+    """Load the latest DataRepository snapshot (live cache, else newest history)."""
+    repository = repo if repo is not None else DataRepository()
+    symbol = str(ticker or "").strip().upper()
+    payload = repository.load_from_cache(symbol)
+    if not payload:
+        stamps = repository.get_available_snapshots(symbol)
+        if stamps:
+            payload = repository.load_from_cache(symbol, stamps[-1])
+    if payload:
+        frame = repository._records_to_frame(payload.get("data")).copy()
+        spot = payload.get("spot")
+        if spot is None:
+            spot = repository._spot_from_frame(frame)
+        try:
+            spot_f = float(spot) if spot is not None else None
+        except (TypeError, ValueError):
+            spot_f = None
+        if spot_f is not None and (not np.isfinite(spot_f) or spot_f <= 0):
+            spot_f = None
+        return frame, spot_f
+    try:
+        frame = repository.get_data(symbol)
+    except Exception:
+        frame = pd.DataFrame()
+    if not isinstance(frame, pd.DataFrame) or frame.empty:
+        return pd.DataFrame(), None
+    working = frame.copy()
+    return working, repository._spot_from_frame(working)
+
+
+def _chain_stress_arrays(frame: pd.DataFrame, spot: float | None) -> dict[str, Any] | None:
+    """Extract copied numeric chain arrays for vectorized stress re-pricing."""
+    if frame is None or not isinstance(frame, pd.DataFrame) or frame.empty:
+        return None
+    working = frame.copy()
+    n = len(working.index)
+    s_col = _sentiment_column(working, "S", "underlyingPrice", "spot", "Price")
+    k_col = _sentiment_column(working, "K", "strike", "Strike")
+    t_col = _sentiment_column(working, "T")
+    dte_col = _sentiment_column(working, "DaysToExpiry", "dte", "days_to_expiry")
+    sig_col = _sentiment_column(working, "sigma", "impliedVolatility", "IV", "iv")
+    rate_col = _sentiment_column(working, "r", "rate")
+    oi_col = _sentiment_column(working, "openInterest", "open_interest", "OI", "oi")
+    size_col = _sentiment_column(working, "contractSize", "contract_size", "multiplier")
+    if k_col is None or sig_col is None:
+        return None
+
+    def _num(col: pd.Series | None, default: float = float("nan")) -> np.ndarray:
+        if col is None:
+            return np.full(n, default, dtype=np.float64)
+        return np.array(pd.to_numeric(col, errors="coerce").to_numpy(dtype=np.float64), dtype=np.float64, copy=True)
+
+    strikes = _num(k_col)
+    spots = _num(s_col)
+    if spot is not None and np.isfinite(spot) and spot > 0:
+        fill = float(spot)
+        spots = np.array(np.where(np.isfinite(spots) & (spots > 0), spots, fill), dtype=np.float64, copy=True)
+    tenors = _num(t_col)
+    dtes = _num(dte_col)
+    missing_t = ~np.isfinite(tenors) | (tenors <= 0)
+    if np.any(missing_t):
+        tenors = np.array(
+            np.where(missing_t & np.isfinite(dtes) & (dtes > 0), dtes / DAYS_PER_YEAR, tenors),
+            dtype=np.float64,
+            copy=True,
+        )
+    sigmas = _num(sig_col)
+    rates = _num(rate_col, DEFAULT_RATE)
+    rates = np.array(np.where(np.isfinite(rates), rates, DEFAULT_RATE), dtype=np.float64, copy=True)
+    oi = _num(oi_col, 0.0)
+    oi = np.array(np.where(np.isfinite(oi) & (oi >= 0), oi, 0.0), dtype=np.float64, copy=True)
+    if not np.any(oi > 0):
+        oi = np.ones(n, dtype=np.float64)
+    sizes = _num(size_col, float(OPTIONS_CONTRACT_SIZE))
+    sizes = np.array(
+        np.where(np.isfinite(sizes) & (sizes > 0), sizes, float(OPTIONS_CONTRACT_SIZE)),
+        dtype=np.float64,
+        copy=True,
+    )
+    is_call, is_put = _sentiment_type_mask(working)
+    put_mask = np.array(is_put, dtype=bool, copy=True)
+    if not np.any(is_call | is_put):
+        put_mask = np.zeros(n, dtype=bool)
+    valid = (
+        np.isfinite(spots)
+        & (spots > 0)
+        & np.isfinite(strikes)
+        & (strikes > 0)
+        & np.isfinite(tenors)
+        & (tenors >= T_MIN)
+        & np.isfinite(sigmas)
+        & (sigmas >= SIGMA_MIN)
+    )
+    if not np.any(valid):
+        return None
+    return {
+        "spots": spots,
+        "strikes": strikes,
+        "tenors": tenors,
+        "rates": rates,
+        "sigmas": sigmas,
+        "oi": oi,
+        "sizes": sizes,
+        "put_mask": put_mask,
+        "valid": valid,
+    }
+
+
+def _bs_chain_price_greeks(
+    spots: np.ndarray,
+    strikes: np.ndarray,
+    tenors: np.ndarray,
+    rates: np.ndarray,
+    sigmas: np.ndarray,
+    put_mask: np.ndarray,
+    valid: np.ndarray,
+) -> dict[str, np.ndarray]:
+    """Vectorized BS price + Delta/Gamma/Vega for heterogeneous chain rows."""
+    n = int(spots.shape[0])
+    price = np.full(n, np.nan, dtype=np.float64)
+    delta = np.full(n, np.nan, dtype=np.float64)
+    gamma = np.full(n, np.nan, dtype=np.float64)
+    vega = np.full(n, np.nan, dtype=np.float64)
+    if n == 0 or not np.any(valid):
+        return {"price": price, "Delta": delta, "Gamma": gamma, "Vega": vega}
+
+    s = spots[valid]
+    k = strikes[valid]
+    t = tenors[valid]
+    r = rates[valid]
+    sig = sigmas[valid]
+    puts = put_mask[valid]
+    sqrt_t = np.sqrt(t)
+    with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
+        d1 = (np.log(s / k) + (r + 0.5 * sig * sig) * t) / (sig * sqrt_t)
+        d2 = d1 - sig * sqrt_t
+        n_d1 = norm.pdf(d1)
+        nd1 = norm.cdf(d1)
+        nd2 = norm.cdf(d2)
+        disc_r = np.exp(-r * t)
+        call_px = s * nd1 - k * disc_r * nd2
+        put_px = k * disc_r * norm.cdf(-d2) - s * norm.cdf(-d1)
+        px = np.where(puts, put_px, call_px)
+        dlt = np.where(puts, nd1 - 1.0, nd1)
+        gam = n_d1 / (s * sig * sqrt_t)
+        veg = s * n_d1 * sqrt_t / 100.0
+    price[valid] = np.asarray(px, dtype=np.float64)
+    delta[valid] = np.asarray(dlt, dtype=np.float64)
+    gamma[valid] = np.asarray(gam, dtype=np.float64)
+    vega[valid] = np.asarray(veg, dtype=np.float64)
+    return {"price": price, "Delta": delta, "Gamma": gamma, "Vega": vega}
+
+
+def _aggregate_chain_risk(
+    greeks: Mapping[str, np.ndarray],
+    oi: np.ndarray,
+    sizes: np.ndarray,
+    put_mask: np.ndarray,
+    valid: np.ndarray,
+) -> dict[str, float]:
+    """OI×multiplier nets; dealer gamma uses put-negative GEX sign convention."""
+    weight = np.array(oi * sizes, dtype=np.float64, copy=True)
+    weight = np.where(valid & np.isfinite(weight), weight, 0.0)
+    delta = np.asarray(greeks["Delta"], dtype=np.float64)
+    gamma = np.asarray(greeks["Gamma"], dtype=np.float64)
+    vega = np.asarray(greeks["Vega"], dtype=np.float64)
+    sign = np.where(put_mask, -1.0, 1.0)
+    with np.errstate(invalid="ignore", over="ignore"):
+        net_delta = float(np.nansum(np.where(valid, delta * weight, 0.0)))
+        net_gamma = float(np.nansum(np.where(valid, gamma * weight, 0.0)))
+        net_vega = float(np.nansum(np.where(valid, vega * weight, 0.0)))
+        dealer_gamma = float(np.nansum(np.where(valid, gamma * weight * sign, 0.0)))
+    return {
+        "Delta": net_delta,
+        "Gamma": net_gamma,
+        "Vega": net_vega,
+        "dealer_gamma": dealer_gamma,
+    }
+
+
+def _chain_net_pnl(
+    base_price: np.ndarray,
+    stress_price: np.ndarray,
+    oi: np.ndarray,
+    sizes: np.ndarray,
+    valid: np.ndarray,
+) -> float:
+    """Long OI-weighted mark-to-market P&L of the chain book."""
+    with np.errstate(invalid="ignore", over="ignore"):
+        d_px = stress_price - base_price
+        pnl = d_px * oi * sizes
+        pnl = np.where(valid & np.isfinite(pnl), pnl, 0.0)
+    return float(np.nansum(pnl))
+
+
+def calculate_stress_scenario(
+    ticker: str,
+    spot_shift: float,
+    iv_shift: float,
+    *,
+    repo: DataRepository | None = None,
+    model: str = MODEL_BLACK_SCHOLES,
+    rate: float = DEFAULT_RATE,
+    frame: pd.DataFrame | None = None,
+    spot: float | None = None,
+) -> dict[str, Any]:
+    """Re-price the DataRepository chain under spot% and IV% shocks.
+
+    Takes the current snapshot, shifts every row's spot by ``spot_shift`` percent
+    and IV by ``iv_shift`` percent, then recomputes the Greek surface
+    (Delta / Gamma / Vega) with vectorized Black–Scholes. ``model=heston`` is
+    accepted for API parity but still uses the BS closed form on the stressed
+    IV surface for real-time use.
+
+    Returns a Risk Impact dict with ``delta_change`` / ``gamma_change`` /
+    ``vega_change``, ``net_pnl`` (OI-weighted chain mark P&L for heatmaps),
+    and ``total_gamma`` (dealer-signed GEX at the stressed spot).
+    """
+    _ = model  # reserved; BS path is the real-time stress engine
+    try:
+        spot_pct = float(spot_shift)
+        iv_pct = float(iv_shift)
+        rate_f = float(rate)
+    except (TypeError, ValueError):
+        return _stress_empty_impact(spot_shift=0.0, iv_shift=0.0)
+
+    if frame is None:
+        chain, snap_spot = _snapshot_chain_frame(ticker, repo=repo)
+        use_spot = spot if spot is not None else snap_spot
+    else:
+        chain = frame.copy() if isinstance(frame, pd.DataFrame) else pd.DataFrame()
+        use_spot = spot
+        if use_spot is None and not chain.empty:
+            use_spot = DataRepository()._spot_from_frame(chain)
+
+    arrays = _chain_stress_arrays(chain, use_spot)
+    if arrays is None:
+        return _stress_empty_impact(spot_shift=spot_pct, iv_shift=iv_pct, spot=use_spot)
+
+    spots = np.array(arrays["spots"], dtype=np.float64, copy=True)
+    strikes = arrays["strikes"]
+    tenors = arrays["tenors"]
+    rates = np.array(arrays["rates"], dtype=np.float64, copy=True)
+    if np.isfinite(rate_f):
+        rates = np.full(rates.shape, rate_f, dtype=np.float64)
+    sigmas = np.array(arrays["sigmas"], dtype=np.float64, copy=True)
+    oi = arrays["oi"]
+    sizes = arrays["sizes"]
+    put_mask = arrays["put_mask"]
+    valid = arrays["valid"]
+
+    spot_mult = 1.0 + spot_pct / 100.0
+    iv_mult = max(1.0 + iv_pct / 100.0, 1e-6)
+    stressed_spots = np.array(spots * spot_mult, dtype=np.float64, copy=True)
+    stressed_sigmas = np.array(np.maximum(sigmas * iv_mult, SIGMA_MIN), dtype=np.float64, copy=True)
+
+    base = _bs_chain_price_greeks(spots, strikes, tenors, rates, sigmas, put_mask, valid)
+    stress = _bs_chain_price_greeks(
+        stressed_spots, strikes, tenors, rates, stressed_sigmas, put_mask, valid
+    )
+    base_agg = _aggregate_chain_risk(base, oi, sizes, put_mask, valid)
+    stress_agg = _aggregate_chain_risk(stress, oi, sizes, put_mask, valid)
+    net_pnl = _chain_net_pnl(base["price"], stress["price"], oi, sizes, valid)
+
+    base_spot = float(np.nanmedian(spots[valid])) if np.any(valid) else use_spot
+    stressed_spot = float(base_spot * spot_mult) if base_spot is not None and np.isfinite(base_spot) else None
+    total_gamma = float(stress_agg["dealer_gamma"])
+    return {
+        "delta_change": float(stress_agg["Delta"] - base_agg["Delta"]),
+        "gamma_change": float(stress_agg["Gamma"] - base_agg["Gamma"]),
+        "vega_change": float(stress_agg["Vega"] - base_agg["Vega"]),
+        "net_pnl": float(net_pnl),
+        "base_delta": float(base_agg["Delta"]),
+        "base_gamma": float(base_agg["Gamma"]),
+        "base_vega": float(base_agg["Vega"]),
+        "stressed_delta": float(stress_agg["Delta"]),
+        "stressed_gamma": float(stress_agg["Gamma"]),
+        "stressed_vega": float(stress_agg["Vega"]),
+        "total_gamma": total_gamma,
+        "negative_gamma": bool(total_gamma < 0.0),
+        "spot": float(base_spot) if base_spot is not None and np.isfinite(base_spot) else None,
+        "stressed_spot": stressed_spot,
+        "spot_shift": float(spot_pct),
+        "iv_shift": float(iv_pct),
+        "n_contracts": int(np.count_nonzero(valid)),
+    }
+
+
+def build_stress_pnl_matrix(
+    ticker: str,
+    spot_shifts: Iterable[float],
+    iv_shifts: Iterable[float],
+    *,
+    repo: DataRepository | None = None,
+    model: str = MODEL_BLACK_SCHOLES,
+    rate: float = DEFAULT_RATE,
+) -> dict[str, Any]:
+    """Thin companion: Net P&L heatmap grid over spot% × IV% shock axes.
+
+    Loads the snapshot once, then evaluates :func:`calculate_stress_scenario`
+    for each cell. Returns ``spot_shifts``, ``iv_shifts``, and ``net_pnl`` as a
+    2D list ``[i_spot][j_iv]`` ready for Plotly heatmaps.
+    """
+    spot_axis = [float(v) for v in spot_shifts]
+    iv_axis = [float(v) for v in iv_shifts]
+    chain, snap_spot = _snapshot_chain_frame(ticker, repo=repo)
+    grid: list[list[float]] = []
+    n_contracts = 0
+    for spot_pct in spot_axis:
+        row: list[float] = []
+        for iv_pct in iv_axis:
+            impact = calculate_stress_scenario(
+                ticker,
+                spot_pct,
+                iv_pct,
+                repo=repo,
+                model=model,
+                rate=rate,
+                frame=chain,
+                spot=snap_spot,
+            )
+            n_contracts = max(n_contracts, int(impact.get("n_contracts") or 0))
+            row.append(float(impact.get("net_pnl") or 0.0))
+        grid.append(row)
+    return {
+        "spot_shifts": spot_axis,
+        "iv_shifts": iv_axis,
+        "net_pnl": grid,
+        "spot": snap_spot,
+        "n_contracts": int(n_contracts),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Market Timelapse — historical surface frames from data_history/
 # ---------------------------------------------------------------------------
 # Prefer ``delta_surface`` (value key ``Delta``): same payload key persisted by

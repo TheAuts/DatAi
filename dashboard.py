@@ -41,6 +41,8 @@ from quant_engine import (
     calculate_gamma_theta_ratio,
     calculate_greeks,
     calculate_portfolio_risk,
+    calculate_stress_scenario,
+    build_stress_pnl_matrix,
     calculate_speed,
     calculate_ultima,
     calculate_vanna,
@@ -3350,6 +3352,190 @@ def test_add_dashboard_tab(
         test_render_layout(ticker, spot=spot, sigma=sigma)
 
 
+@st.cache_data(ttl=120, show_spinner="Running stress scenario…")
+def cached_stress_scenario(ticker: str, spot_shift: float, iv_shift: float) -> dict[str, Any]:
+    return calculate_stress_scenario(str(ticker), float(spot_shift), float(iv_shift), repo=DATA_REPO)
+
+
+@st.cache_data(ttl=120, show_spinner="Building stress P&L matrix…")
+def cached_stress_pnl_matrix(
+    ticker: str,
+    spot_shifts: tuple[float, ...],
+    iv_shifts: tuple[float, ...],
+) -> dict[str, Any]:
+    return build_stress_pnl_matrix(
+        str(ticker),
+        spot_shifts,
+        iv_shifts,
+        repo=DATA_REPO,
+    )
+
+
+def render_stress_pnl_heatmap(matrix: Mapping[str, Any]) -> None:
+    """2D Plotly heatmap of portfolio Net P&L across spot × IV scenarios."""
+    spots = list(matrix.get("spot_shifts") or [])
+    ivs = list(matrix.get("iv_shifts") or [])
+    z = matrix.get("net_pnl")
+    if not spots or not ivs or z is None:
+        st.info("No stress P&L matrix to plot.")
+        return
+    z_arr = np.asarray(z, dtype=np.float64)
+    if z_arr.size == 0 or not np.any(np.isfinite(z_arr)):
+        st.info("No finite Net P&L values for this stress matrix.")
+        return
+    x_labels = [f"IV {v:+.0f}%" for v in ivs]
+    y_labels = [f"Spot {v:+.0f}%" for v in spots]
+    fig = go.Figure(
+        data=[
+            go.Heatmap(
+                z=z_arr,
+                x=x_labels,
+                y=y_labels,
+                colorscale="RdYlGn",
+                zmid=0.0,
+                colorbar={"title": "Net P&L"},
+                hovertemplate="Spot=%{y}<br>%{x}<br>Net P&L=%{z:,.2f}<extra></extra>",
+            )
+        ]
+    )
+    fig.update_layout(
+        template="plotly_dark",
+        paper_bgcolor=DARK_BG,
+        plot_bgcolor=PANEL_BG,
+        font={"color": TEXT},
+        height=420,
+        title={"text": "Scenario Net P&L Heatmap", "x": 0.0, "xanchor": "left"},
+        xaxis={"title": "IV shock", "side": "top"},
+        yaxis={"title": "Spot shock", "autorange": "reversed"},
+        margin={"l": 72, "r": 24, "t": 56, "b": 40},
+        uirevision="risk-terminal-pnl-heatmap",
+    )
+    st.plotly_chart(
+        fig,
+        use_container_width=True,
+        config={"displayModeBar": True},
+        key="risk-terminal-pnl-heatmap",
+    )
+
+
+def add_risk_terminal_tab(tab: Any, ticker: str) -> None:
+    """Institutional Risk Terminal: stress matrix, P&L heatmap, dealer gamma overlay."""
+    with tab:
+        st.caption(
+            "What-If Scenario Engine — re-prices the DataRepository chain under spot / IV shocks."
+        )
+        st.subheader("Stress Matrix")
+        st.caption("Rows = Spot (−10%…+10%). Columns = IV (−20%…+20%).")
+        spot_cols = st.columns(3)
+        spot_defaults = (-10.0, 0.0, 10.0)
+        spot_shifts: list[float] = []
+        for i, (col, default) in enumerate(zip(spot_cols, spot_defaults)):
+            with col:
+                spot_shifts.append(
+                    float(
+                        st.slider(
+                            f"Spot row {i + 1}",
+                            min_value=-10.0,
+                            max_value=10.0,
+                            value=float(default),
+                            step=1.0,
+                            key=f"risk_term_spot_{i}",
+                        )
+                    )
+                )
+        iv_cols = st.columns(3)
+        iv_defaults = (-20.0, 0.0, 20.0)
+        iv_shifts: list[float] = []
+        for i, (col, default) in enumerate(zip(iv_cols, iv_defaults)):
+            with col:
+                iv_shifts.append(
+                    float(
+                        st.slider(
+                            f"IV col {i + 1}",
+                            min_value=-20.0,
+                            max_value=20.0,
+                            value=float(default),
+                            step=1.0,
+                            key=f"risk_term_iv_{i}",
+                        )
+                    )
+                )
+
+        focus_cols = st.columns(2)
+        with focus_cols[0]:
+            focus_spot = float(
+                st.slider(
+                    "Focus spot shock %",
+                    min_value=-10.0,
+                    max_value=10.0,
+                    value=float(spot_shifts[0]),
+                    step=1.0,
+                    key="risk_term_focus_spot",
+                )
+            )
+        with focus_cols[1]:
+            focus_iv = float(
+                st.slider(
+                    "Focus IV shock %",
+                    min_value=-20.0,
+                    max_value=20.0,
+                    value=float(iv_shifts[0]),
+                    step=1.0,
+                    key="risk_term_focus_iv",
+                )
+            )
+
+        try:
+            matrix = cached_stress_pnl_matrix(
+                str(ticker),
+                tuple(float(v) for v in spot_shifts),
+                tuple(float(v) for v in iv_shifts),
+            )
+            render_stress_pnl_heatmap(matrix)
+        except Exception:
+            st.error("Could not render the stress P&L heatmap.")
+            matrix = {}
+
+        try:
+            impact = cached_stress_scenario(str(ticker), focus_spot, focus_iv)
+        except Exception:
+            impact = {}
+            st.error("Could not run the focus stress scenario.")
+
+        st.subheader("Risk Impact")
+        if impact:
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Δ Delta", _format_greek_metric(impact.get("delta_change")), border=True)
+            m2.metric("Δ Gamma", _format_greek_metric(impact.get("gamma_change")), border=True)
+            m3.metric("Δ Vega", _format_greek_metric(impact.get("vega_change")), border=True)
+            m4.metric("Net P&L", _format_greek_metric(impact.get("net_pnl")), border=True)
+            st.caption(
+                f"Focus {focus_spot:+.0f}% spot / {focus_iv:+.0f}% IV · "
+                f"contracts={impact.get('n_contracts', 0)} · "
+                f"spot {impact.get('spot')} → {impact.get('stressed_spot')}"
+            )
+        else:
+            st.info("No DataRepository snapshot available for stress analysis.")
+
+        st.subheader("Dealer Flow Overlay")
+        total_gamma = impact.get("total_gamma") if impact else None
+        try:
+            gamma_val = float(total_gamma) if total_gamma is not None else float("nan")
+        except (TypeError, ValueError):
+            gamma_val = float("nan")
+        st.metric(
+            "Dealer Hedging Pressure",
+            _format_greek_metric(gamma_val) if np.isfinite(gamma_val) else "—",
+            border=True,
+        )
+        st.caption("Total dealer-signed Gamma (GEX) at the stressed spot.")
+        if impact and bool(impact.get("negative_gamma")):
+            st.error(
+                "CRITICAL WARNING: stress pushes into the Negative Gamma zone — "
+                "dealer hedging may amplify moves."
+            )
+
+
 @st.cache_data(show_spinner=False)
 def _cached_timelapse_frames(ticker: str) -> list[dict[str, Any]]:
     """Cached Market Timelapse frames (delta_surface grids + labels)."""
@@ -3660,6 +3846,7 @@ def main() -> None:
         "Integrated Risk View",
         "Test Dashboard",
         "Market Timelapse",
+        "Risk Terminal",
     ]
     (
         greeks_tab,
@@ -3672,6 +3859,7 @@ def main() -> None:
         integrated_tab,
         test_dashboard_tab,
         timelapse_tab,
+        risk_terminal_tab,
     ) = st.tabs(
         tab_labels,
         on_change="rerun",
@@ -3876,6 +4064,9 @@ def main() -> None:
 
     if timelapse_tab.open:
         add_market_timelapse_tab(timelapse_tab, ticker)
+
+    if risk_terminal_tab.open:
+        add_risk_terminal_tab(risk_terminal_tab, ticker)
 
 
 if __name__ == "__main__":
