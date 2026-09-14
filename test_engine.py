@@ -754,6 +754,15 @@ def test_fetch_option_chain_live_uses_expiration_omits_date(monkeypatch) -> None
     assert captured["params"].get("expiration") == "2026-10-16"
     assert "date" not in captured["params"]
     assert "date=" not in str(captured["path"])
+    # Full URL shape: .../options/chain/{ticker}/?expiration=... with no date=
+    live_url = f"{ingest.API_BASE}{captured['path']}"
+    if captured["params"]:
+        from urllib.parse import urlencode
+
+        live_url = f"{live_url}?{urlencode(captured['params'])}"
+    assert "/options/chain/SPY/" in live_url
+    assert "expiration=2026-10-16" in live_url
+    assert "date=" not in live_url
 
     # Positional ``expiry`` alias still maps to the same query param.
     captured.clear()
@@ -766,3 +775,30 @@ def test_fetch_option_chain_live_uses_expiration_omits_date(monkeypatch) -> None
     ingest.fetch_option_chain("SPY", expiration="2026-10-16", date="2025-06-01")
     assert captured["params"].get("expiration") == "2026-10-16"
     assert "date=2025-06-01" in str(captured["path"])
+
+
+def test_fetch_option_chain_wrong_expiry_raises(monkeypatch) -> None:
+    """Requested expiration must match normalized payload expiration (list or scalar)."""
+    import data_ingestion as ingest
+
+    monkeypatch.setenv("MARKETDATA_API_KEY", "test-token")
+
+    def _wrong_list(_path: str, _params: dict[str, Any] | None = None) -> dict[str, Any]:
+        return {"s": "ok", "expiration": ["2026-12-18", "2026-12-18"], "strike": [100]}
+
+    monkeypatch.setattr(ingest, "_marketdata_get", _wrong_list)
+    with pytest.raises(ValueError, match=r"API returned wrong expiry: \['2026-12-18', '2026-12-18'\]"):
+        ingest.fetch_option_chain("SPY", expiration="2026-10-16")
+
+    def _wrong_scalar(_path: str, _params: dict[str, Any] | None = None) -> dict[str, Any]:
+        return {"s": "ok", "expiration": "2025-01-17"}
+
+    monkeypatch.setattr(ingest, "_marketdata_get", _wrong_scalar)
+    with pytest.raises(ValueError, match=r"API returned wrong expiry: 2025-01-17"):
+        ingest.fetch_option_chain("QQQ", "2026-10-16")
+
+    def _matching(_path: str, _params: dict[str, Any] | None = None) -> dict[str, Any]:
+        return {"s": "no_data", "expiration": ["2026-10-16"]}
+
+    monkeypatch.setattr(ingest, "_marketdata_get", _matching)
+    assert ingest.fetch_option_chain("SPY", expiration="2026-10-16").empty

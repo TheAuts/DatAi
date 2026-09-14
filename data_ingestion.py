@@ -388,6 +388,30 @@ def _with_date_query(path: str, date: str | None) -> str:
     return f"{path}{separator}date={text}"
 
 
+def _normalized_expiry_set(raw: Any) -> set[str]:
+    """Normalize a scalar or list/array MarketData ``expiration`` field to ISO dates."""
+    if raw is None or raw == "":
+        return set()
+    values = list(raw) if isinstance(raw, (list, tuple)) else [raw]
+    out: set[str] = set()
+    for item in values:
+        iso = _unix_to_iso(item) or _expiry_iso(item)
+        if iso:
+            out.add(iso)
+    return out
+
+
+def _validate_response_expiration(response_data: dict[str, Any], requested_expiration: str) -> None:
+    """Raise if payload ``expiration`` (scalar or list) does not match ``requested_expiration``."""
+    if "expiration" not in response_data:
+        return
+    returned = _normalized_expiry_set(response_data["expiration"])
+    if not returned:
+        return
+    if returned != {requested_expiration}:
+        raise ValueError(f"API returned wrong expiry: {response_data['expiration']}")
+
+
 def fetch_option_chain(
     ticker: str,
     expiry: Any = None,
@@ -412,6 +436,10 @@ def fetch_option_chain(
         DataFrame with strike, expiration, bid, ask, underlyingPrice, plus S/K/T/sigma.
         On request failure or missing token, returns a mock DataFrame (``attrs['is_mock']``)
         so the dashboard does not crash; check ``get_last_api_error()`` / attrs for status.
+
+    Raises:
+        ValueError: When a requested expiration was provided and the API payload's
+            ``expiration`` field (scalar or list) normalizes to a different ISO date.
     """
     symbol = _normalize_ticker(ticker)
     if not symbol:
@@ -428,13 +456,16 @@ def fetch_option_chain(
 
     params: dict[str, Any] = {}
     # ``expiration`` wins when both are provided; ``expiry`` remains a positional alias.
-    expiry_iso = _expiry_iso(expiration if expiration is not None else expiry)
-    if expiry_iso:
-        params["expiration"] = expiry_iso
+    requested_expiration = _expiry_iso(expiration if expiration is not None else expiry)
+    if requested_expiration:
+        params["expiration"] = requested_expiration
 
     # Live/future: path has no ``date=``. Historical EOD: append ``?date=`` only.
+    # Shape: https://api.marketdata.app/v1/options/chain/{ticker}/?expiration={requested_expiration}
     hist_iso = _expiry_iso(date) if date else None
     path = _with_date_query(CHAIN_PATH.format(symbol=symbol), hist_iso)
+    if requested_expiration:
+        print(f"DEBUG: Fetching {ticker} with expiration {requested_expiration}")
     try:
         payload = _marketdata_get(path, params)
     except Exception as exc:
@@ -449,6 +480,8 @@ def fetch_option_chain(
             error_code=code,
             message=str(err.get("message") or "request failed"),
         )
+    if requested_expiration:
+        _validate_response_expiration(payload, requested_expiration)
     if str(payload.get("s") or "").lower() == "no_data":
         return _empty_chain()
     try:
