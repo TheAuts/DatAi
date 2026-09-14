@@ -94,6 +94,19 @@ from quant_engine import (
     simulate_gbm_paths,
     strategist_evaluate_position,
     build_vanna_volga_report,
+    # Council of Experts
+    EXPERT_A,
+    EXPERT_B,
+    EXPERT_C,
+    EXPERT_NAMES,
+    STANCE_BUY,
+    STANCE_NEUTRAL,
+    STANCE_SELL,
+    STANCES,
+    build_disagreement_report,
+    clip_confidence,
+    compute_iv_rank_percentile,
+    run_council_debate,
 )
 
 STANDARD = {"S": 100.0, "K": 100.0, "T": 1.0, "r": 0.05, "sigma": 0.2, "option_type": "call"}
@@ -1808,3 +1821,96 @@ def test_strategist_evaluate_position_integrates_regime_and_mc() -> None:
     # Without hedge, Mathematician's Rule must block when PoT > PoP.
     rule = mathematicians_rule_gate(0.2, 0.8, delta_hedged=False)
     assert rule["approved"] is False
+
+
+# ---------------------------------------------------------------------------
+# Council of Experts debate
+# ---------------------------------------------------------------------------
+
+
+def test_clip_confidence_bounds_0_100() -> None:
+    assert clip_confidence(-5) == 0.0
+    assert clip_confidence(150) == 100.0
+    assert clip_confidence(72.5) == 72.5
+    assert clip_confidence(float("nan")) == 0.0
+    assert clip_confidence("bad") == 0.0
+
+
+def test_compute_iv_rank_percentile() -> None:
+    hist = np.array([0.10, 0.15, 0.20, 0.25, 0.30], dtype=float)
+    mid = compute_iv_rank_percentile(hist, 0.20)
+    assert mid["iv_rank"] == pytest.approx(50.0)
+    assert 0.0 <= mid["iv_percentile"] <= 100.0
+    high = compute_iv_rank_percentile(hist, 0.30)
+    assert high["iv_rank"] == pytest.approx(100.0)
+    low = compute_iv_rank_percentile(hist, 0.10)
+    assert low["iv_rank"] == pytest.approx(0.0)
+
+
+def test_build_disagreement_report_when_stances_differ() -> None:
+    preds = {
+        EXPERT_A: {
+            "expert_id": EXPERT_A,
+            "name": EXPERT_NAMES[EXPERT_A],
+            "stance": STANCE_BUY,
+            "confidence": 80.0,
+            "justification": "Positive GEX + velocity.",
+        },
+        EXPERT_B: {
+            "expert_id": EXPERT_B,
+            "name": EXPERT_NAMES[EXPERT_B],
+            "stance": STANCE_SELL,
+            "confidence": 70.0,
+            "justification": "IV Rank elevated.",
+        },
+        EXPERT_C: {
+            "expert_id": EXPERT_C,
+            "name": EXPERT_NAMES[EXPERT_C],
+            "stance": STANCE_NEUTRAL,
+            "confidence": 40.0,
+            "justification": "Balanced path mass.",
+        },
+    }
+    report = build_disagreement_report(preds)
+    assert report["disagreement"] is True
+    assert report["report"] is not None
+    assert "Disagreement Report" in report["report"]
+    assert "Buy" in report["report"] and "Sell" in report["report"]
+    assert (EXPERT_A, EXPERT_B) in report["conflict_pairs"]
+
+    aligned = {
+        EXPERT_A: {**preds[EXPERT_A], "stance": STANCE_BUY},
+        EXPERT_B: {**preds[EXPERT_B], "stance": STANCE_BUY},
+        EXPERT_C: {**preds[EXPERT_C], "stance": STANCE_NEUTRAL},
+    }
+    calm = build_disagreement_report(aligned)
+    assert calm["disagreement"] is False
+    assert calm["report"] is None
+
+
+def test_run_council_debate_summary_shape_and_confidence() -> None:
+    frame = _regime_chain_frame(gex_sign=1.0, vanna_level=0.02, spot=100.0)
+    original = frame.copy()
+    out = run_council_debate("COUNCIL", frame=frame, spot=100.0, lookback=5, seed=7)
+    assert out["ok"] is True
+    assert out["ticker"] == "COUNCIL"
+    assert set(out["experts"].keys()) == {EXPERT_A, EXPERT_B, EXPERT_C}
+    assert len(out["predictions"]) == 3
+    for pred in out["predictions"]:
+        assert pred["stance"] in STANCES
+        assert 0.0 <= float(pred["confidence"]) <= 100.0
+        assert isinstance(pred["justification"], str) and len(pred["justification"]) > 0
+        assert pred["name"] in EXPERT_NAMES.values()
+    assert "disagreement" in out
+    if out["disagreement"]:
+        assert isinstance(out["disagreement_report"], str)
+        assert "Disagreement Report" in out["disagreement_report"]
+    pd.testing.assert_frame_equal(frame, original)
+
+def test_run_council_debate_empty_frame() -> None:
+    out = run_council_debate("EMPTY", frame=pd.DataFrame())
+    assert out["ok"] is False
+    assert len(out["predictions"]) == 3
+    for pred in out["predictions"]:
+        assert pred["stance"] == STANCE_NEUTRAL
+        assert 0.0 <= float(pred["confidence"]) <= 100.0

@@ -6378,3 +6378,20 @@ from quant_engine_montecarlo import (  # noqa: E402
     strategist_evaluate_position,
     test_audit_monte_carlo_paths,
 )
+from quant_engine_debate import (  # noqa: E402
+    EXPERT_A,
+    EXPERT_B,
+    EXPERT_C,
+    EXPERT_NAMES,
+    STANCE_BUY,
+    STANCE_NEUTRAL,
+    STANCE_SELL,
+    STANCES,
+    build_disagreement_report,
+    clip_confidence,
+    compute_iv_rank_percentile,
+    expert_a_momentum,
+    expert_b_mean_reversion,
+    expert_c_volatility_arb,
+    run_council_debate,
+)
