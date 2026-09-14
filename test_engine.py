@@ -35,6 +35,9 @@ from quant_engine import (
     generate_pro_surface_data,
     generate_greek_curve,
     generate_synthetic_drift,
+    prefill_drift_data,
+    prefill_driftdata,
+    drift_prefill_stamp,
     EVENT_INSUFFICIENT_COVERAGE,
     analyze_event_outlook,
     analyze_gex_outlook,
@@ -576,6 +579,69 @@ def test_identical_snapshots_trigger_synthetic_drift_fallback(tmp_path) -> None:
     assert synthetic is True
     assert z.shape == (len(dte_axis), len(strike_axis))
     assert float(np.nanmin(z)) != float(np.nanmax(z))
+
+
+def test_prefill_drift_data_creates_distinct_surfaces(tmp_path) -> None:
+    """Prefill writes START/END history files with non-flat-comparable delta surfaces."""
+    chain = pd.DataFrame(
+        {
+            "Strike": [90.0, 100.0, 110.0, 90.0, 100.0, 110.0],
+            "DaysToExpiry": [7.0, 7.0, 7.0, 30.0, 30.0, 30.0],
+            "Delta": [0.80, 0.50, 0.20, 0.70, 0.50, 0.30],
+            "impliedVolatility": [0.22, 0.20, 0.21, 0.23, 0.205, 0.215],
+            "S": [100.0] * 6,
+        }
+    )
+
+    def _fetcher(ticker: str, expiry: Any = None) -> pd.DataFrame:
+        assert str(ticker).upper() == "SPY"
+        return chain.copy()
+
+    repo = DataRepository(
+        cache_dir=tmp_path / "cache",
+        history_dir=tmp_path / "data_history",
+        fetcher=_fetcher,
+        status_probe=lambda: {"ok": True},
+    )
+    result = prefill_drift_data("SPY", 100.0, "2026-09-19", repo=repo, seed=7)
+    assert result["start_label"] == "100_2026-09-19_START"
+    assert result["end_label"] == "100_2026-09-19_END"
+    assert result["start_label"] != result["end_label"]
+    assert Path(result["start_path"]).is_file()
+    assert Path(result["end_path"]).is_file()
+    assert Path(result["start_path"]).name == "SPY_100_2026-09-19_START.json"
+    assert Path(result["end_path"]).name == "SPY_100_2026-09-19_END.json"
+
+    stamps = repo.get_available_snapshots("SPY")
+    assert result["start_label"] in stamps
+    assert result["end_label"] in stamps
+
+    payload_a = repo._snapshot_payload("SPY", result["start_label"]) or {}
+    payload_b = repo._snapshot_payload("SPY", result["end_label"]) or {}
+    matched, message = DataRepository.validate_snapshot_match(payload_a, payload_b)
+    assert matched is True, message
+    assert payload_a.get("snapshot_id") != payload_b.get("snapshot_id")
+
+    deltas_a = np.asarray(
+        [np.nan if v is None else float(v) for v in (payload_a.get("delta_surface") or {}).get("Delta") or []],
+        dtype=float,
+    )
+    deltas_b = np.asarray(
+        [np.nan if v is None else float(v) for v in (payload_b.get("delta_surface") or {}).get("Delta") or []],
+        dtype=float,
+    )
+    assert deltas_a.size > 0 and deltas_b.size > 0
+    assert not np.allclose(deltas_a, deltas_b, equal_nan=True)
+
+    drift = repo.calculate_delta_drift("SPY", result["start_label"], result["end_label"])
+    assert not drift.empty
+    finite = drift["Delta"].to_numpy(dtype=float)
+    finite = finite[np.isfinite(finite)]
+    assert finite.size > 0
+    assert float(np.min(finite)) != float(np.max(finite)) or not np.allclose(finite, 0.0, atol=1e-12)
+    assert float(np.nanmean(finite)) == pytest.approx(0.05, abs=0.02)
+    assert prefill_driftdata is prefill_drift_data
+    assert drift_prefill_stamp(450, "2026-09-19", "START") == "450_2026-09-19_START"
 
 
 def test_snapshot_vol_surface_from_history(tmp_path) -> None:

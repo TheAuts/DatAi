@@ -676,6 +676,201 @@ def generate_synthetic_drift(ticker: str) -> tuple[np.ndarray, np.ndarray, np.nd
     return strike_axis.astype(float), dte_axis.astype(float), drift
 
 
+DRIFT_PREFILL_SHIFT = 0.05
+DRIFT_PREFILL_NOISE_SIGMA = 0.01
+
+
+def _drift_prefill_expiry_label(expiry: Any) -> str:
+    """Normalize expiry to ``YYYY-MM-DD`` (filesystem-safe)."""
+    if isinstance(expiry, datetime):
+        return expiry.date().isoformat()
+    if isinstance(expiry, date):
+        return expiry.isoformat()
+    text = str(expiry or "").strip()
+    if not text:
+        return "unknown"
+    return text[:10]
+
+
+def _drift_prefill_strike_label(strike: Any) -> str:
+    """Filesystem-safe strike token (no brackets/spaces)."""
+    try:
+        value = float(strike)
+        if np.isfinite(value):
+            return f"{value:g}"
+    except (TypeError, ValueError):
+        pass
+    raw = str(strike or "na").strip() or "na"
+    return "".join(ch if ch.isalnum() or ch in {"-", "_", "."} else "_" for ch in raw)
+
+
+def drift_prefill_stamp(strike: Any, expiry: Any, role: str) -> str:
+    """Stamp segment for Time Machine listing (after ``{TICKER}_``).
+
+    On-disk pattern (brackets avoided for portability)::
+
+        {TICKER}_{STRIKE}_{EXPIRY}_{START|END}.json
+
+    Example: ``SPY_450_2026-09-19_START.json`` / ``SPY_450_2026-09-19_END.json``.
+    """
+    tag = str(role or "").strip().upper()
+    if tag not in {"START", "END"}:
+        tag = "START"
+    return f"{_drift_prefill_strike_label(strike)}_{_drift_prefill_expiry_label(expiry)}_{tag}"
+
+
+def _apply_market_drift_delta(
+    values: Any,
+    *,
+    shift: float = DRIFT_PREFILL_SHIFT,
+    noise_sigma: float = DRIFT_PREFILL_NOISE_SIGMA,
+    rng: np.random.Generator | None = None,
+) -> list[float | None]:
+    """Shift Delta by ``shift`` and add i.i.d. Gaussian noise (Market Drift)."""
+    generator = rng if rng is not None else np.random.default_rng()
+    if not isinstance(values, (list, tuple, np.ndarray)):
+        return []
+    arr = np.asarray(
+        [np.nan if v is None else float(v) for v in values],
+        dtype=np.float64,
+    )
+    noise = generator.normal(0.0, float(noise_sigma), size=arr.shape)
+    drifted = arr + float(shift) + noise
+    return [None if not np.isfinite(v) else float(v) for v in drifted]
+
+
+def _apply_market_drift_to_payload(
+    payload: dict[str, Any],
+    *,
+    shift: float = DRIFT_PREFILL_SHIFT,
+    noise_sigma: float = DRIFT_PREFILL_NOISE_SIGMA,
+    rng: np.random.Generator | None = None,
+) -> dict[str, Any]:
+    """Return a deep-ish copy of ``payload`` with Market Drift on Delta surface + raw rows."""
+    generator = rng if rng is not None else np.random.default_rng()
+    out = dict(payload)
+    surface = payload.get("delta_surface")
+    if isinstance(surface, dict):
+        drifted_surface = dict(surface)
+        drifted_surface["Delta"] = _apply_market_drift_delta(
+            surface.get("Delta"),
+            shift=shift,
+            noise_sigma=noise_sigma,
+            rng=generator,
+        )
+        out["delta_surface"] = drifted_surface
+    records = payload.get("data")
+    if isinstance(records, list) and records:
+        new_rows: list[Any] = []
+        for row in records:
+            if not isinstance(row, dict):
+                new_rows.append(row)
+                continue
+            cloned = dict(row)
+            for key in ("Delta", "delta"):
+                if key not in cloned or cloned[key] is None:
+                    continue
+                try:
+                    base = float(cloned[key])
+                except (TypeError, ValueError):
+                    continue
+                if not np.isfinite(base):
+                    continue
+                cloned[key] = float(base + shift + float(generator.normal(0.0, float(noise_sigma))))
+            new_rows.append(cloned)
+        out["data"] = new_rows
+    return out
+
+
+def prefill_drift_data(
+    ticker: str,
+    strike: Any = None,
+    expiry: Any = None,
+    *,
+    repo: DataRepository | None = None,
+    seed: int | None = None,
+    shift: float = DRIFT_PREFILL_SHIFT,
+    noise_sigma: float = DRIFT_PREFILL_NOISE_SIGMA,
+) -> dict[str, Any]:
+    """Fetch a live chain and write START/END snapshots with Market Drift on Delta.
+
+    Steps:
+      1. Fetch the current option chain via :class:`DataRepository` (``_fetch`` /
+         injected fetcher).
+      2. Persist the real surface as ``{TICKER}_{STRIKE}_{EXPIRY}_START.json``.
+      3. Apply Market Drift: Delta += ``shift`` (+ small Gaussian noise).
+      4. Persist the drifted surface as ``{TICKER}_{STRIKE}_{EXPIRY}_END.json``.
+
+    Both files land under ``data_history/`` (via ``repo.history_dir``) with
+    ``metadata`` (ticker, strike, expiry) so
+    :meth:`DataRepository.validate_snapshot_match` still passes. Filenames use
+    underscores instead of brackets for filesystem safety; the START/END role
+    remains explicit.
+
+    Returns paths and Time Machine dropdown labels (stamps) for auto-select.
+    """
+    repository = repo if repo is not None else DataRepository()
+    symbol = str(ticker or "").strip().upper() or "SPY"
+    safe = repository._safe_ticker(symbol)
+    start_stamp = drift_prefill_stamp(strike, expiry, "START")
+    end_stamp = drift_prefill_stamp(strike, expiry, "END")
+    metadata = repository._normalize_metadata(
+        symbol,
+        {"ticker": symbol, "strike": strike, "expiry": expiry},
+    )
+
+    try:
+        frame = repository._fetch(symbol, expiry)
+    except Exception:
+        frame = repository.get_data(symbol, expiry)
+    if not isinstance(frame, pd.DataFrame) or frame.empty:
+        raise ValueError(f"No option chain data available to prefill drift for {symbol}.")
+
+    start_payload = repository._payload_from_data(symbol, frame)
+    start_payload["stamp"] = start_stamp
+    start_payload["metadata"] = dict(metadata)
+    start_payload["snapshot_id"] = uuid.uuid4().hex
+    start_payload["saved_at"] = time.time()
+
+    rng = np.random.default_rng(int(seed) if seed is not None else None)
+    end_payload = _apply_market_drift_to_payload(
+        start_payload,
+        shift=shift,
+        noise_sigma=noise_sigma,
+        rng=rng,
+    )
+    end_payload["stamp"] = end_stamp
+    end_payload["metadata"] = dict(metadata)
+    end_payload["snapshot_id"] = uuid.uuid4().hex
+    end_payload["saved_at"] = time.time() + 1e-3
+
+    start_path = repository._atomic_json_write(
+        Path(repository.history_dir) / f"{safe}_{start_stamp}.json",
+        start_payload,
+    )
+    end_path = repository._atomic_json_write(
+        Path(repository.history_dir) / f"{safe}_{end_stamp}.json",
+        end_payload,
+    )
+
+    return {
+        "ticker": symbol,
+        "strike": metadata.get("strike"),
+        "expiry": metadata.get("expiry"),
+        "start_path": str(start_path),
+        "end_path": str(end_path),
+        "start_label": start_stamp,
+        "end_label": end_stamp,
+        "start_stamp": start_stamp,
+        "end_stamp": end_stamp,
+        "filename_pattern": "{TICKER}_{STRIKE}_{EXPIRY}_{START|END}.json",
+    }
+
+
+# Alias for the alternate spelling used in the request.
+prefill_driftdata = prefill_drift_data
+
+
 class DataRepository:
     """TTL-backed JSON cache for option-chain frames, with atomic writes."""
 
