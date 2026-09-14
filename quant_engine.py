@@ -6454,3 +6454,194 @@ from quant_engine_debate import (  # noqa: E402
     expert_c_volatility_arb,
     run_council_debate,
 )
+
+# ---------------------------------------------------------------------------
+# Social Sentiment Specialist — alpha + MC factor (auditor-normalized [0, 1])
+# ---------------------------------------------------------------------------
+from sentiment_engine import (  # noqa: E402
+    SENTIMENT_UNSTABLE_MSG,
+    audit_sentiment_normalized,
+    clip_sentiment_01,
+    extract_portfolio_sentiment,
+    extract_ticker_sentiment,
+    filter_social_posts,
+    normalize_compound_to_01,
+    sentiment_factor_for_montecarlo,
+)
+
+
+def calculate_sentiment_alpha(
+    ticker: str,
+    *,
+    prices: Any = None,
+    sentiment_scores: Any = None,
+    force_stub: bool = True,
+    spike_z: float = 1.0,
+) -> dict[str, Any]:
+    """Correlate sentiment spikes with subsequent price / realized-vol changes.
+
+    Returns auditor-friendly normalized scores in ``[0, 1]`` plus Pearson
+    correlations suitable for Monte Carlo Sentiment Factor consumption.
+    ``force_stub=True`` by default so CI / offline paths stay deterministic.
+    """
+    symbol = str(ticker or "").strip().upper() or "SPY"
+    sources_breakdown: dict[str, Any] = {}
+    if sentiment_scores is None:
+        payload = extract_ticker_sentiment(symbol, force_stub=force_stub)
+        posts = payload.get("posts")
+        if isinstance(posts, pd.DataFrame) and not posts.empty and "score_01" in posts.columns:
+            scores = pd.to_numeric(posts["score_01"], errors="coerce").to_numpy(dtype=np.float64)
+        else:
+            scores = np.array([float(payload.get("score_01", 0.5))], dtype=np.float64)
+        buzz = float(payload.get("buzz") or 0.0)
+        uoa_flag = bool(payload.get("uoa_flag"))
+        mention_count = int(payload.get("mention_count") or 0)
+        source = str(payload.get("source") or "stub")
+        sources_breakdown = dict(payload.get("sources") or {})
+        reddit_block = payload.get("reddit") or {}
+        fourchan_block = payload.get("fourchan") or {}
+    else:
+        scores = np.asarray(sentiment_scores, dtype=np.float64).ravel()
+        buzz = float(np.clip(np.log1p(scores.size) / np.log1p(100.0), 0.0, 1.0))
+        uoa_flag = False
+        mention_count = int(scores.size)
+        source = "injected"
+        reddit_block = {}
+        fourchan_block = {}
+
+    scores = np.asarray(scores, dtype=np.float64)
+    if scores.size == 0 or not np.any(np.isfinite(scores)):
+        scores = np.array([0.5], dtype=np.float64)
+
+    # Price path: injected series, else synthetic path seeded by ticker (offline-safe).
+    if prices is None:
+        rng = np.random.default_rng(abs(hash(symbol)) % (2**32))
+        n = max(int(scores.size), 16)
+        rets = rng.normal(0.0, 0.01, size=n)
+        # Embed a mild causal link: high sentiment → slight positive next return.
+        sent = np.resize(scores, n)
+        rets = rets + 0.02 * (sent - 0.5)
+        px = 100.0 * np.exp(np.cumsum(rets))
+    else:
+        px = np.asarray(prices, dtype=np.float64).ravel()
+        px = px[np.isfinite(px) & (px > 0.0)]
+        if px.size < 3:
+            rng = np.random.default_rng(0)
+            px = 100.0 * np.exp(np.cumsum(rng.normal(0.0, 0.01, size=max(scores.size, 16))))
+
+    log_rets = np.diff(np.log(px))
+    # Realized vol over a rolling window of 5 returns (annualized-ish daily).
+    window = min(5, max(log_rets.size, 1))
+    if log_rets.size >= window:
+        rv = np.array(
+            [
+                float(np.std(log_rets[max(0, i - window + 1) : i + 1]) * np.sqrt(252.0))
+                for i in range(log_rets.size)
+            ],
+            dtype=np.float64,
+        )
+    else:
+        rv = np.array([], dtype=np.float64)
+
+    n_align = min(scores.size, log_rets.size)
+    if n_align < 2:
+        # Pad scores to match returns when only a scalar aggregate is available.
+        sent_series = np.resize(scores, max(log_rets.size, 2))
+        n_align = min(sent_series.size, log_rets.size)
+    else:
+        sent_series = scores[:n_align]
+    sent_aligned = np.asarray(sent_series[:n_align], dtype=np.float64)
+    ret_aligned = np.asarray(log_rets[:n_align], dtype=np.float64)
+    rv_aligned = np.asarray(rv[:n_align], dtype=np.float64) if rv.size >= n_align else rv
+
+    finite_s = np.isfinite(sent_aligned)
+    finite_r = np.isfinite(ret_aligned)
+    mask = finite_s & finite_r
+    if int(mask.sum()) >= 2:
+        corr_price = float(np.corrcoef(sent_aligned[mask], ret_aligned[mask])[0, 1])
+    else:
+        corr_price = 0.0
+    if not np.isfinite(corr_price):
+        corr_price = 0.0
+
+    if rv_aligned.size >= 2:
+        m2 = np.isfinite(sent_aligned[: rv_aligned.size]) & np.isfinite(rv_aligned)
+        if int(m2.sum()) >= 2:
+            corr_vol = float(np.corrcoef(sent_aligned[: rv_aligned.size][m2], rv_aligned[m2])[0, 1])
+        else:
+            corr_vol = 0.0
+    else:
+        corr_vol = 0.0
+    if not np.isfinite(corr_vol):
+        corr_vol = 0.0
+
+    mu = float(np.nanmean(sent_aligned)) if sent_aligned.size else 0.5
+    sigma_s = float(np.nanstd(sent_aligned)) if sent_aligned.size else 0.0
+    if np.isfinite(sigma_s) and sigma_s > 1e-12:
+        spikes = sent_aligned >= (mu + float(spike_z) * sigma_s)
+    else:
+        spikes = np.zeros(sent_aligned.shape, dtype=bool)
+    if int(spikes.sum()) > 0 and ret_aligned.size == sent_aligned.size:
+        spike_ret = float(np.nanmean(ret_aligned[spikes]))
+        spike_vol = (
+            float(np.nanmean(rv_aligned[spikes[: rv_aligned.size]]))
+            if rv_aligned.size == sent_aligned.size
+            else float("nan")
+        )
+    else:
+        spike_ret = 0.0
+        spike_vol = float("nan")
+
+    mean_score = clip_sentiment_01(float(np.nanmean(scores)) if scores.size else 0.5)
+    # Alpha proxy: sentiment–return correlation scaled to [0, 1] via (ρ+1)/2, modulated by |spike ret|.
+    alpha_raw = 0.5 * (corr_price + 1.0)
+    if np.isfinite(spike_ret):
+        alpha_raw = float(np.clip(alpha_raw + 2.0 * spike_ret, 0.0, 1.0))
+    alpha_01 = clip_sentiment_01(alpha_raw)
+    scores_01 = np.array([clip_sentiment_01(x) for x in scores.tolist()], dtype=np.float64)
+    audit = audit_sentiment_normalized(scores_01)
+    mc_factor = sentiment_factor_for_montecarlo(mean_score)
+
+    # Correlation chart series (sentiment vs realized vol), length-aligned.
+    chart_n = min(sent_aligned.size, rv_aligned.size) if rv_aligned.size else sent_aligned.size
+    chart_sentiment = np.array(sent_aligned[:chart_n], dtype=np.float64, copy=True)
+    if rv_aligned.size:
+        chart_vol = np.array(rv_aligned[:chart_n], dtype=np.float64, copy=True)
+    else:
+        chart_vol = np.full(chart_n, 0.0, dtype=np.float64)
+
+    return {
+        "ok": True,
+        "ticker": symbol,
+        "score_01": mean_score,
+        "alpha_01": alpha_01,
+        "buzz": clip_sentiment_01(buzz),
+        "mention_count": mention_count,
+        "uoa_flag": uoa_flag,
+        "corr_price": float(corr_price),
+        "corr_vol": float(corr_vol),
+        "spike_count": int(spikes.sum()) if spikes.size else 0,
+        "spike_mean_return": spike_ret,
+        "spike_mean_realized_vol": spike_vol if np.isfinite(spike_vol) else None,
+        "scores_01": scores_01,
+        "audit": audit,
+        "sentiment_factor": mc_factor,
+        "chart_sentiment": chart_sentiment,
+        "chart_realized_vol": chart_vol,
+        "source": source,
+        "sources": sources_breakdown,
+        "reddit": {
+            "score_01": clip_sentiment_01(reddit_block.get("score_01", mean_score)),
+            "buzz": clip_sentiment_01(reddit_block.get("buzz", 0.0)),
+            "mention_count": int(reddit_block.get("mention_count") or 0),
+            "source": str(reddit_block.get("source") or "empty"),
+            "uoa_flag": bool(reddit_block.get("uoa_flag")),
+        },
+        "fourchan": {
+            "score_01": clip_sentiment_01(fourchan_block.get("score_01", mean_score)),
+            "buzz": clip_sentiment_01(fourchan_block.get("buzz", 0.0)),
+            "mention_count": int(fourchan_block.get("mention_count") or 0),
+            "source": str(fourchan_block.get("source") or "empty"),
+            "uoa_flag": bool(fourchan_block.get("uoa_flag")),
+        },
+    }

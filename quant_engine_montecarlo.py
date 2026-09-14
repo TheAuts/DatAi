@@ -214,16 +214,33 @@ def evaluate_position_montecarlo(
     vanna: float | None = None,
     volga: float | None = None,
     delta_hedged: bool = False,
+    sentiment_factor: float | None = None,
 ) -> dict[str, Any]:
-    """Simulate ≥ ``MC_MIN_PATHS`` paths and report PoP, PoT, Greeks, rule gate."""
+    """Simulate ≥ ``MC_MIN_PATHS`` paths and report PoP, PoT, Greeks, rule gate.
+
+    Optional ``sentiment_factor`` ∈ [0, 1] (from Social Sentiment Specialist)
+    nudges drift and vol via ``sentiment_factor_for_montecarlo``.
+    """
     paths_req = max(int(n_paths), MC_MIN_PATHS)
     audit = audit_monte_carlo_path_count(paths_req)
     entry_px = float(entry) if entry is not None else float(spot)
+    sigma_eff = float(sigma)
+    rate_eff = float(rate)
+    sentiment_payload: dict[str, float] | None = None
+    if sentiment_factor is not None:
+        try:
+            from sentiment_engine import sentiment_factor_for_montecarlo
+
+            sentiment_payload = sentiment_factor_for_montecarlo(sentiment_factor)
+            sigma_eff = max(float(sigma) * float(sentiment_payload["vol_mult"]), 0.0)
+            rate_eff = float(rate) + float(sentiment_payload["drift_bias"])
+        except Exception:
+            sentiment_payload = None
     paths = simulate_gbm_paths(
         float(spot),
-        float(sigma),
+        sigma_eff,
         float(time_years),
-        rate=float(rate),
+        rate=rate_eff,
         n_paths=paths_req,
         n_steps=int(n_steps),
         seed=seed,
@@ -249,6 +266,12 @@ def evaluate_position_montecarlo(
         "mathematicians_rule": rule,
         "approved": bool(audit["ok"] and rule["approved"]),
         "paths": paths,
+        "sigma_effective": sigma_eff,
+        "rate_effective": rate_eff,
+        "sentiment_factor": (
+            float(sentiment_payload["sentiment_factor"]) if sentiment_payload is not None else None
+        ),
+        "sentiment_mc": sentiment_payload,
     }
     result.update(greeks)
     if greeks["vanna_warning"]:
@@ -272,11 +295,13 @@ def strategist_evaluate_position(
     n_paths: int = MC_MIN_PATHS,
     seed: int | None = None,
     frame: pd.DataFrame | None = None,
+    sentiment_factor: float | None = None,
 ) -> dict[str, Any]:
     """Full Godlike evaluation: HMM regime → MC PoP/PoT → Mathematician's Rule.
 
     Imports regime classification lazily so the Monte Carlo module stays usable
     without forcing HMM fit on every isolated PoP/PoT call.
+    Optional ``sentiment_factor`` ∈ [0, 1] feeds the Monte Carlo Sentiment Factor.
     """
     from quant_engine_regime import classify_market_regime, require_regime_before_trade
 
@@ -316,6 +341,7 @@ def strategist_evaluate_position(
         vanna=vanna,
         volga=volga,
         delta_hedged=delta_hedged,
+        sentiment_factor=sentiment_factor,
     )
     # Drop bulky path matrix from strategist summary (available via evaluate_*).
     paths = mc.pop("paths", None)

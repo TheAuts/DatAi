@@ -83,6 +83,9 @@ from quant_engine import (
     STANCE_BUY,
     STANCE_SELL,
     STANCE_NEUTRAL,
+    calculate_sentiment_alpha,
+    audit_sentiment_normalized,
+    SENTIMENT_UNSTABLE_MSG,
 )
 
 DATA_REPO = DataRepository()
@@ -4140,6 +4143,260 @@ def add_regime_lab_tab(tab: Any, ticker: str) -> None:
             st.caption(f"Cascade Probability = {cascade_p:.3f} (bounded [0, 1]).")
 
 
+@st.cache_data(ttl=120, show_spinner="Scanning social sentiment…")
+def sentiment_lab_cached_alpha(ticker: str) -> dict[str, Any]:
+    """Cached Sentiment Lab payload (`calculate_sentiment_alpha`)."""
+    return calculate_sentiment_alpha(str(ticker or "").strip().upper(), force_stub=True)
+
+
+def sentiment_lab_build_gauge(score_01: float) -> go.Figure:
+    """Sentiment Gauge: Bearish (0) → Bullish (1)."""
+    s = float(np.clip(float(score_01), 0.0, 1.0))
+    if s < 0.4:
+        bar = "#e74c3c"
+    elif s > 0.6:
+        bar = "#2ecc71"
+    else:
+        bar = "#f1c40f"
+    fig = go.Figure(
+        go.Indicator(
+            mode="gauge+number",
+            value=s,
+            number={"valueformat": ".3f"},
+            title={"text": "Sentiment (Bearish → Bullish)"},
+            gauge={
+                "axis": {"range": [0, 1], "tickvals": [0, 0.5, 1], "ticktext": ["Bearish", "Neutral", "Bullish"]},
+                "bar": {"color": bar},
+                "bgcolor": PANEL_BG,
+                "borderwidth": 1,
+                "bordercolor": TEXT,
+                "steps": [
+                    {"range": [0.0, 0.4], "color": "#3a1e1e"},
+                    {"range": [0.4, 0.6], "color": "#3a341e"},
+                    {"range": [0.6, 1.0], "color": "#1e3a2f"},
+                ],
+                "threshold": {
+                    "line": {"color": TEXT, "width": 2},
+                    "thickness": 0.75,
+                    "value": 0.5,
+                },
+            },
+        )
+    )
+    fig.update_layout(
+        template="plotly_dark",
+        paper_bgcolor=DARK_BG,
+        font={"color": TEXT},
+        height=280,
+        margin={"l": 24, "r": 24, "t": 48, "b": 24},
+        uirevision="sentiment-lab-gauge",
+    )
+    return fig
+
+
+def sentiment_lab_build_buzz_meter(buzz: float, mention_count: int) -> go.Figure:
+    """Buzz Meter: mention-volume intensity in [0, 1]."""
+    b = float(np.clip(float(buzz), 0.0, 1.0))
+    fig = go.Figure(
+        go.Indicator(
+            mode="gauge+number",
+            value=b * 100.0,
+            number={"suffix": "%", "valueformat": ".1f"},
+            title={"text": f"Buzz Meter ({int(mention_count)} mentions)"},
+            gauge={
+                "axis": {"range": [0, 100]},
+                "bar": {"color": "#3498db"},
+                "bgcolor": PANEL_BG,
+                "borderwidth": 1,
+                "bordercolor": TEXT,
+                "steps": [
+                    {"range": [0, 33], "color": "#1e2a3a"},
+                    {"range": [33, 66], "color": "#1e334a"},
+                    {"range": [66, 100], "color": "#1e4060"},
+                ],
+            },
+        )
+    )
+    fig.update_layout(
+        template="plotly_dark",
+        paper_bgcolor=DARK_BG,
+        font={"color": TEXT},
+        height=280,
+        margin={"l": 24, "r": 24, "t": 48, "b": 24},
+        uirevision="sentiment-lab-buzz",
+    )
+    return fig
+
+
+def sentiment_lab_build_correlation_chart(
+    sentiment: Any,
+    realized_vol: Any,
+) -> go.Figure:
+    """Scatter: Sentiment Score vs Realized Volatility."""
+    s = np.asarray(sentiment, dtype=float).ravel()
+    v = np.asarray(realized_vol, dtype=float).ravel()
+    n = min(s.size, v.size)
+    s, v = s[:n], v[:n]
+    mask = np.isfinite(s) & np.isfinite(v)
+    fig = go.Figure()
+    if int(mask.sum()) == 0:
+        fig.update_layout(
+            template="plotly_dark",
+            paper_bgcolor=DARK_BG,
+            plot_bgcolor=PANEL_BG,
+            font={"color": TEXT},
+            height=360,
+            title="Sentiment Score vs Realized Volatility",
+            margin={"l": 48, "r": 16, "t": 48, "b": 48},
+        )
+        return fig
+    fig.add_trace(
+        go.Scatter(
+            x=s[mask],
+            y=v[mask],
+            mode="markers",
+            marker={"size": 9, "color": "#58a6ff", "opacity": 0.85},
+            name="Observations",
+            hovertemplate="Sentiment=%{x:.3f}<br>RV=%{y:.4f}<extra></extra>",
+        )
+    )
+    fig.update_layout(
+        template="plotly_dark",
+        paper_bgcolor=DARK_BG,
+        plot_bgcolor=PANEL_BG,
+        font={"color": TEXT},
+        height=360,
+        title={"text": "Sentiment Score vs Realized Volatility", "x": 0.0, "xanchor": "left"},
+        xaxis_title="Sentiment Score [0, 1]",
+        yaxis_title="Realized Volatility",
+        margin={"l": 48, "r": 16, "t": 48, "b": 48},
+        uirevision="sentiment-lab-corr",
+    )
+    return fig
+
+
+def add_sentiment_lab_tab(tab: Any, ticker: str) -> None:
+    """Sentiment Lab: gauge, buzz meter, sentiment–vol correlation (additive only)."""
+    with tab:
+        st.caption(
+            "Social Sentiment Lab — Reddit + 4chan scan + VADER scoring "
+            "(`calculate_sentiment_alpha` / Sentiment Factor for Monte Carlo). "
+            "Offline stubs when Reddit credentials or 4chan HTTP are unavailable."
+        )
+        try:
+            result = sentiment_lab_cached_alpha(str(ticker))
+        except Exception:
+            st.error("Could not calculate social sentiment.")
+            return
+        if not result or not result.get("ok"):
+            st.info(str((result or {}).get("message") or "No sentiment data."))
+            return
+
+        score_01 = float(result.get("score_01") or 0.5)
+        buzz = float(result.get("buzz") or 0.0)
+        alpha_01 = float(result.get("alpha_01") or 0.5)
+        mentions = int(result.get("mention_count") or 0)
+        audit = result.get("audit") or audit_sentiment_normalized(result.get("scores_01"))
+        reddit = result.get("reddit") or {}
+        fourchan = result.get("fourchan") or {}
+
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Combined Sentiment", f"{score_01:.3f}", border=True)
+        m2.metric("Combined Buzz", f"{buzz:.3f}", border=True)
+        m3.metric("Alpha [0,1]", f"{alpha_01:.3f}", border=True)
+        m4.metric("Mentions", mentions, border=True)
+
+        s1, s2 = st.columns(2, gap="large")
+        with s1:
+            st.subheader("Reddit")
+            r_score = float(reddit.get("score_01") or 0.5)
+            r_buzz = float(reddit.get("buzz") or 0.0)
+            r_n = int(reddit.get("mention_count") or 0)
+            r1, r2, r3 = st.columns(3)
+            r1.metric("Sentiment", f"{r_score:.3f}", border=True)
+            r2.metric("Buzz", f"{r_buzz:.3f}", border=True)
+            r3.metric("Mentions", r_n, border=True)
+            st.caption(f"source = {reddit.get('source', 'empty')}")
+            if bool(reddit.get("uoa_flag")):
+                st.warning("Reddit: UOA / unusual flow mentions detected.")
+        with s2:
+            st.subheader("4chan")
+            f_score = float(fourchan.get("score_01") or 0.5)
+            f_buzz = float(fourchan.get("buzz") or 0.0)
+            f_n = int(fourchan.get("mention_count") or 0)
+            f1, f2, f3 = st.columns(3)
+            f1.metric("Sentiment", f"{f_score:.3f}", border=True)
+            f2.metric("Buzz", f"{f_buzz:.3f}", border=True)
+            f3.metric("Mentions", f_n, border=True)
+            boards = (result.get("sources") or {}).get("fourchan", {}).get("boards") or ["biz", "pol"]
+            st.caption(f"source = {fourchan.get('source', 'empty')} · boards = {', '.join(map(str, boards))}")
+            if bool(fourchan.get("uoa_flag")):
+                st.warning("4chan: UOA / unusual flow mentions detected.")
+
+        if bool(result.get("uoa_flag")):
+            st.warning("Novelty: Unusual Options Activity mentions detected across social feeds.")
+        factor = result.get("sentiment_factor") or {}
+        if isinstance(factor, dict) and factor:
+            st.caption(
+                f"MC Sentiment Factor = {float(factor.get('sentiment_factor', score_01)):.3f} · "
+                f"drift_bias = {float(factor.get('drift_bias', 0.0)):+.4f} · "
+                f"vol_mult = {float(factor.get('vol_mult', 1.0)):.3f} · "
+                f"combined source = {result.get('source', 'stub')}"
+            )
+
+        left, mid, right = st.columns([1.0, 1.0, 1.2], gap="large")
+        with left:
+            st.subheader("Sentiment Gauge")
+            if not audit.get("ok") or bool(audit.get("halt_render")):
+                st.error(str(audit.get("message") or SENTIMENT_UNSTABLE_MSG))
+            else:
+                try:
+                    fig_g = sentiment_lab_build_gauge(score_01)
+                    st.plotly_chart(
+                        fig_g,
+                        use_container_width=True,
+                        config={"displayModeBar": False},
+                        key="sentiment-lab-gauge",
+                    )
+                    st.caption("Combined (mention-weighted Reddit + 4chan). Gauge gated on [0, 1] audit.")
+                except Exception:
+                    st.error("Could not render the Sentiment Gauge.")
+        with mid:
+            st.subheader("Buzz Meter")
+            try:
+                fig_b = sentiment_lab_build_buzz_meter(buzz, mentions)
+                st.plotly_chart(
+                    fig_b,
+                    use_container_width=True,
+                    config={"displayModeBar": False},
+                    key="sentiment-lab-buzz",
+                )
+                st.caption(
+                    f"Reddit buzz={r_buzz:.3f} ({r_n}) · 4chan buzz={f_buzz:.3f} ({f_n})"
+                )
+            except Exception:
+                st.error("Could not render the Buzz Meter.")
+        with right:
+            st.subheader("Correlation")
+            try:
+                fig_c = sentiment_lab_build_correlation_chart(
+                    result.get("chart_sentiment"),
+                    result.get("chart_realized_vol"),
+                )
+                st.plotly_chart(
+                    fig_c,
+                    use_container_width=True,
+                    config={"displayModeBar": True},
+                    key="sentiment-lab-corr",
+                )
+                st.caption(
+                    f"corr(sentiment, return) = {float(result.get('corr_price') or 0.0):+.3f} · "
+                    f"corr(sentiment, RV) = {float(result.get('corr_vol') or 0.0):+.3f}"
+                )
+            except Exception:
+                st.error("Could not render the Sentiment vs Realized Volatility chart.")
+
+
 def add_event_impact_lab_tab(tab: Any, ticker: str) -> None:
     """Event Impact Lab: event dropdown, shock summary, RdBu shock surface."""
     with tab:
@@ -4490,6 +4747,7 @@ def main() -> None:
         "Event Impact Lab",
         "Regime Lab",
         "Liquidation Waterfall",
+        "Sentiment Lab",
     ]
     (
         greeks_tab,
@@ -4506,6 +4764,7 @@ def main() -> None:
         event_impact_tab,
         regime_lab_tab,
         liquidation_waterfall_tab,
+        sentiment_lab_tab,
     ) = st.tabs(
         tab_labels,
         on_change="rerun",
@@ -4722,6 +4981,9 @@ def main() -> None:
 
     if liquidation_waterfall_tab.open:
         add_liquidation_waterfall_tab(liquidation_waterfall_tab, ticker)
+
+    if sentiment_lab_tab.open:
+        add_sentiment_lab_tab(sentiment_lab_tab, ticker)
 
 
 if __name__ == "__main__":
