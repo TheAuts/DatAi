@@ -58,6 +58,16 @@ from quant_engine import (
     analyze_volatility_risk_outlook,
     calculate_stress_scenario,
     build_stress_pnl_matrix,
+    calculate_market_reflexivity,
+    regime_cascade_probability,
+    regime_classify_states,
+    regime_clip_probability,
+    regime_reflexive_cascade_flag,
+    REGIME_CRASH_CASCADE,
+    REGIME_FRAGILE_BEAR,
+    REGIME_SQUEEZE_UP,
+    REGIME_STABLE_BULL,
+    REGIME_HEDGE_PUT_SPREADS,
 )
 
 STANDARD = {"S": 100.0, "K": 100.0, "T": 1.0, "r": 0.05, "sigma": 0.2, "option_type": "call"}
@@ -1348,3 +1358,133 @@ def test_event_impact_suggest_position_gamma_bias() -> None:
     assert text == "High Gamma Shock: Suggest Calendar Spreads"
     low = event_impact_suggest_position(0.0)
     assert "Low Shock" in low
+
+
+def _regime_chain_frame(
+    *,
+    gex_sign: float = 1.0,
+    vanna_level: float = 0.05,
+    spot: float = 100.0,
+) -> pd.DataFrame:
+    """Synthetic chain for regime tests (Gamma × OI drives GEX; Vanna precomputed).
+
+    ``gex_sign < 0`` overweight put OI so put-negative dealer GEX nets negative.
+    """
+    put_oi_scale = 8.0 if gex_sign < 0 else 1.0
+    call_oi_scale = 1.0 if gex_sign < 0 else 4.0
+    rows = []
+    for strike, opt, oi, gamma in (
+        (95.0, "call", 50.0 * call_oi_scale, 0.04),
+        (100.0, "call", 80.0 * call_oi_scale, 0.05),
+        (105.0, "put", 60.0 * put_oi_scale, 0.05),
+        (110.0, "put", 40.0 * put_oi_scale, 0.04),
+    ):
+        rows.append(
+            {
+                "S": spot,
+                "K": strike,
+                "strike": strike,
+                "T": 0.25,
+                "r": 0.05,
+                "sigma": 0.20,
+                "impliedVolatility": 0.20,
+                "option_type": opt,
+                "openInterest": oi,
+                "contractSize": 100.0,
+                "Gamma": abs(gamma),
+                "Vanna": float(vanna_level) * (1.0 if opt == "call" else -1.0),
+                "underlyingPrice": spot,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def test_regime_clip_probability_bounds() -> None:
+    assert regime_clip_probability(-1.0) == 0.0
+    assert regime_clip_probability(0.0) == 0.0
+    assert regime_clip_probability(0.5) == 0.5
+    assert regime_clip_probability(1.0) == 1.0
+    assert regime_clip_probability(2.5) == 1.0
+    assert regime_clip_probability(float("nan")) == 0.0
+    assert regime_clip_probability("bad") == 0.0
+
+
+def test_regime_cascade_probability_in_unit_interval() -> None:
+    gex = np.array([-1e6, -5e5, 1e5, 0.0, -1e9], dtype=float)
+    vanna = np.array([0.01, 0.5, 2.0, np.nan, 100.0], dtype=float)
+    mom = np.array([-0.08, -0.02, 0.03, -0.5, -1.0], dtype=float)
+    probs = regime_cascade_probability(gex, vanna, mom, vanna_high_threshold=0.2)
+    assert probs.shape == (5,)
+    assert np.all(probs >= 0.0) and np.all(probs <= 1.0)
+    assert math.isfinite(float(probs.max()))
+    # Extreme negative GEX + high vanna + hard dump → near upper bound.
+    hot = regime_cascade_probability([-1e9], [10.0], [-0.2], vanna_high_threshold=0.1)
+    assert 0.0 <= float(hot[0]) <= 1.0
+    assert float(hot[0]) >= 0.7
+    # Positive GEX + up-momentum → low cascade.
+    calm = regime_cascade_probability([1e6], [0.01], [0.05], vanna_high_threshold=0.2)
+    assert 0.0 <= float(calm[0]) <= 1.0
+    assert float(calm[0]) < 0.35
+
+
+def test_regime_classify_four_states_vectorized() -> None:
+    gex = np.array([1e5, -1e5, 1e5, -1e5], dtype=float)
+    vanna = np.array([0.01, 0.01, 0.01, 1.0], dtype=float)
+    mom = np.array([0.02, 0.02, -0.02, -0.03], dtype=float)
+    labels = regime_classify_states(gex, vanna, mom, vanna_high_threshold=0.5)
+    assert list(labels) == [
+        REGIME_STABLE_BULL,
+        REGIME_SQUEEZE_UP,
+        REGIME_FRAGILE_BEAR,
+        REGIME_CRASH_CASCADE,
+    ]
+
+
+def test_regime_reflexive_cascade_flag() -> None:
+    flags = regime_reflexive_cascade_flag([-1.0, 1.0, -1.0], [1.0, 1.0, 0.01], vanna_high_threshold=0.5)
+    assert list(flags) == [True, False, False]
+
+
+def test_calculate_market_reflexivity_cascade_bounded_and_copy() -> None:
+    frame = _regime_chain_frame(gex_sign=-1.0, vanna_level=0.8)
+    original = frame.copy()
+    out = calculate_market_reflexivity(
+        "TEST",
+        frame=frame,
+        spot=100.0,
+        momentum=-0.04,
+    )
+    pd.testing.assert_frame_equal(frame, original)
+    assert out["ok"] is True
+    p = float(out["cascade_probability"])
+    assert 0.0 <= p <= 1.0
+    assert out["regime"] in (
+        REGIME_STABLE_BULL,
+        REGIME_SQUEEZE_UP,
+        REGIME_FRAGILE_BEAR,
+        REGIME_CRASH_CASCADE,
+    )
+    assert isinstance(out["map_frame"], pd.DataFrame)
+    assert {"GEX", "Vanna", "Momentum", "Regime"}.issubset(out["map_frame"].columns)
+    # Negative GEX + high Vanna → reflexive cascade risk.
+    assert out["reflexive_cascade"] is True
+    assert out["regime"] == REGIME_CRASH_CASCADE
+    assert out["hedge_suggestion"] == REGIME_HEDGE_PUT_SPREADS
+
+
+def test_calculate_market_reflexivity_stable_bull() -> None:
+    frame = _regime_chain_frame(gex_sign=1.0, vanna_level=0.01)
+    # Heavy call OI / positive gamma → positive net GEX under put-negative convention.
+    out = calculate_market_reflexivity("BULL", frame=frame, spot=100.0, momentum=0.02)
+    assert out["ok"] is True
+    assert 0.0 <= float(out["cascade_probability"]) <= 1.0
+    assert out["regime"] == REGIME_STABLE_BULL
+    assert out["reflexive_cascade"] is False
+    assert out["hedge_suggestion"] is None
+
+
+def test_calculate_market_reflexivity_empty_frame() -> None:
+    out = calculate_market_reflexivity("EMPTY", frame=pd.DataFrame())
+    assert out["ok"] is False
+    assert float(out["cascade_probability"]) == 0.0
+    assert out["map_frame"].empty

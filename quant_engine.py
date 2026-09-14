@@ -5435,3 +5435,438 @@ def event_impact_calculate_shock(
         }
     )
     return result
+
+
+# ---------------------------------------------------------------------------
+# Market Regime & Reflexivity Engine
+# ---------------------------------------------------------------------------
+REGIME_STABLE_BULL = "Stable-Bull"
+REGIME_SQUEEZE_UP = "Squeeze-Up"
+REGIME_FRAGILE_BEAR = "Fragile-Bear"
+REGIME_CRASH_CASCADE = "Crash-Cascade"
+REGIME_STATES = (
+    REGIME_STABLE_BULL,
+    REGIME_SQUEEZE_UP,
+    REGIME_FRAGILE_BEAR,
+    REGIME_CRASH_CASCADE,
+)
+REGIME_VANNA_HIGH_QUANTILE = 0.65
+REGIME_CASCADE_GEX_WEIGHT = 0.45
+REGIME_CASCADE_VANNA_WEIGHT = 0.35
+REGIME_CASCADE_MOM_WEIGHT = 0.20
+REGIME_HEDGE_PUT_SPREADS = "Buy Put Spreads"
+
+
+def regime_clip_probability(value: Any) -> float:
+    """Bound cascade probability to ``[0, 1]``; non-finite → ``0.0``."""
+    try:
+        x = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    if not np.isfinite(x):
+        return 0.0
+    return float(np.clip(x, 0.0, 1.0))
+
+
+def regime_classify_states(
+    gex: Any,
+    vanna: Any,
+    momentum: Any,
+    *,
+    vanna_high_threshold: float | None = None,
+) -> np.ndarray:
+    """Vectorized regime labels from GEX, Vanna, and price momentum.
+
+    Rules (numpy boolean masks, no Python row loops):
+    - Crash-Cascade: GEX < 0, momentum < 0, |Vanna| high
+    - Squeeze-Up: GEX < 0, momentum ≥ 0
+    - Fragile-Bear: momentum < 0 and not Crash-Cascade
+    - Stable-Bull: otherwise (GEX ≥ 0 and momentum ≥ 0)
+
+    ``vanna_high_threshold`` defaults to a robust scale of |Vanna|
+    (``REGIME_VANNA_HIGH_QUANTILE`` of finite |Vanna|, floored at a tiny epsilon).
+    """
+    g = np.asarray(gex, dtype=np.float64).reshape(-1).copy()
+    v = np.asarray(vanna, dtype=np.float64).reshape(-1).copy()
+    m = np.asarray(momentum, dtype=np.float64).reshape(-1).copy()
+    n = int(max(g.size, v.size, m.size))
+    if g.size == 1 and n > 1:
+        g = np.full(n, float(g[0]) if g.size else np.nan, dtype=np.float64)
+    if v.size == 1 and n > 1:
+        v = np.full(n, float(v[0]) if v.size else np.nan, dtype=np.float64)
+    if m.size == 1 and n > 1:
+        m = np.full(n, float(m[0]) if m.size else np.nan, dtype=np.float64)
+    if not (g.size == v.size == m.size == n):
+        raise ValueError("gex, vanna, and momentum must broadcast to the same length")
+
+    abs_v = np.abs(v)
+    finite_v = abs_v[np.isfinite(abs_v)]
+    if vanna_high_threshold is None:
+        if finite_v.size == 0:
+            thr = 0.0
+        else:
+            thr = float(np.quantile(finite_v, REGIME_VANNA_HIGH_QUANTILE))
+            if thr <= 0.0:
+                thr = float(np.nanmax(finite_v)) if np.any(finite_v > 0) else 0.0
+    else:
+        thr = float(vanna_high_threshold)
+    high_vanna = np.isfinite(abs_v) & (abs_v >= thr) & (thr > 0.0)
+    gex_neg = np.isfinite(g) & (g < 0.0)
+    mom_pos = np.isfinite(m) & (m >= 0.0)
+    mom_neg = np.isfinite(m) & (m < 0.0)
+
+    crash = gex_neg & mom_neg & high_vanna
+    squeeze = gex_neg & mom_pos
+    fragile = (~crash) & mom_neg
+    # Remaining finite rows → Stable-Bull; unknown/NaN rows stay Stable-Bull as safe default.
+    labels = np.full(n, REGIME_STABLE_BULL, dtype=object)
+    labels[fragile] = REGIME_FRAGILE_BEAR
+    labels[squeeze] = REGIME_SQUEEZE_UP
+    labels[crash] = REGIME_CRASH_CASCADE
+    return labels
+
+
+def regime_cascade_probability(
+    gex: Any,
+    vanna: Any,
+    momentum: Any,
+    *,
+    vanna_high_threshold: float | None = None,
+    mom_ref: float = 0.05,
+) -> np.ndarray:
+    """Cascade risk in ``[0, 1]`` from negative GEX, elevated |Vanna|, and down-momentum.
+
+    Weighted blend of unit scores; result is vectorized ``np.clip`` into ``[0, 1]``.
+    Momentum uses a fixed reference scale (``mom_ref``, default 5% drop → score 1).
+    """
+    g = np.asarray(gex, dtype=np.float64).reshape(-1).copy()
+    v = np.asarray(vanna, dtype=np.float64).reshape(-1).copy()
+    m = np.asarray(momentum, dtype=np.float64).reshape(-1).copy()
+    n = int(max(g.size, v.size, m.size, 1))
+    if g.size == 1 and n > 1:
+        g = np.full(n, float(g[0]), dtype=np.float64)
+    if v.size == 1 and n > 1:
+        v = np.full(n, float(v[0]), dtype=np.float64)
+    if m.size == 1 and n > 1:
+        m = np.full(n, float(m[0]), dtype=np.float64)
+
+    abs_g = np.abs(g)
+    abs_v = np.abs(v)
+    neg_g = np.where(np.isfinite(g) & (g < 0.0), abs_g, 0.0)
+    # Prefer relative scale when a threshold or span exists; else min-max.
+    g_span = float(np.nanmax(neg_g) - np.nanmin(neg_g)) if neg_g.size else 0.0
+    if g_span > 0.0:
+        g_score = minmax_normalize_01(neg_g)
+    else:
+        g_ref = float(np.nanmax(neg_g)) if neg_g.size and float(np.nanmax(neg_g)) > 0 else 1.0
+        g_score = np.clip(neg_g / g_ref, 0.0, 1.0)
+
+    if vanna_high_threshold is not None and float(vanna_high_threshold) > 0.0:
+        thr = float(vanna_high_threshold)
+        v_score = np.clip(np.where(np.isfinite(abs_v), abs_v / thr, 0.0), 0.0, 1.0)
+    else:
+        v_span = float(np.nanmax(abs_v) - np.nanmin(np.where(np.isfinite(abs_v), abs_v, np.nan))) if abs_v.size else 0.0
+        if np.isfinite(v_span) and v_span > 0.0:
+            v_score = minmax_normalize_01(np.where(np.isfinite(abs_v), abs_v, 0.0))
+        else:
+            v_ref = float(np.nanmax(abs_v)) if abs_v.size and np.isfinite(np.nanmax(abs_v)) and float(np.nanmax(abs_v)) > 0 else 1.0
+            v_score = np.clip(np.where(np.isfinite(abs_v), abs_v / v_ref, 0.0), 0.0, 1.0)
+
+    mom_down = np.where(np.isfinite(m) & (m < 0.0), -m, 0.0)
+    ref = float(mom_ref) if mom_ref and float(mom_ref) > 0 else 0.05
+    m_score = np.clip(mom_down / ref, 0.0, 1.0)
+
+    raw = (
+        REGIME_CASCADE_GEX_WEIGHT * g_score
+        + REGIME_CASCADE_VANNA_WEIGHT * v_score
+        + REGIME_CASCADE_MOM_WEIGHT * m_score
+    )
+    return np.clip(np.asarray(raw, dtype=np.float64), 0.0, 1.0).copy()
+
+
+def regime_reflexive_cascade_flag(gex: Any, vanna: Any, *, vanna_high_threshold: float | None = None) -> np.ndarray:
+    """True where dealer GEX is negative and |Vanna| is high (Reflexive Cascade risk)."""
+    g = np.asarray(gex, dtype=np.float64).reshape(-1).copy()
+    v = np.asarray(vanna, dtype=np.float64).reshape(-1).copy()
+    n = int(max(g.size, v.size, 1))
+    if g.size == 1 and n > 1:
+        g = np.full(n, float(g[0]), dtype=np.float64)
+    if v.size == 1 and n > 1:
+        v = np.full(n, float(v[0]), dtype=np.float64)
+    abs_v = np.abs(v)
+    finite_v = abs_v[np.isfinite(abs_v)]
+    if vanna_high_threshold is None:
+        thr = float(np.quantile(finite_v, REGIME_VANNA_HIGH_QUANTILE)) if finite_v.size else 0.0
+        if thr <= 0.0 and finite_v.size:
+            thr = float(np.nanmax(finite_v))
+    else:
+        thr = float(vanna_high_threshold)
+    return (np.isfinite(g) & (g < 0.0) & np.isfinite(abs_v) & (abs_v >= thr) & (thr > 0.0)).copy()
+
+
+def regime_net_dealer_gex(frame: pd.DataFrame) -> tuple[float, np.ndarray, np.ndarray]:
+    """Net dealer-signed GEX plus per-row GEX and strike arrays (copied)."""
+    if frame is None or not isinstance(frame, pd.DataFrame) or frame.empty:
+        return 0.0, np.array([], dtype=np.float64), np.array([], dtype=np.float64)
+    working = _attach_chain_gamma(frame.copy())
+    gamma_col = _sentiment_column(working, "Gamma", "gamma")
+    oi_col = _sentiment_column(working, "openInterest", "open_interest", "OI", "oi")
+    price_col = _sentiment_column(working, "strike", "K", "Strike", "Price")
+    if gamma_col is None or price_col is None:
+        return 0.0, np.array([], dtype=np.float64), np.array([], dtype=np.float64)
+    gamma = np.array(pd.to_numeric(gamma_col, errors="coerce").to_numpy(dtype=np.float64), dtype=np.float64, copy=True)
+    prices = np.array(pd.to_numeric(price_col, errors="coerce").to_numpy(dtype=np.float64), dtype=np.float64, copy=True)
+    if oi_col is None:
+        oi = np.ones(len(working.index), dtype=np.float64)
+    else:
+        oi = np.array(pd.to_numeric(oi_col, errors="coerce").to_numpy(dtype=np.float64), dtype=np.float64, copy=True)
+        oi = np.where(np.isfinite(oi) & (oi >= 0), oi, 0.0)
+        if not np.any(oi > 0):
+            oi = np.ones(len(working.index), dtype=np.float64)
+    size_col = _sentiment_column(working, "contractSize", "contract_size", "multiplier")
+    if size_col is None:
+        size = np.full(prices.shape, float(OPTIONS_CONTRACT_SIZE), dtype=np.float64)
+    else:
+        size = np.array(pd.to_numeric(size_col, errors="coerce").to_numpy(dtype=np.float64), dtype=np.float64, copy=True)
+        size = np.where(np.isfinite(size) & (size > 0), size, float(OPTIONS_CONTRACT_SIZE))
+    is_call, is_put = _sentiment_type_mask(working)
+    sign = np.ones(prices.shape, dtype=np.float64)
+    if np.any(is_put) or np.any(is_call):
+        sign = np.where(is_put, -1.0, 1.0)
+    valid = np.isfinite(gamma) & np.isfinite(prices) & (prices > 0) & np.isfinite(oi)
+    with np.errstate(invalid="ignore", over="ignore"):
+        gex = gamma * oi * size * sign
+    gex = np.where(valid & np.isfinite(gex), gex, np.nan)
+    net = float(np.nansum(gex)) if np.any(np.isfinite(gex)) else 0.0
+    return net, np.array(gex, dtype=np.float64, copy=True), np.array(prices, dtype=np.float64, copy=True)
+
+
+def regime_chain_vanna_exposure(frame: pd.DataFrame) -> tuple[float, np.ndarray]:
+    """OI-weighted mean |Vanna| and per-row signed Vanna (copied)."""
+    if frame is None or not isinstance(frame, pd.DataFrame) or frame.empty:
+        return 0.0, np.array([], dtype=np.float64)
+    working = frame.copy()
+    vanna, _volga = _chain_vanna_volga(working)
+    vanna = np.array(vanna, dtype=np.float64, copy=True)
+    oi_col = _sentiment_column(working, "openInterest", "open_interest", "OI", "oi")
+    if oi_col is None:
+        weights = np.ones(len(working.index), dtype=np.float64)
+    else:
+        weights = np.array(pd.to_numeric(oi_col, errors="coerce").to_numpy(dtype=np.float64), dtype=np.float64, copy=True)
+        weights = np.where(np.isfinite(weights) & (weights > 0), weights, np.nan)
+        if not np.any(np.isfinite(weights)):
+            weights = np.ones(len(working.index), dtype=np.float64)
+    with np.errstate(invalid="ignore"):
+        abs_exp = np.abs(vanna) * weights
+    score = _finite_mean(abs_exp)
+    return (float(score) if np.isfinite(score) else 0.0), vanna
+
+
+def regime_estimate_momentum(
+    ticker: str,
+    *,
+    repo: DataRepository | None = None,
+    spot: float | None = None,
+) -> float:
+    """Relative spot change from the two newest DataRepository snapshots.
+
+    Returns ``(spot_new - spot_old) / spot_old``. Falls back to ``0.0`` when
+    history is insufficient.
+    """
+    repository = repo if repo is not None else DataRepository()
+    symbol = str(ticker or "").strip().upper()
+    stamps = repository.get_available_snapshots(symbol)
+    spots: list[float] = []
+    for stamp in stamps[-8:]:
+        payload = repository.load_from_cache(symbol, stamp) or {}
+        raw = payload.get("spot")
+        try:
+            value = float(raw) if raw is not None else float("nan")
+        except (TypeError, ValueError):
+            value = float("nan")
+        if not np.isfinite(value) or value <= 0:
+            frame = repository._records_to_frame(payload.get("data")).copy()
+            value = repository._spot_from_frame(frame) or float("nan")
+        if np.isfinite(value) and value > 0:
+            spots.append(float(value))
+    if spot is not None:
+        try:
+            spot_f = float(spot)
+        except (TypeError, ValueError):
+            spot_f = float("nan")
+        if np.isfinite(spot_f) and spot_f > 0:
+            spots.append(spot_f)
+    if len(spots) < 2:
+        return 0.0
+    old, new = float(spots[-2]), float(spots[-1])
+    if old <= 0:
+        return 0.0
+    return float((new - old) / old)
+
+
+def regime_build_map_frame(
+    gex_rows: np.ndarray,
+    vanna_rows: np.ndarray,
+    momentum: float,
+    *,
+    vanna_high_threshold: float | None = None,
+) -> pd.DataFrame:
+    """Strike-level Regime Map points: X=GEX, Y=Vanna, Z=Momentum (+ Regime)."""
+    g = np.asarray(gex_rows, dtype=np.float64).reshape(-1).copy()
+    v = np.asarray(vanna_rows, dtype=np.float64).reshape(-1).copy()
+    n = int(min(g.size, v.size))
+    if n == 0:
+        return pd.DataFrame(columns=["GEX", "Vanna", "Momentum", "Regime"]).copy()
+    g = g[:n]
+    v = v[:n]
+    m = np.full(n, float(momentum), dtype=np.float64)
+    valid = np.isfinite(g) & np.isfinite(v)
+    g = g[valid]
+    v = v[valid]
+    m = m[valid]
+    if g.size == 0:
+        return pd.DataFrame(columns=["GEX", "Vanna", "Momentum", "Regime"]).copy()
+    labels = regime_classify_states(g, v, m, vanna_high_threshold=vanna_high_threshold)
+    return pd.DataFrame(
+        {
+            "GEX": np.array(g, dtype=np.float64, copy=True),
+            "Vanna": np.array(v, dtype=np.float64, copy=True),
+            "Momentum": np.array(m, dtype=np.float64, copy=True),
+            "Regime": labels,
+        }
+    ).copy()
+
+
+def regime_hedge_suggestion(regime: str, cascade_probability: float, reflexive: bool) -> str | None:
+    """Hedge copy for fragile / cascade regimes; otherwise ``None``."""
+    state = str(regime or "")
+    p = regime_clip_probability(cascade_probability)
+    if state in (REGIME_FRAGILE_BEAR, REGIME_CRASH_CASCADE) or reflexive or p >= 0.55:
+        return REGIME_HEDGE_PUT_SPREADS
+    return None
+
+
+def _regime_empty_result(ticker: str, message: str) -> dict[str, Any]:
+    return {
+        "ticker": str(ticker or "").strip().upper(),
+        "ok": False,
+        "message": message,
+        "regime": REGIME_STABLE_BULL,
+        "cascade_probability": 0.0,
+        "reflexive_cascade": False,
+        "gex": 0.0,
+        "vanna": 0.0,
+        "momentum": 0.0,
+        "hedge_suggestion": None,
+        "map_frame": pd.DataFrame(columns=["GEX", "Vanna", "Momentum", "Regime"]).copy(),
+        "vanna_high_threshold": 0.0,
+    }
+
+
+def calculate_market_reflexivity(
+    ticker: str,
+    *,
+    repo: DataRepository | None = None,
+    frame: pd.DataFrame | None = None,
+    spot: float | None = None,
+    momentum: float | None = None,
+) -> dict[str, Any]:
+    """Correlate dealer GEX, Vanna, and price momentum into a market regime.
+
+    Classifies one of ``Stable-Bull``, ``Squeeze-Up``, ``Fragile-Bear``,
+    ``Crash-Cascade``. When net GEX is negative and aggregate |Vanna| is high,
+    sets ``reflexive_cascade`` and elevates cascade probability (always in
+    ``[0, 1]``). Returns a Regime Map DataFrame for 3D scatter plotting.
+
+    Args:
+        ticker: Underlying symbol (DataRepository lookup when ``frame`` omitted).
+        repo: Optional repository override.
+        frame: Optional chain DataFrame (``.copy()`` used; caller frame untouched).
+        spot: Optional spot override for momentum estimation.
+        momentum: Optional relative momentum override (e.g. ``-0.02`` = −2%).
+
+    Returns:
+        Dict with regime label, cascade probability, map frame, and hedge hint.
+    """
+    symbol = str(ticker or "").strip().upper()
+    if frame is None:
+        chain, snap_spot = _snapshot_chain_frame(symbol, repo=repo)
+        use_spot = spot if spot is not None else snap_spot
+    else:
+        chain = frame.copy() if isinstance(frame, pd.DataFrame) else pd.DataFrame()
+        use_spot = spot
+        if use_spot is None and not chain.empty:
+            use_spot = DataRepository()._spot_from_frame(chain)
+
+    if chain is None or not isinstance(chain, pd.DataFrame) or chain.empty:
+        return _regime_empty_result(symbol, "No option chain available for regime analysis.")
+
+    working = chain.copy()
+    net_gex, gex_rows, _strikes = regime_net_dealer_gex(working)
+    vanna_score, vanna_rows = regime_chain_vanna_exposure(working)
+    if momentum is None:
+        mom = regime_estimate_momentum(symbol, repo=repo, spot=use_spot)
+    else:
+        try:
+            mom = float(momentum)
+        except (TypeError, ValueError):
+            mom = 0.0
+        if not np.isfinite(mom):
+            mom = 0.0
+
+    abs_v = np.abs(vanna_rows[np.isfinite(vanna_rows)]) if vanna_rows.size else np.array([], dtype=np.float64)
+    if abs_v.size:
+        thr = float(np.quantile(abs_v, REGIME_VANNA_HIGH_QUANTILE))
+        if thr <= 0.0:
+            thr = float(np.nanmax(abs_v))
+    else:
+        thr = float(vanna_score) if vanna_score > 0 else 0.0
+
+    labels = regime_classify_states(
+        np.array([net_gex], dtype=np.float64),
+        np.array([vanna_score], dtype=np.float64),
+        np.array([mom], dtype=np.float64),
+        vanna_high_threshold=thr if thr > 0 else None,
+    )
+    regime = str(labels[0])
+    probs = regime_cascade_probability(
+        np.array([net_gex], dtype=np.float64),
+        np.array([vanna_score], dtype=np.float64),
+        np.array([mom], dtype=np.float64),
+        vanna_high_threshold=thr if thr > 0 else None,
+    )
+    cascade_p = regime_clip_probability(probs[0] if probs.size else 0.0)
+    reflexive = bool(
+        regime_reflexive_cascade_flag(
+            np.array([net_gex], dtype=np.float64),
+            np.array([vanna_score], dtype=np.float64),
+            vanna_high_threshold=thr if thr > 0 else None,
+        )[0]
+    )
+    if reflexive and regime == REGIME_FRAGILE_BEAR:
+        regime = REGIME_CRASH_CASCADE
+        cascade_p = regime_clip_probability(max(cascade_p, 0.7))
+    elif reflexive:
+        cascade_p = regime_clip_probability(max(cascade_p, 0.55))
+
+    map_frame = regime_build_map_frame(
+        gex_rows,
+        vanna_rows,
+        mom,
+        vanna_high_threshold=thr if thr > 0 else None,
+    )
+    hedge = regime_hedge_suggestion(regime, cascade_p, reflexive)
+    return {
+        "ticker": symbol,
+        "ok": True,
+        "message": "ok",
+        "regime": regime,
+        "cascade_probability": cascade_p,
+        "reflexive_cascade": reflexive,
+        "gex": float(net_gex),
+        "vanna": float(vanna_score),
+        "momentum": float(mom),
+        "hedge_suggestion": hedge,
+        "map_frame": map_frame.copy(),
+        "vanna_high_threshold": float(thr),
+    }
