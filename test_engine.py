@@ -506,6 +506,56 @@ def test_data_repository_ttl_version_and_atomic_cache(tmp_path) -> None:
     assert Path(snaps[0]).name.startswith("SPY_")
 
 
+def test_data_repository_is_historical_live_vs_snapshot(tmp_path) -> None:
+    def fetcher(ticker: str, expiry: Any, date: str | None = None) -> pd.DataFrame:
+        return pd.DataFrame(
+            {
+                "ticker": [ticker],
+                "expiration": [str(expiry) if expiry is not None else "2026-10-16"],
+                "as_of": [date or "live"],
+                "sigma": [0.2],
+            }
+        )
+
+    repo = DataRepository(
+        cache_dir=tmp_path,
+        history_dir=tmp_path / "data_history",
+        fetcher=fetcher,
+        status_probe=lambda: {"ok": True},
+    )
+    assert repo.is_historical is False
+    assert repo.status_date is None
+
+    live = repo.get_data("SPY", "2026-10-16")
+    assert not live.empty
+    assert repo.is_historical is False
+    assert repo.status_date is None
+
+    hist = repo.get_data("SPY", "2026-10-16", date="2024-06-15")
+    assert not hist.empty
+    assert repo.is_historical is True
+    assert repo.status_date == "2024-06-15"
+
+    live_again = repo.get_data("SPY", "2026-10-16")
+    assert not live_again.empty
+    assert repo.is_historical is False
+    assert repo.status_date is None
+
+    repo.save_to_cache(
+        "SPY",
+        pd.DataFrame({"ticker": ["SPY"], "sigma": [0.25]}),
+        metadata={"ticker": "SPY", "as_of_date": "2025-03-01"},
+    )
+    stamp = repo.get_available_snapshots("SPY")[-1]
+    payload = repo.load_from_cache("SPY", stamp)
+    assert payload is not None
+    assert repo.is_historical is True
+    assert repo.status_date == "2025-03-01"
+
+    repo.get_data("SPY")
+    assert repo.is_historical is False
+
+
 def test_data_repository_historical_compare_and_prune(tmp_path) -> None:
     repo = DataRepository(cache_dir=tmp_path, status_probe=lambda: {"ok": True})
     first = pd.DataFrame({"impliedVolatility": [0.20, 0.22], "Delta": [0.50, 0.40], "Gamma": [0.02, 0.01], "Theta": [-0.03, -0.02], "Vega": [0.10, 0.12]})
