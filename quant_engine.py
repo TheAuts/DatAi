@@ -5099,3 +5099,339 @@ def test_simulated_pnl(
 
 
 test_simulated_pnl.__test__ = False  # not a pytest case; Test Dashboard helper only
+
+
+# ---------------------------------------------------------------------------
+# Event Impact Lab — event-driven Greek shock surfaces (isolated feature)
+# ---------------------------------------------------------------------------
+# All public helpers use the ``event_impact_`` prefix. Snapshot pairing uses
+# DataRepository history only; no coupling to Time Machine / Advanced Metrics.
+
+EVENT_IMPACT_DATA_PATH = Path(__file__).resolve().parent / "event_impact_data.json"
+EVENT_IMPACT_EVENT_HOUR = 12  # noon local — same-calendar-day snaps can straddle
+
+
+def event_impact_load_data(
+    path: str | Path | None = None,
+) -> list[dict[str, str]]:
+    """Parse ``event_impact_data.json`` into ``[{date, event}, ...]``.
+
+    Invalid rows are skipped. Missing / unreadable files yield ``[]``.
+    """
+    target = Path(path) if path is not None else EVENT_IMPACT_DATA_PATH
+    try:
+        raw = json.loads(target.read_text(encoding="utf-8"))
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        return []
+    if not isinstance(raw, list):
+        return []
+    out: list[dict[str, str]] = []
+    for item in raw:
+        if not isinstance(item, Mapping):
+            continue
+        event_date = str(item.get("date") or "").strip()
+        event_name = str(item.get("event") or "").strip()
+        if not event_date or not event_name:
+            continue
+        out.append({"date": event_date, "event": event_name})
+    return out
+
+
+def event_impact_parse_stamp_datetime(stamp: str, saved_at: Any = None) -> datetime | None:
+    """Best-effort datetime for a history stamp (prefers ``saved_at`` unix when valid)."""
+    try:
+        ts = float(saved_at)
+    except (TypeError, ValueError):
+        ts = float("nan")
+    if np.isfinite(ts) and ts > 1e9:
+        return datetime.fromtimestamp(ts, tz=timezone.utc).replace(tzinfo=None)
+
+    text = str(stamp or "").strip()
+    if not text:
+        return None
+    parts = text.replace(".json", "").split("_")
+    date_part = next((p for p in parts if len(p) >= 10 and p[4] == "-" and p[7] == "-"), None)
+    if date_part is None:
+        return None
+    try:
+        base = datetime.strptime(date_part[:10], "%Y-%m-%d")
+    except ValueError:
+        return None
+    # Prefer HHMM / HHMMSS token after the date; ignore trailing unix ids.
+    for part in parts[parts.index(date_part) + 1 :]:
+        digits = "".join(ch for ch in part if ch.isdigit())
+        if len(digits) >= 10:
+            continue
+        if len(digits) >= 6:
+            return base.replace(
+                hour=int(digits[0:2]),
+                minute=int(digits[2:4]),
+                second=int(digits[4:6]),
+            )
+        if len(digits) >= 4:
+            return base.replace(hour=int(digits[0:2]), minute=int(digits[2:4]), second=0)
+    return base.replace(hour=EVENT_IMPACT_EVENT_HOUR, minute=0, second=0)
+
+
+def event_impact_event_datetime(event_date: str | date | datetime) -> datetime | None:
+    """Normalize an event date to a noon datetime for before/after pairing."""
+    if isinstance(event_date, datetime):
+        return event_date.replace(tzinfo=None)
+    if isinstance(event_date, date):
+        return datetime(event_date.year, event_date.month, event_date.day, EVENT_IMPACT_EVENT_HOUR)
+    text = str(event_date or "").strip()
+    if not text:
+        return None
+    for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%Y%m%d"):
+        try:
+            parsed = datetime.strptime(text[:10] if fmt != "%Y%m%d" else text[:8], fmt)
+            return parsed.replace(hour=EVENT_IMPACT_EVENT_HOUR, minute=0, second=0)
+        except ValueError:
+            continue
+    return None
+
+
+def event_impact_list_snapshot_times(
+    ticker: str,
+    *,
+    repo: DataRepository | None = None,
+) -> list[dict[str, Any]]:
+    """Return sorted snapshot metadata ``[{stamp, when, path}, ...]`` for ``ticker``."""
+    repository = repo if repo is not None else DataRepository()
+    symbol = str(ticker or "").strip().upper()
+    rows: list[dict[str, Any]] = []
+    for stamp in repository.get_available_snapshots(symbol):
+        path = repository._resolve_snapshot_path(symbol, stamp)
+        payload: dict[str, Any] = {}
+        if path is not None:
+            loaded = repository._read_json(path)
+            if isinstance(loaded, dict):
+                payload = loaded
+        when = event_impact_parse_stamp_datetime(stamp, payload.get("saved_at"))
+        if when is None:
+            continue
+        rows.append({"stamp": str(stamp), "when": when, "path": path})
+    rows.sort(key=lambda item: (item["when"], item["stamp"]))
+    return rows
+
+
+def event_impact_find_bracketing_snapshots(
+    ticker: str,
+    event_date: str | date | datetime,
+    *,
+    repo: DataRepository | None = None,
+) -> tuple[str | None, str | None]:
+    """Closest snapshot strictly before and after the event instant."""
+    event_when = event_impact_event_datetime(event_date)
+    if event_when is None:
+        return None, None
+    rows = event_impact_list_snapshot_times(ticker, repo=repo)
+    before = [row for row in rows if row["when"] < event_when]
+    after = [row for row in rows if row["when"] > event_when]
+    stamp_before = str(before[-1]["stamp"]) if before else None
+    stamp_after = str(after[0]["stamp"]) if after else None
+    return stamp_before, stamp_after
+
+
+def _event_impact_payload_in_memory(
+    repository: DataRepository,
+    ticker: str,
+    stamp: str,
+) -> dict[str, Any]:
+    """Load a snapshot and backfill surfaces in memory (no history rewrite)."""
+    path = repository._resolve_snapshot_path(ticker, stamp)
+    if path is None:
+        return {}
+    payload = repository._read_json(path)
+    if not isinstance(payload, dict) or not payload:
+        return {}
+    working = dict(payload)
+    missing = [
+        key
+        for key, val in repository.SURFACE_KEYS.items()
+        if repository._surface_is_empty(working.get(key), val)
+    ]
+    if missing:
+        frame = repository._records_to_frame(working.get("data")).copy()
+        if not frame.empty:
+            working.update(repository._compute_surfaces(frame.copy()))
+    return working
+
+
+def _event_impact_shared_axes(
+    pts_a: pd.DataFrame,
+    pts_b: pd.DataFrame,
+) -> tuple[np.ndarray, np.ndarray]:
+    empty = (np.empty(0, dtype=np.float64), np.empty(0, dtype=np.float64))
+    if pts_a is None or pts_b is None or pts_a.empty or pts_b.empty:
+        return empty
+    a = pts_a.copy()
+    b = pts_b.copy()
+    x_min = float(min(float(a["Strike"].min()), float(b["Strike"].min())))
+    x_max = float(max(float(a["Strike"].max()), float(b["Strike"].max())))
+    y_min = float(min(float(a["DaysToExpiry"].min()), float(b["DaysToExpiry"].min())))
+    y_max = float(max(float(a["DaysToExpiry"].max()), float(b["DaysToExpiry"].max())))
+    nx = int(max(2, min(VOL_SURFACE_STRIKE_POINTS, max(a["Strike"].nunique(), b["Strike"].nunique(), 8))))
+    ny = int(max(2, min(VOL_SURFACE_DTE_POINTS, max(a["DaysToExpiry"].nunique(), b["DaysToExpiry"].nunique(), 8))))
+    strike_axis = np.linspace(x_min, x_max if x_max > x_min else x_min + 1e-6, nx, dtype=np.float64)
+    dte_axis = np.linspace(y_min, y_max if y_max > y_min else y_min + 1e-6, ny, dtype=np.float64)
+    return strike_axis, dte_axis
+
+
+def _event_impact_grid_abs_sum(grid: np.ndarray) -> float:
+    arr = np.asarray(grid, dtype=np.float64)
+    if arr.size == 0:
+        return 0.0
+    finite = arr[np.isfinite(arr)]
+    if finite.size == 0:
+        return 0.0
+    return float(np.sum(np.abs(finite)))
+
+
+def event_impact_suggest_position(
+    magnitude: float,
+    *,
+    gamma_magnitude: float = 0.0,
+    vega_magnitude: float = 0.0,
+) -> str:
+    """Map shock magnitude / greek mix to a suggested options structure."""
+    mag = float(magnitude) if np.isfinite(magnitude) else 0.0
+    g_mag = float(gamma_magnitude) if np.isfinite(gamma_magnitude) else 0.0
+    v_mag = float(vega_magnitude) if np.isfinite(vega_magnitude) else 0.0
+    if mag <= 0.0:
+        return "Low Shock: No action suggested"
+    denom = g_mag + v_mag
+    gamma_share = (g_mag / denom) if denom > 0 else 0.5
+    if gamma_share >= 0.55:
+        return "High Gamma Shock: Suggest Calendar Spreads"
+    if gamma_share <= 0.45:
+        return "High Vega Shock: Suggest Volatility Spreads"
+    return "Mixed Shock: Suggest Defined-Risk Iron Condors"
+
+
+def event_impact_calculate_shock(
+    ticker: str,
+    event_date: str | date | datetime,
+    *,
+    repo: DataRepository | None = None,
+) -> dict[str, Any]:
+    """Compute Shock Surface (Δ after − Δ before) and Gamma/Vega shock magnitude.
+
+    Finds the two snapshots closest to ``event_date`` (one before, one after),
+    interpolates Delta/Gamma/Vega onto a shared Strike×DTE grid, then::
+
+        Shock Surface = Delta_After − Delta_Before
+        Shock Magnitude = Σ|Γ_After − Γ_Before| + Σ|ν_After − ν_Before|
+
+    All DataFrame operations use ``.copy()``. Returns a result dict with
+    ``ok``, axes, long-format ``shock_frame``, magnitudes, and a position hint.
+    """
+    empty_frame = pd.DataFrame(columns=["Strike", "DaysToExpiry", "Shock"])
+    result: dict[str, Any] = {
+        "ok": False,
+        "message": "",
+        "ticker": str(ticker or "").strip().upper(),
+        "event_date": str(event_date),
+        "stamp_before": None,
+        "stamp_after": None,
+        "shock_frame": empty_frame.copy(),
+        "strike_axis": np.empty(0, dtype=np.float64),
+        "dte_axis": np.empty(0, dtype=np.float64),
+        "shock_z": np.empty((0, 0), dtype=np.float64),
+        "shock_magnitude": 0.0,
+        "gamma_magnitude": 0.0,
+        "vega_magnitude": 0.0,
+        "suggestion": event_impact_suggest_position(0.0),
+    }
+    repository = repo if repo is not None else DataRepository()
+    symbol = result["ticker"]
+    if not symbol:
+        result["message"] = "Ticker is required."
+        return result
+
+    stamp_before, stamp_after = event_impact_find_bracketing_snapshots(
+        symbol, event_date, repo=repository
+    )
+    result["stamp_before"] = stamp_before
+    result["stamp_after"] = stamp_after
+    if not stamp_before or not stamp_after:
+        result["message"] = (
+            "Need one snapshot before and one after the event date "
+            f"(before={stamp_before!r}, after={stamp_after!r})."
+        )
+        return result
+
+    payload_before = _event_impact_payload_in_memory(repository, symbol, stamp_before)
+    payload_after = _event_impact_payload_in_memory(repository, symbol, stamp_after)
+    frame_before = repository._records_to_frame(payload_before.get("data")).copy()
+    frame_after = repository._records_to_frame(payload_after.get("data")).copy()
+    if frame_before.empty or frame_after.empty:
+        result["message"] = "Bracketing snapshots have empty option chains."
+        return result
+
+    delta_before = repository._greek_points(frame_before.copy(), "Delta").copy()
+    delta_after = repository._greek_points(frame_after.copy(), "Delta").copy()
+    gamma_before = repository._greek_points(frame_before.copy(), "Gamma").copy()
+    gamma_after = repository._greek_points(frame_after.copy(), "Gamma").copy()
+    vega_before = repository._greek_points(frame_before.copy(), "Vega").copy()
+    vega_after = repository._greek_points(frame_after.copy(), "Vega").copy()
+
+    strike_axis, dte_axis = _event_impact_shared_axes(delta_before, delta_after)
+    if strike_axis.size == 0 or dte_axis.size == 0:
+        result["message"] = "Could not build a shared Strike × DTE grid."
+        return result
+
+    z_delta_before = repository._interpolate_delta_grid(
+        delta_before.copy(), strike_axis, dte_axis, value_col="Delta"
+    )
+    z_delta_after = repository._interpolate_delta_grid(
+        delta_after.copy(), strike_axis, dte_axis, value_col="Delta"
+    )
+    z_gamma_before = repository._interpolate_delta_grid(
+        gamma_before.copy(), strike_axis, dte_axis, value_col="Gamma"
+    )
+    z_gamma_after = repository._interpolate_delta_grid(
+        gamma_after.copy(), strike_axis, dte_axis, value_col="Gamma"
+    )
+    z_vega_before = repository._interpolate_delta_grid(
+        vega_before.copy(), strike_axis, dte_axis, value_col="Vega"
+    )
+    z_vega_after = repository._interpolate_delta_grid(
+        vega_after.copy(), strike_axis, dte_axis, value_col="Vega"
+    )
+
+    # Shock Surface = Delta_Surface_After − Delta_Surface_Before
+    shock_z = np.array(z_delta_after - z_delta_before, dtype=np.float64, copy=True)
+    gamma_mag = _event_impact_grid_abs_sum(z_gamma_after - z_gamma_before)
+    vega_mag = _event_impact_grid_abs_sum(z_vega_after - z_vega_before)
+    magnitude = float(gamma_mag + vega_mag)
+
+    grid_x, grid_y = np.meshgrid(strike_axis, dte_axis)
+    shock_frame = pd.DataFrame(
+        {
+            "Strike": np.asarray(grid_x, dtype=np.float64).ravel().copy(),
+            "DaysToExpiry": np.asarray(grid_y, dtype=np.float64).ravel().copy(),
+            "Shock": np.asarray(shock_z, dtype=np.float64).ravel().copy(),
+        }
+    ).copy()
+    shock_frame.attrs["X"] = np.array(strike_axis, dtype=np.float64, copy=True)
+    shock_frame.attrs["Y"] = np.array(dte_axis, dtype=np.float64, copy=True)
+    shock_frame.attrs["Z"] = np.array(shock_z, dtype=np.float64, copy=True)
+
+    result.update(
+        {
+            "ok": True,
+            "message": "ok",
+            "shock_frame": shock_frame.copy(),
+            "strike_axis": np.array(strike_axis, dtype=np.float64, copy=True),
+            "dte_axis": np.array(dte_axis, dtype=np.float64, copy=True),
+            "shock_z": np.array(shock_z, dtype=np.float64, copy=True),
+            "shock_magnitude": magnitude,
+            "gamma_magnitude": gamma_mag,
+            "vega_magnitude": vega_mag,
+            "suggestion": event_impact_suggest_position(
+                magnitude, gamma_magnitude=gamma_mag, vega_magnitude=vega_mag
+            ),
+        }
+    )
+    return result

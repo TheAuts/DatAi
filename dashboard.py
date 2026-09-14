@@ -67,6 +67,8 @@ from quant_engine import (
     test_simulated_pnl,
     timelapse_shared_z_range,
     TIMELAPSE_SURFACE_KEY,
+    event_impact_calculate_shock,
+    event_impact_load_data,
 )
 
 DATA_REPO = DataRepository()
@@ -3537,6 +3539,118 @@ def add_risk_terminal_tab(tab: Any, ticker: str) -> None:
 
 
 @st.cache_data(show_spinner=False)
+def event_impact_cached_events() -> list[dict[str, str]]:
+    """Cached event calendar from ``event_impact_data.json``."""
+    return event_impact_load_data()
+
+
+@st.cache_data(show_spinner=False)
+def event_impact_cached_shock(ticker: str, event_date: str) -> dict[str, Any]:
+    """Cached shock surface + magnitude for ``ticker`` around ``event_date``."""
+    return event_impact_calculate_shock(str(ticker or "").strip().upper(), str(event_date))
+
+
+def event_impact_render_shock_summary(result: Mapping[str, Any]) -> None:
+    """Right-pane Shock Summary card (magnitude + suggested position)."""
+    st.subheader("Shock Summary")
+    if not result or not result.get("ok"):
+        st.info(str((result or {}).get("message") or "Select an event with bracketing snapshots."))
+        return
+    magnitude = float(result.get("shock_magnitude") or 0.0)
+    suggestion = str(result.get("suggestion") or "")
+    st.metric("Shock Magnitude", f"{magnitude:.4f}", border=True)
+    st.caption(
+        f"Σ|ΔΓ| + Σ|Δν| · before=`{result.get('stamp_before')}` · after=`{result.get('stamp_after')}`"
+    )
+    st.success(suggestion)
+    g_mag = float(result.get("gamma_magnitude") or 0.0)
+    v_mag = float(result.get("vega_magnitude") or 0.0)
+    st.write({"gamma_magnitude": g_mag, "vega_magnitude": v_mag})
+
+
+def event_impact_render_shock_surface(result: Mapping[str, Any]) -> None:
+    """Plotly ``go.Surface`` for Shock Surface with RdBu colorscale."""
+    if not result or not result.get("ok"):
+        return
+    z = np.asarray(result.get("shock_z"), dtype=float)
+    x = np.asarray(result.get("strike_axis"), dtype=float)
+    y = np.asarray(result.get("dte_axis"), dtype=float)
+    if z.size == 0 or x.size == 0 or y.size == 0:
+        st.warning("Shock surface is empty.")
+        return
+    finite = z[np.isfinite(z)]
+    if finite.size == 0:
+        st.warning("Shock surface has no finite values.")
+        return
+    zmax = float(np.max(np.abs(finite)))
+    if zmax <= 0:
+        zmax = 1e-6
+    fig = go.Figure(
+        data=[
+            go.Surface(
+                z=z,
+                x=x,
+                y=y,
+                colorscale="RdBu",
+                cmin=-zmax,
+                cmax=zmax,
+                colorbar={"title": "ΔΔ"},
+                hovertemplate="Strike=%{x:.2f}<br>DTE=%{y:.1f}<br>Shock=%{z:.6f}<extra></extra>",
+            )
+        ]
+    )
+    fig.update_layout(
+        template="plotly_dark",
+        paper_bgcolor=DARK_BG,
+        font={"color": TEXT},
+        height=560,
+        title={"text": "Shock Surface (Δ after − Δ before)", "x": 0.0, "xanchor": "left"},
+        scene={
+            "xaxis_title": "Strike",
+            "yaxis_title": "Days to Expiry",
+            "zaxis_title": "Delta Shock",
+            "bgcolor": PANEL_BG,
+            "dragmode": "orbit",
+        },
+        margin={"l": 8, "r": 8, "t": 48, "b": 8},
+        uirevision="event-impact-shock",
+    )
+    st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+
+
+def add_event_impact_lab_tab(tab: Any, ticker: str) -> None:
+    """Event Impact Lab: event dropdown, shock summary, RdBu shock surface."""
+    with tab:
+        st.caption(
+            "Event-driven Greek shock — Delta surface after − before, "
+            "magnitude from Σ|ΔΓ| + Σ|Δν| (`event_impact_*` helpers)."
+        )
+        left, right = st.columns([1, 1], gap="large")
+        events = event_impact_cached_events()
+        if not events:
+            with left:
+                st.warning("No events found in `event_impact_data.json`.")
+            return
+        labels = [f"{row['date']} — {row['event']}" for row in events]
+        with left:
+            choice = st.selectbox(
+                "Event",
+                options=labels,
+                index=0,
+                key="event_impact_event_select",
+            )
+            selected = events[labels.index(choice)] if choice in labels else events[0]
+            st.write({"date": selected["date"], "event": selected["event"]})
+        try:
+            result = event_impact_cached_shock(str(ticker), str(selected["date"]))
+        except Exception:
+            result = {"ok": False, "message": "Could not calculate event shock."}
+        with right:
+            event_impact_render_shock_summary(result)
+        event_impact_render_shock_surface(result)
+
+
+@st.cache_data(show_spinner=False)
 def _cached_timelapse_frames(ticker: str) -> list[dict[str, Any]]:
     """Cached Market Timelapse frames (delta_surface grids + labels)."""
     return load_all_snapshots(str(ticker or "").strip().upper())
@@ -3847,6 +3961,7 @@ def main() -> None:
         "Test Dashboard",
         "Market Timelapse",
         "Risk Terminal",
+        "Event Impact Lab",
     ]
     (
         greeks_tab,
@@ -3860,6 +3975,7 @@ def main() -> None:
         test_dashboard_tab,
         timelapse_tab,
         risk_terminal_tab,
+        event_impact_tab,
     ) = st.tabs(
         tab_labels,
         on_change="rerun",
@@ -4067,6 +4183,9 @@ def main() -> None:
 
     if risk_terminal_tab.open:
         add_risk_terminal_tab(risk_terminal_tab, ticker)
+
+    if event_impact_tab.open:
+        add_event_impact_lab_tab(event_impact_tab, ticker)
 
 
 if __name__ == "__main__":

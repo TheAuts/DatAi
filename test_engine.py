@@ -47,6 +47,11 @@ from quant_engine import (
     timelapse_shared_z_range,
     TIMELAPSE_SURFACE_KEY,
     EVENT_INSUFFICIENT_COVERAGE,
+    event_impact_calculate_shock,
+    event_impact_find_bracketing_snapshots,
+    event_impact_load_data,
+    event_impact_parse_stamp_datetime,
+    event_impact_suggest_position,
     analyze_event_outlook,
     analyze_gex_outlook,
     analyze_market_sentiment,
@@ -1202,3 +1207,144 @@ def test_calculate_stress_scenario_empty_frame() -> None:
     assert impact["n_contracts"] == 0
     assert impact["delta_change"] == 0.0
     assert impact["net_pnl"] == 0.0
+
+
+def _event_impact_chain_rows(deltas: list[float], gammas: list[float], vegas: list[float]) -> list[dict[str, Any]]:
+    strikes = (100.0, 110.0, 100.0, 110.0)
+    dtes = (7.0, 7.0, 14.0, 14.0)
+    rows = []
+    for strike, dte, delta, gamma, vega in zip(strikes, dtes, deltas, gammas, vegas):
+        rows.append(
+            {
+                "ticker": "EVT",
+                "option_type": "call",
+                "strike": strike,
+                "S": 105.0,
+                "K": strike,
+                "T": dte / 365.0,
+                "sigma": 0.20,
+                "impliedVolatility": 0.20,
+                "underlyingPrice": 105.0,
+                "Delta": delta,
+                "Gamma": gamma,
+                "Vega": vega,
+                "Theta": -0.01,
+                "Rho": 0.02,
+            }
+        )
+    return rows
+
+
+def test_event_impact_load_data_parses_repo_json() -> None:
+    events = event_impact_load_data()
+    assert isinstance(events, list)
+    assert len(events) >= 1
+    assert {"date", "event"} <= set(events[0].keys())
+    assert any(row["event"] == "FOMC" for row in events)
+
+
+def test_event_impact_load_data_skips_bad_rows(tmp_path: Path) -> None:
+    path = tmp_path / "events.json"
+    path.write_text(
+        json.dumps(
+            [
+                {"date": "2026-09-15", "event": "FOMC"},
+                {"date": "", "event": "Bad"},
+                {"event": "NoDate"},
+                "not-a-dict",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    events = event_impact_load_data(path)
+    assert events == [{"date": "2026-09-15", "event": "FOMC"}]
+
+
+def test_event_impact_parse_stamp_datetime_hhmm_and_unix() -> None:
+    assert event_impact_parse_stamp_datetime("2026-09-13_1434") == datetime(2026, 9, 13, 14, 34, 0)
+    # Unix suffix ignored when HHMM is present.
+    parsed = event_impact_parse_stamp_datetime("2026-09-13_0723_1789284208")
+    assert parsed == datetime(2026, 9, 13, 7, 23, 0)
+    # Prefer saved_at when provided.
+    from_saved = event_impact_parse_stamp_datetime("2026-09-13_1434", saved_at=1_700_000_000.0)
+    assert from_saved is not None
+    assert from_saved.year >= 2023
+
+
+def test_event_impact_find_bracketing_and_shock(tmp_path: Path) -> None:
+    history = tmp_path / "data_history"
+    history.mkdir()
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    repo = DataRepository(cache_dir=cache, history_dir=history)
+
+    def _write(stamp: str, saved_at: float, deltas: list[float], gammas: list[float], vegas: list[float]) -> None:
+        payload = {
+            "version": "1.0",
+            "ticker": "EVT",
+            "saved_at": saved_at,
+            "stamp": stamp,
+            "data": _event_impact_chain_rows(deltas, gammas, vegas),
+        }
+        (history / f"EVT_{stamp}.json").write_text(json.dumps(payload), encoding="utf-8")
+
+    _write(
+        "2026-09-13_0900",
+        100.0,
+        [0.40, 0.30, 0.55, 0.45],
+        [0.02, 0.01, 0.015, 0.012],
+        [0.10, 0.08, 0.12, 0.09],
+    )
+    _write(
+        "2026-09-13_1500",
+        200.0,
+        [0.50, 0.35, 0.60, 0.48],
+        [0.04, 0.02, 0.03, 0.025],
+        [0.15, 0.10, 0.18, 0.11],
+    )
+
+    before, after = event_impact_find_bracketing_snapshots("EVT", "2026-09-13", repo=repo)
+    assert before == "2026-09-13_0900"
+    assert after == "2026-09-13_1500"
+
+    result = event_impact_calculate_shock("EVT", "2026-09-13", repo=repo)
+    assert result["ok"] is True
+    assert result["stamp_before"] == before
+    assert result["stamp_after"] == after
+    assert result["shock_magnitude"] > 0.0
+    z = np.asarray(result["shock_z"], dtype=float)
+    assert z.ndim == 2 and z.size > 0
+    assert np.isfinite(z).any()
+    frame = result["shock_frame"].copy()
+    assert {"Strike", "DaysToExpiry", "Shock"} <= set(frame.columns)
+    # Mutating the returned frame must not raise; copy semantics on inputs already covered.
+    frame.loc[:, "Shock"] = 0.0
+    assert "Calendar Spreads" in result["suggestion"] or "Shock" in result["suggestion"]
+
+
+def test_event_impact_calculate_shock_missing_after(tmp_path: Path) -> None:
+    history = tmp_path / "data_history"
+    history.mkdir()
+    repo = DataRepository(cache_dir=tmp_path / "cache", history_dir=history)
+    payload = {
+        "version": "1.0",
+        "ticker": "EVT",
+        "saved_at": 50.0,
+        "stamp": "2026-09-10_1200",
+        "data": _event_impact_chain_rows(
+            [0.4, 0.3, 0.5, 0.4],
+            [0.01, 0.01, 0.01, 0.01],
+            [0.1, 0.1, 0.1, 0.1],
+        ),
+    }
+    (history / "EVT_2026-09-10_1200.json").write_text(json.dumps(payload), encoding="utf-8")
+    result = event_impact_calculate_shock("EVT", "2026-09-15", repo=repo)
+    assert result["ok"] is False
+    assert result["stamp_after"] is None
+
+
+def test_event_impact_suggest_position_gamma_bias() -> None:
+    text = event_impact_suggest_position(10.0, gamma_magnitude=8.0, vega_magnitude=2.0)
+    assert text == "High Gamma Shock: Suggest Calendar Spreads"
+    low = event_impact_suggest_position(0.0)
+    assert "Low Shock" in low
