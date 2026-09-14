@@ -17,8 +17,8 @@ Specialist roles (`.cursor/rules/*.mdc`):
 - perf — vectorization, `st.cache_data` optimization, memory profiling
 - qa — pytest generation, mathematical boundary testing
 - ux — docstrings, tooltips, user-friendly labels
-- quant — Quant Strategist: statistical edge, PoP/Monte Carlo, Greek-neutral hedges
+- quant — Quant Strategist (Godlike Tier): HMM regime, Vanna/Volga, MC PoP/PoT (≥10k paths), Mathematician's Rule
 
 Institutional Tier readiness: compliance, perf, qa, and ux required alongside core roles.
 
-Protocol: Before the Architect approves any new trading feature, the Quant Strategist must perform a Statistical Sanity Check — ensure the logic is not directional betting, but a mathematical edge.
+Protocol: Before the Architect approves any new trading feature, the Quant Strategist must perform a Statistical Sanity Check — ensure the logic is not directional betting, but a mathematical edge. Godlike Tier: HMM regime [Stable|Trend|Crash-Cascade] before trade approval; Monte Carlo PoP+PoT with ≥10,000 paths; Mathematician's Rule (forbid PoT > PoP unless delta-hedged); Auditor verifies path count.
