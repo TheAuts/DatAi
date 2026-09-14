@@ -47,6 +47,12 @@ from quant_engine import (
     REGIME_CRASH_CASCADE,
     REGIME_FRAGILE_BEAR,
     REGIME_HEDGE_PUT_SPREADS,
+    test_calculate_liquidation_waterfall,
+    test_audit_gex_normalized,
+    test_simulate_liquidation_greeks,
+    TEST_LIQUIDATION_UNSTABLE_MSG,
+    TEST_LIQUIDATION_ZONE,
+    TEST_STABILITY_NEAR_PCT,
     calculate_speed,
     calculate_ultima,
     calculate_vanna,
@@ -3731,6 +3737,214 @@ def regime_lab_build_cascade_gauge(
     return fig
 
 
+@st.cache_data(show_spinner=False)
+def liquidation_waterfall_cached(ticker: str) -> dict[str, Any]:
+    """Cached Liquidation Waterfall payload for ``ticker``."""
+    return test_calculate_liquidation_waterfall(str(ticker or "").strip().upper())
+
+
+def liquidation_waterfall_build_heatmap(surface: Mapping[str, Any]) -> go.Figure:
+    """``go.Heatmap``: X=Price, Y=Time/Expiry, Z=cascade score (Liquidation Zones bright red)."""
+    price = np.asarray(surface.get("price_axis"), dtype=float)
+    expiry = np.asarray(surface.get("expiry_axis"), dtype=float)
+    cascade = np.asarray(surface.get("cascade_z"), dtype=float)
+    if price.size == 0 or expiry.size == 0 or cascade.size == 0:
+        return go.Figure()
+    colorscale = [
+        [0.0, "#0d1b2a"],
+        [0.35, "#1b4332"],
+        [0.55, "#ca6702"],
+        [0.75, "#e63946"],
+        [1.0, "#ff1744"],
+    ]
+    fig = go.Figure(
+        data=[
+            go.Heatmap(
+                x=price,
+                y=expiry,
+                z=cascade,
+                colorscale=colorscale,
+                zmin=0.0,
+                zmax=1.0,
+                colorbar={"title": "Cascade"},
+                hovertemplate=(
+                    "Price=%{x:.2f}<br>DTE=%{y:.1f}<br>Cascade=%{z:.3f}<extra></extra>"
+                ),
+            )
+        ]
+    )
+    fig.update_layout(
+        template="plotly_dark",
+        paper_bgcolor=DARK_BG,
+        font={"color": TEXT},
+        height=520,
+        title={"text": "Liquidation Waterfall — GEX Cascade Heatmap", "x": 0.0, "xanchor": "left"},
+        xaxis_title="Price",
+        yaxis_title="Time / Expiry (DTE)",
+        margin={"l": 48, "r": 24, "t": 48, "b": 48},
+        uirevision="liquidation-waterfall-heatmap",
+    )
+    return fig
+
+
+def liquidation_waterfall_build_stability_gauge(stability: Mapping[str, Any], next_flip: float | None) -> go.Figure:
+    """Market Stability gauge — aggressive red as spot approaches the next Gamma Flip."""
+    approach = float(stability.get("approach_risk") or 0.0)
+    approach = float(np.clip(approach, 0.0, 1.0))
+    near = bool(stability.get("near_flip"))
+    bar_color = "#ff1744" if near or approach >= 0.7 else ("#f39c12" if approach >= 0.4 else "#2ecc71")
+    dist_pct = stability.get("distance_pct")
+    try:
+        dist_label = f"{float(dist_pct) * 100:.2f}%" if dist_pct is not None and np.isfinite(float(dist_pct)) else "—"
+    except (TypeError, ValueError):
+        dist_label = "—"
+    flip_txt = f"{float(next_flip):.2f}" if next_flip is not None and np.isfinite(float(next_flip)) else "—"
+    fig = go.Figure(
+        go.Indicator(
+            mode="gauge+number",
+            value=approach * 100.0,
+            number={"suffix": "%", "valueformat": ".1f"},
+            title={"text": f"Flip Approach Risk · next={flip_txt} · Δ={dist_label}"},
+            gauge={
+                "axis": {"range": [0, 100]},
+                "bar": {"color": bar_color},
+                "bgcolor": PANEL_BG,
+                "borderwidth": 1,
+                "bordercolor": TEXT,
+                "steps": [
+                    {"range": [0, 40], "color": "#1e3a2f"},
+                    {"range": [40, 70], "color": "#3a341e"},
+                    {"range": [70, 100], "color": "#3a1e1e"},
+                ],
+                "threshold": {
+                    "line": {"color": "#ff1744", "width": 3},
+                    "thickness": 0.75,
+                    "value": 70,
+                },
+            },
+        )
+    )
+    fig.update_layout(
+        template="plotly_dark",
+        paper_bgcolor=DARK_BG,
+        font={"color": TEXT},
+        height=280,
+        margin={"l": 24, "r": 24, "t": 64, "b": 24},
+        uirevision="liquidation-waterfall-gauge",
+    )
+    return fig
+
+
+def add_liquidation_waterfall_tab(tab: Any, ticker: str) -> None:
+    """Liquidation Waterfall: GEX cascade heatmap, stability gauge, Simulate Liquidation."""
+    with tab:
+        st.caption(
+            "Liquidation Waterfall — GEX surface, Gamma Flip cascade, and Liquidation Zones "
+            "(`test_calculate_liquidation_waterfall`)."
+        )
+        try:
+            result = liquidation_waterfall_cached(str(ticker))
+        except Exception:
+            st.error("Could not calculate the liquidation waterfall.")
+            return
+        if not result or not result.get("ok"):
+            st.info(str((result or {}).get("message") or "No chain data for liquidation waterfall."))
+            return
+
+        spot = result.get("spot")
+        next_flip = result.get("next_gamma_flip")
+        stability = result.get("stability") or {}
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Spot", f"{float(spot):.2f}" if spot is not None else "—", border=True)
+        m2.metric(
+            "Next Gamma Flip",
+            f"{float(next_flip):.2f}" if next_flip is not None else "—",
+            border=True,
+        )
+        m3.metric("Net GEX", f"{float(result.get('net_gex') or 0.0):.4g}", border=True)
+        m4.metric("Liquidation Zones", int(result.get("liquidation_zone_count") or 0), border=True)
+
+        if bool(stability.get("near_flip")):
+            st.error(
+                "Spot is approaching the next Gamma Flip — expect accelerated dealer hedging "
+                f"(within {float(TEST_STABILITY_NEAR_PCT) * 100:.0f}% of flip)."
+            )
+
+        left, right = st.columns([1.35, 1.0], gap="large")
+        with left:
+            st.subheader("GEX Cascade Heatmap")
+            surface = result.get("surface") or {}
+            audit = result.get("gex_audit") or test_audit_gex_normalized(surface.get("gex_z"))
+            if not audit.get("ok") or bool(audit.get("halt_render")):
+                st.error(str(audit.get("message") or TEST_LIQUIDATION_UNSTABLE_MSG))
+            elif not surface.get("ok"):
+                st.info("GEX surface is empty for this chain.")
+            else:
+                try:
+                    fig_hm = liquidation_waterfall_build_heatmap(surface)
+                    st.plotly_chart(
+                        fig_hm,
+                        use_container_width=True,
+                        config={"displayModeBar": True},
+                        key="liquidation-waterfall-heatmap",
+                    )
+                    st.caption(
+                        f"Bright red = {TEST_LIQUIDATION_ZONE} (high cascade score from negative GEX)."
+                    )
+                except Exception:
+                    st.error("Could not render the Liquidation Waterfall heatmap.")
+        with right:
+            st.subheader("Market Stability")
+            try:
+                fig_gauge = liquidation_waterfall_build_stability_gauge(stability, next_flip)
+                st.plotly_chart(
+                    fig_gauge,
+                    use_container_width=True,
+                    config={"displayModeBar": False},
+                    key="liquidation-waterfall-gauge",
+                )
+            except Exception:
+                st.error("Could not render the Market Stability gauge.")
+            dist_pct = stability.get("distance_pct")
+            if dist_pct is not None and np.isfinite(float(dist_pct)):
+                st.caption(f"Distance to next Gamma Flip = {float(dist_pct) * 100:.2f}% of spot.")
+
+        st.subheader("Positioner")
+        st.caption("Simulate how chain Greeks react if price hits the next Gamma Flip zone.")
+        if st.button("Simulate Liquidation", key="liquidation_simulate_btn", type="primary"):
+            if next_flip is None:
+                st.warning("No Gamma Flip detected — cannot simulate liquidation.")
+            else:
+                try:
+                    sim = test_simulate_liquidation_greeks(
+                        str(ticker),
+                        float(next_flip),
+                        spot=float(spot) if spot is not None else None,
+                    )
+                except Exception:
+                    sim = {"ok": False, "message": "Simulation failed."}
+                if not sim.get("ok"):
+                    st.error(str(sim.get("message") or "Simulation unavailable."))
+                else:
+                    impact = sim.get("impact") or {}
+                    st.success(
+                        f"Simulated spot → flip {float(sim.get('flip_price') or next_flip):.2f} "
+                        f"({float(sim.get('spot_shift') or 0.0):+.2f}% shock)."
+                    )
+                    s1, s2, s3, s4 = st.columns(4)
+                    s1.metric("Δ Delta", f"{float(impact.get('delta_change') or 0.0):+.4g}", border=True)
+                    s2.metric("Δ Gamma", f"{float(impact.get('gamma_change') or 0.0):+.4g}", border=True)
+                    s3.metric("Δ Vega", f"{float(impact.get('vega_change') or 0.0):+.4g}", border=True)
+                    s4.metric("Net P&L", f"{float(impact.get('net_pnl') or 0.0):+.4g}", border=True)
+                    if bool(impact.get("negative_gamma")):
+                        st.error("Stressed book enters Negative Gamma — liquidation cascade risk elevated.")
+
+        flips = result.get("gamma_flips")
+        if flips is not None and len(np.asarray(flips)) > 0:
+            with st.expander("Detected Gamma Flip levels"):
+                st.write([float(x) for x in np.asarray(flips, dtype=float).tolist()])
+
+
 def add_regime_lab_tab(tab: Any, ticker: str) -> None:
     """Regime Lab: 3D Regime Map + Cascade Probability gauge (additive only)."""
     with tab:
@@ -4144,6 +4358,7 @@ def main() -> None:
         "Risk Terminal",
         "Event Impact Lab",
         "Regime Lab",
+        "Liquidation Waterfall",
     ]
     (
         greeks_tab,
@@ -4159,6 +4374,7 @@ def main() -> None:
         risk_terminal_tab,
         event_impact_tab,
         regime_lab_tab,
+        liquidation_waterfall_tab,
     ) = st.tabs(
         tab_labels,
         on_change="rerun",
@@ -4372,6 +4588,9 @@ def main() -> None:
 
     if regime_lab_tab.open:
         add_regime_lab_tab(regime_lab_tab, ticker)
+
+    if liquidation_waterfall_tab.open:
+        add_liquidation_waterfall_tab(liquidation_waterfall_tab, ticker)
 
 
 if __name__ == "__main__":

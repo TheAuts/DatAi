@@ -68,6 +68,15 @@ from quant_engine import (
     REGIME_SQUEEZE_UP,
     REGIME_STABLE_BULL,
     REGIME_HEDGE_PUT_SPREADS,
+    test_audit_gex_normalized as lw_audit_gex_normalized,
+    test_cascade_score as lw_cascade_score,
+    test_calculate_liquidation_waterfall as lw_calculate_liquidation_waterfall,
+    test_classify_liquidation_zones as lw_classify_liquidation_zones,
+    test_detect_gamma_flips as lw_detect_gamma_flips,
+    test_market_stability_distance as lw_market_stability_distance,
+    TEST_LIQUIDATION_UNSTABLE_MSG,
+    TEST_LIQUIDATION_ZONE,
+    calculate_liquidation_waterfall,
 )
 
 STANDARD = {"S": 100.0, "K": 100.0, "T": 1.0, "r": 0.05, "sigma": 0.2, "option_type": "call"}
@@ -1488,3 +1497,135 @@ def test_calculate_market_reflexivity_empty_frame() -> None:
     assert out["ok"] is False
     assert float(out["cascade_probability"]) == 0.0
     assert out["map_frame"].empty
+
+
+def _liquidation_chain_frame(*, spot: float = 100.0) -> pd.DataFrame:
+    """Synthetic chain with clear GEX + → − flip near 100 and a deep negative wing."""
+    rows = []
+    # Lower strikes: put-heavy negative GEX. Higher strikes: call-heavy positive GEX.
+    specs = [
+        (90.0, "put", 200.0, 0.05, 0.20),
+        (95.0, "put", 150.0, 0.06, 0.20),
+        (100.0, "put", 80.0, 0.05, 0.20),
+        (100.0, "call", 40.0, 0.05, 0.20),
+        (105.0, "call", 120.0, 0.05, 0.20),
+        (110.0, "call", 180.0, 0.04, 0.20),
+    ]
+    for strike, opt, oi, gamma, dte_frac in specs:
+        rows.append(
+            {
+                "S": spot,
+                "K": strike,
+                "strike": strike,
+                "T": dte_frac,
+                "DaysToExpiry": dte_frac * 365.0,
+                "r": 0.05,
+                "sigma": 0.20,
+                "impliedVolatility": 0.20,
+                "option_type": opt,
+                "openInterest": oi,
+                "contractSize": 100.0,
+                "Gamma": abs(gamma),
+                "underlyingPrice": spot,
+            }
+        )
+    # Second tenor for heatmap Y axis.
+    for strike, opt, oi, gamma, dte_frac in specs:
+        rows.append(
+            {
+                "S": spot,
+                "K": strike,
+                "strike": strike,
+                "T": 0.10,
+                "DaysToExpiry": 36.5,
+                "r": 0.05,
+                "sigma": 0.22,
+                "impliedVolatility": 0.22,
+                "option_type": opt,
+                "openInterest": oi * 0.8,
+                "contractSize": 100.0,
+                "Gamma": abs(gamma) * 1.1,
+                "underlyingPrice": spot,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def test_detect_gamma_flips_plus_to_minus() -> None:
+    strikes = np.array([90.0, 95.0, 100.0, 105.0, 110.0], dtype=float)
+    gex = np.array([-500.0, -200.0, -50.0, 100.0, 300.0], dtype=float)
+    flips = lw_detect_gamma_flips(strikes, gex)
+    assert flips.size >= 1
+    # Crossing between 100 (−) and 105 (+).
+    assert 100.0 <= float(flips[0]) <= 105.0
+    # No flip when all positive.
+    none = lw_detect_gamma_flips(strikes, np.array([10.0, 20.0, 30.0, 40.0, 50.0]))
+    assert none.size == 0
+
+
+def test_cascade_score_bounds_and_negative_gex() -> None:
+    gex = np.array([-1e6, -1e3, 0.0, 5e5, np.nan], dtype=float)
+    scores = lw_cascade_score(gex)
+    assert scores.shape == gex.shape
+    assert np.all(scores >= 0.0) and np.all(scores <= 1.0)
+    assert float(scores[0]) >= float(scores[1]) >= float(scores[2])
+    assert float(scores[2]) == 0.0
+    assert float(scores[3]) == 0.0
+    assert float(scores[4]) == 0.0
+    zones = lw_classify_liquidation_zones(scores, threshold=0.5)
+    assert zones[0] == TEST_LIQUIDATION_ZONE
+
+
+def test_audit_gex_normalized_halts_on_nan_inf() -> None:
+    ok = lw_audit_gex_normalized(np.array([0.1, 0.5, 0.9], dtype=float))
+    assert ok["ok"] is True
+    assert ok["halt_render"] is False
+    assert np.all(np.isfinite(ok["gex_normalized"]))
+
+    bad_nan = lw_audit_gex_normalized(np.array([0.1, float("nan"), 0.3], dtype=float))
+    assert bad_nan["ok"] is False
+    assert bad_nan["halt_render"] is True
+    assert bad_nan["message"] == TEST_LIQUIDATION_UNSTABLE_MSG
+
+    bad_inf = lw_audit_gex_normalized(np.array([0.1, float("inf"), 0.3], dtype=float))
+    assert bad_inf["ok"] is False
+    assert bad_inf["halt_render"] is True
+    assert bad_inf["message"] == TEST_LIQUIDATION_UNSTABLE_MSG
+
+    empty = lw_audit_gex_normalized(np.array([], dtype=float))
+    assert empty["ok"] is False
+    assert empty["message"] == TEST_LIQUIDATION_UNSTABLE_MSG
+
+
+def test_market_stability_near_flip_aggressive() -> None:
+    far = lw_market_stability_distance(100.0, 90.0)
+    assert far["near_flip"] is False
+    assert float(far["approach_risk"]) < 0.5
+    near = lw_market_stability_distance(100.0, 99.0)
+    assert near["near_flip"] is True
+    assert float(near["approach_risk"]) >= 0.85
+
+
+def test_calculate_liquidation_waterfall_surface_and_copy() -> None:
+    frame = _liquidation_chain_frame(spot=100.0)
+    original = frame.copy()
+    out = lw_calculate_liquidation_waterfall("TEST", frame=frame, spot=100.0)
+    pd.testing.assert_frame_equal(frame, original)
+    assert out["ok"] is True
+    assert isinstance(out["strike_frame"], pd.DataFrame)
+    assert {"Price", "GEX", "CascadeScore", "Zone"}.issubset(out["strike_frame"].columns)
+    assert out["surface"]["ok"] is True
+    assert out["surface"]["price_axis"].size > 0
+    assert out["surface"]["expiry_axis"].size > 0
+    assert out["gex_audit"]["ok"] is True
+    assert out["gex_audit"]["halt_render"] is False
+    # Alias matches isolation entry.
+    alias = calculate_liquidation_waterfall("TEST", frame=frame, spot=100.0)
+    assert alias["ok"] is True
+    assert np.all((out["strike_frame"]["CascadeScore"] >= 0.0) & (out["strike_frame"]["CascadeScore"] <= 1.0))
+
+
+def test_calculate_liquidation_waterfall_empty_frame() -> None:
+    out = lw_calculate_liquidation_waterfall("EMPTY", frame=pd.DataFrame())
+    assert out["ok"] is False
+    assert out["gex_audit"]["halt_render"] is True

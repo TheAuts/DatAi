@@ -5870,3 +5870,482 @@ def calculate_market_reflexivity(
         "map_frame": map_frame.copy(),
         "vanna_high_threshold": float(thr),
     }
+
+
+# ---------------------------------------------------------------------------
+# Liquidation Waterfall Engine (isolated; all helpers use test_ prefix)
+# ---------------------------------------------------------------------------
+TEST_LIQUIDATION_ZONE = "Liquidation Zone"
+TEST_LIQUIDATION_STABLE = "Stable"
+TEST_LIQUIDATION_UNSTABLE_MSG = "Liquidation Engine: GEX data unstable."
+TEST_CASCADE_ZONE_THRESHOLD = 0.65
+TEST_STABILITY_NEAR_PCT = 0.02
+TEST_STABILITY_REF_PCT = 0.05
+
+
+def test_audit_gex_normalized(gex: Any) -> dict[str, Any]:
+    """Auditor: verify GEX values are finite after normalization.
+
+    Non-finite input (NaN / ±inf) after ``minmax_normalize_01`` → halt render
+    with ``TEST_LIQUIDATION_UNSTABLE_MSG``. Empty input is treated as unstable.
+    """
+    arr = np.asarray(gex, dtype=np.float64)
+    if arr.size == 0:
+        return {
+            "ok": False,
+            "message": TEST_LIQUIDATION_UNSTABLE_MSG,
+            "gex_normalized": np.array([], dtype=np.float64),
+            "halt_render": True,
+        }
+    if not np.all(np.isfinite(arr)):
+        return {
+            "ok": False,
+            "message": TEST_LIQUIDATION_UNSTABLE_MSG,
+            "gex_normalized": np.array(arr, dtype=np.float64, copy=True),
+            "halt_render": True,
+        }
+    normalized = minmax_normalize_01(arr)
+    if normalized.size == 0 or not np.all(np.isfinite(normalized)):
+        return {
+            "ok": False,
+            "message": TEST_LIQUIDATION_UNSTABLE_MSG,
+            "gex_normalized": np.array(normalized, dtype=np.float64, copy=True),
+            "halt_render": True,
+        }
+    return {
+        "ok": True,
+        "message": "ok",
+        "gex_normalized": np.array(normalized, dtype=np.float64, copy=True),
+        "halt_render": False,
+    }
+
+
+def test_detect_gamma_flips(strikes: Any, gex: Any) -> np.ndarray:
+    """Interpolated prices where net GEX crosses from positive to negative.
+
+    Strikes are sorted ascending. A flip is recorded when ``gex[i] >= 0`` and
+    ``gex[i + 1] < 0`` (GEX + → − as price falls through the level), matching
+    the dealer long-gamma / short-gamma convention used by ``analyze_gex_outlook``.
+    """
+    k = np.asarray(strikes, dtype=np.float64).reshape(-1).copy()
+    g = np.asarray(gex, dtype=np.float64).reshape(-1).copy()
+    n = int(min(k.size, g.size))
+    if n < 2:
+        return np.array([], dtype=np.float64)
+    k = k[:n]
+    g = g[:n]
+    valid = np.isfinite(k) & (k > 0) & np.isfinite(g)
+    k = k[valid]
+    g = g[valid]
+    if k.size < 2:
+        return np.array([], dtype=np.float64)
+    order = np.argsort(k)
+    k = k[order]
+    g = g[order]
+    # Aggregate duplicate strikes (vectorized unique + bincount-style sum).
+    uniq_k, inv = np.unique(k, return_inverse=True)
+    sums = np.zeros(uniq_k.shape, dtype=np.float64)
+    np.add.at(sums, inv, g)
+    if uniq_k.size < 2:
+        return np.array([], dtype=np.float64)
+    flips: list[float] = []
+    for i in range(int(uniq_k.size) - 1):
+        high_gex = float(sums[i + 1])
+        low_gex = float(sums[i])
+        # Ascending: lower strike then higher. Flip when higher strike is ≥0 and
+        # lower strike is <0 (crossing + → − as price declines).
+        if high_gex >= 0.0 and low_gex < 0.0:
+            denom = high_gex - low_gex
+            if abs(denom) < 1e-18:
+                flip = float(uniq_k[i + 1])
+            else:
+                weight = high_gex / denom
+                flip = float(uniq_k[i + 1] + weight * (uniq_k[i] - uniq_k[i + 1]))
+            if np.isfinite(flip) and flip > 0:
+                flips.append(flip)
+    return np.array(flips, dtype=np.float64, copy=True)
+
+
+def test_cascade_score(gex: Any) -> np.ndarray:
+    """Per-strike cascade score in ``[0, 1]``; highly negative GEX → high score.
+
+    Positive / zero GEX map to 0. Non-finite cells → 0. Always copies.
+    """
+    g = np.asarray(gex, dtype=np.float64)
+    out = np.zeros(g.shape, dtype=np.float64)
+    if g.size == 0:
+        return out
+    neg = np.where(np.isfinite(g) & (g < 0.0), -g, 0.0)
+    span = float(np.nanmax(neg) - np.nanmin(neg)) if neg.size else 0.0
+    if np.isfinite(span) and span > 0.0:
+        scored = minmax_normalize_01(neg)
+    else:
+        ref = float(np.nanmax(neg)) if neg.size and float(np.nanmax(neg)) > 0 else 1.0
+        scored = np.clip(neg / ref, 0.0, 1.0)
+    scored = np.asarray(scored, dtype=np.float64)
+    scored = np.where(np.isfinite(scored), scored, 0.0)
+    return np.clip(scored, 0.0, 1.0).copy()
+
+
+def test_classify_liquidation_zones(
+    cascade: Any,
+    *,
+    threshold: float = TEST_CASCADE_ZONE_THRESHOLD,
+) -> np.ndarray:
+    """Label ``Liquidation Zone`` where cascade score ≥ threshold; else ``Stable``."""
+    c = np.asarray(cascade, dtype=np.float64)
+    thr = float(threshold) if np.isfinite(threshold) else TEST_CASCADE_ZONE_THRESHOLD
+    labels = np.full(c.shape, TEST_LIQUIDATION_STABLE, dtype=object)
+    hot = np.isfinite(c) & (c >= thr)
+    labels[hot] = TEST_LIQUIDATION_ZONE
+    return labels.copy()
+
+
+def test_net_gex_by_strike(frame: pd.DataFrame) -> pd.DataFrame:
+    """Aggregate dealer-signed GEX by strike (copied frame; put-negative convention)."""
+    if frame is None or not isinstance(frame, pd.DataFrame) or frame.empty:
+        return pd.DataFrame(columns=["Price", "GEX", "CascadeScore", "Zone"]).copy()
+    working = _attach_chain_gamma(frame.copy())
+    gamma_col = _sentiment_column(working, "Gamma", "gamma")
+    oi_col = _sentiment_column(working, "openInterest", "open_interest", "OI", "oi")
+    price_col = _sentiment_column(working, "strike", "K", "Strike", "Price")
+    if gamma_col is None or price_col is None:
+        return pd.DataFrame(columns=["Price", "GEX", "CascadeScore", "Zone"]).copy()
+    gamma = np.array(pd.to_numeric(gamma_col, errors="coerce").to_numpy(dtype=np.float64), dtype=np.float64, copy=True)
+    prices = np.array(pd.to_numeric(price_col, errors="coerce").to_numpy(dtype=np.float64), dtype=np.float64, copy=True)
+    if oi_col is None:
+        oi = np.ones(len(working.index), dtype=np.float64)
+    else:
+        oi = np.array(pd.to_numeric(oi_col, errors="coerce").to_numpy(dtype=np.float64), dtype=np.float64, copy=True)
+        oi = np.where(np.isfinite(oi) & (oi >= 0), oi, 0.0)
+        if not np.any(oi > 0):
+            oi = np.ones(len(working.index), dtype=np.float64)
+    size_col = _sentiment_column(working, "contractSize", "contract_size", "multiplier")
+    if size_col is None:
+        size = np.full(prices.shape, float(OPTIONS_CONTRACT_SIZE), dtype=np.float64)
+    else:
+        size = np.array(pd.to_numeric(size_col, errors="coerce").to_numpy(dtype=np.float64), dtype=np.float64, copy=True)
+        size = np.where(np.isfinite(size) & (size > 0), size, float(OPTIONS_CONTRACT_SIZE))
+    is_call, is_put = _sentiment_type_mask(working)
+    sign = np.ones(prices.shape, dtype=np.float64)
+    if np.any(is_put) or np.any(is_call):
+        sign = np.where(is_put, -1.0, 1.0)
+    valid = np.isfinite(gamma) & np.isfinite(prices) & (prices > 0) & np.isfinite(oi)
+    with np.errstate(invalid="ignore", over="ignore"):
+        gex = gamma * oi * size * sign
+    gex = np.where(valid & np.isfinite(gex), gex, np.nan)
+    table = pd.DataFrame({"Price": prices, "GEX": gex}).dropna().copy()
+    if table.empty:
+        return pd.DataFrame(columns=["Price", "GEX", "CascadeScore", "Zone"]).copy()
+    net = table.groupby("Price", sort=True, as_index=False)["GEX"].sum().copy()
+    scores = test_cascade_score(net["GEX"].to_numpy(dtype=np.float64))
+    zones = test_classify_liquidation_zones(scores)
+    net = net.copy()
+    net["CascadeScore"] = scores
+    net["Zone"] = zones
+    return net.copy()
+
+
+def test_build_gex_surface(frame: pd.DataFrame) -> dict[str, Any]:
+    """GEX / cascade surface across full strike × tenor range.
+
+    Returns ``price_axis`` (X), ``expiry_axis`` (Y = days to expiry), ``gex_z``,
+    ``cascade_z``, and ``zone_mask`` for heatmap rendering.
+    """
+    empty = {
+        "price_axis": np.array([], dtype=np.float64),
+        "expiry_axis": np.array([], dtype=np.float64),
+        "gex_z": np.zeros((0, 0), dtype=np.float64),
+        "cascade_z": np.zeros((0, 0), dtype=np.float64),
+        "zone_mask": np.zeros((0, 0), dtype=bool),
+        "ok": False,
+    }
+    if frame is None or not isinstance(frame, pd.DataFrame) or frame.empty:
+        return empty
+    working = _attach_chain_gamma(frame.copy())
+    gamma_col = _sentiment_column(working, "Gamma", "gamma")
+    oi_col = _sentiment_column(working, "openInterest", "open_interest", "OI", "oi")
+    price_col = _sentiment_column(working, "strike", "K", "Strike", "Price")
+    if gamma_col is None or price_col is None:
+        return empty
+    gamma = np.array(pd.to_numeric(gamma_col, errors="coerce").to_numpy(dtype=np.float64), dtype=np.float64, copy=True)
+    prices = np.array(pd.to_numeric(price_col, errors="coerce").to_numpy(dtype=np.float64), dtype=np.float64, copy=True)
+    dtes = np.array(_sentiment_tenor_days(working), dtype=np.float64, copy=True)
+    if oi_col is None:
+        oi = np.ones(len(working.index), dtype=np.float64)
+    else:
+        oi = np.array(pd.to_numeric(oi_col, errors="coerce").to_numpy(dtype=np.float64), dtype=np.float64, copy=True)
+        oi = np.where(np.isfinite(oi) & (oi >= 0), oi, 0.0)
+        if not np.any(oi > 0):
+            oi = np.ones(len(working.index), dtype=np.float64)
+    size_col = _sentiment_column(working, "contractSize", "contract_size", "multiplier")
+    if size_col is None:
+        size = np.full(prices.shape, float(OPTIONS_CONTRACT_SIZE), dtype=np.float64)
+    else:
+        size = np.array(pd.to_numeric(size_col, errors="coerce").to_numpy(dtype=np.float64), dtype=np.float64, copy=True)
+        size = np.where(np.isfinite(size) & (size > 0), size, float(OPTIONS_CONTRACT_SIZE))
+    is_call, is_put = _sentiment_type_mask(working)
+    sign = np.ones(prices.shape, dtype=np.float64)
+    if np.any(is_put) or np.any(is_call):
+        sign = np.where(is_put, -1.0, 1.0)
+    valid = (
+        np.isfinite(gamma)
+        & np.isfinite(prices)
+        & (prices > 0)
+        & np.isfinite(oi)
+        & np.isfinite(dtes)
+        & (dtes >= 0)
+    )
+    with np.errstate(invalid="ignore", over="ignore"):
+        gex = gamma * oi * size * sign
+    gex = np.where(valid & np.isfinite(gex), gex, np.nan)
+    table = pd.DataFrame(
+        {
+            "Price": prices,
+            "DTE": dtes,
+            "GEX": gex,
+        }
+    ).dropna().copy()
+    if table.empty:
+        return empty
+    pivot = (
+        table.groupby(["DTE", "Price"], sort=True, as_index=False)["GEX"]
+        .sum()
+        .copy()
+    )
+    if pivot.empty:
+        return empty
+    wide = pivot.pivot(index="DTE", columns="Price", values="GEX").sort_index(axis=0).sort_index(axis=1)
+    wide = wide.copy().fillna(0.0)
+    price_axis = np.array(wide.columns.to_numpy(dtype=np.float64), dtype=np.float64, copy=True)
+    expiry_axis = np.array(wide.index.to_numpy(dtype=np.float64), dtype=np.float64, copy=True)
+    gex_z = np.array(wide.to_numpy(dtype=np.float64), dtype=np.float64, copy=True)
+    # Sparse pivot NaNs are filled above; ±inf from overflow is left for the auditor.
+    cascade_z = test_cascade_score(np.where(np.isfinite(gex_z), gex_z, 0.0))
+    zone_mask = cascade_z >= float(TEST_CASCADE_ZONE_THRESHOLD)
+    return {
+        "price_axis": price_axis,
+        "expiry_axis": expiry_axis,
+        "gex_z": gex_z,
+        "cascade_z": np.array(cascade_z, dtype=np.float64, copy=True),
+        "zone_mask": np.array(zone_mask, dtype=bool, copy=True),
+        "ok": True,
+    }
+
+
+def test_next_gamma_flip(spot: Any, flips: Any) -> float | None:
+    """Nearest Gamma Flip at or below spot (waterfall downside); else nearest overall."""
+    try:
+        spot_f = float(spot)
+    except (TypeError, ValueError):
+        spot_f = float("nan")
+    arr = np.asarray(flips, dtype=np.float64).reshape(-1).copy()
+    arr = arr[np.isfinite(arr) & (arr > 0)]
+    if arr.size == 0 or not np.isfinite(spot_f) or spot_f <= 0:
+        return None
+    below = arr[arr <= spot_f]
+    if below.size:
+        return float(below[np.argmax(below)])
+    return float(arr[np.argmin(np.abs(arr - spot_f))])
+
+
+def test_market_stability_distance(spot: Any, next_flip: Any) -> dict[str, Any]:
+    """Distance from spot to next Gamma Flip; approach risk in ``[0, 1]``.
+
+    ``approach_risk`` → 1 when within ``TEST_STABILITY_NEAR_PCT`` of the flip
+    (aggressive red), → 0 when distance ≥ ``TEST_STABILITY_REF_PCT``.
+    """
+    try:
+        spot_f = float(spot)
+    except (TypeError, ValueError):
+        spot_f = float("nan")
+    try:
+        flip_f = float(next_flip) if next_flip is not None else float("nan")
+    except (TypeError, ValueError):
+        flip_f = float("nan")
+    if not np.isfinite(spot_f) or spot_f <= 0 or not np.isfinite(flip_f) or flip_f <= 0:
+        return {
+            "distance_abs": float("nan"),
+            "distance_pct": float("nan"),
+            "approach_risk": 0.0,
+            "near_flip": False,
+            "stability": 1.0,
+        }
+    dist_abs = float(abs(spot_f - flip_f))
+    dist_pct = float(dist_abs / spot_f)
+    near = dist_pct <= float(TEST_STABILITY_NEAR_PCT)
+    ref = float(TEST_STABILITY_REF_PCT) if TEST_STABILITY_REF_PCT > 0 else 0.05
+    approach = float(np.clip(1.0 - dist_pct / ref, 0.0, 1.0))
+    if near:
+        approach = max(approach, 0.85)
+    stability = float(np.clip(1.0 - approach, 0.0, 1.0))
+    return {
+        "distance_abs": dist_abs,
+        "distance_pct": dist_pct,
+        "approach_risk": approach,
+        "near_flip": bool(near),
+        "stability": stability,
+    }
+
+
+def test_simulate_liquidation_greeks(
+    ticker: str,
+    flip_price: float,
+    *,
+    spot: float | None = None,
+    repo: DataRepository | None = None,
+    frame: pd.DataFrame | None = None,
+) -> dict[str, Any]:
+    """Portfolio / chain Greek reaction if spot hits the next Gamma Flip zone.
+
+    Shifts spot by ``(flip - spot) / spot * 100`` percent via
+    :func:`calculate_stress_scenario` (IV held flat).
+    """
+    try:
+        flip_f = float(flip_price)
+    except (TypeError, ValueError):
+        flip_f = float("nan")
+    if frame is None:
+        chain, snap_spot = _snapshot_chain_frame(str(ticker or "").strip().upper(), repo=repo)
+        use_spot = spot if spot is not None else snap_spot
+    else:
+        chain = frame.copy() if isinstance(frame, pd.DataFrame) else pd.DataFrame()
+        use_spot = spot
+        if use_spot is None and not chain.empty:
+            use_spot = DataRepository()._spot_from_frame(chain)
+    try:
+        spot_f = float(use_spot) if use_spot is not None else float("nan")
+    except (TypeError, ValueError):
+        spot_f = float("nan")
+    if not np.isfinite(flip_f) or flip_f <= 0 or not np.isfinite(spot_f) or spot_f <= 0:
+        return {
+            "ok": False,
+            "message": "Flip or spot unavailable for liquidation simulation.",
+            "spot_shift": 0.0,
+            "impact": {},
+        }
+    spot_shift = float((flip_f - spot_f) / spot_f * 100.0)
+    impact = calculate_stress_scenario(
+        str(ticker or "").strip().upper(),
+        spot_shift,
+        0.0,
+        repo=repo,
+        frame=chain,
+        spot=spot_f,
+    )
+    return {
+        "ok": True,
+        "message": "ok",
+        "spot_shift": spot_shift,
+        "flip_price": flip_f,
+        "spot": spot_f,
+        "impact": impact,
+    }
+
+
+def _test_liquidation_empty(ticker: str, message: str) -> dict[str, Any]:
+    return {
+        "ticker": str(ticker or "").strip().upper(),
+        "ok": False,
+        "message": message,
+        "spot": None,
+        "strike_frame": pd.DataFrame(columns=["Price", "GEX", "CascadeScore", "Zone"]).copy(),
+        "gamma_flips": np.array([], dtype=np.float64),
+        "next_gamma_flip": None,
+        "stability": {
+            "distance_abs": float("nan"),
+            "distance_pct": float("nan"),
+            "approach_risk": 0.0,
+            "near_flip": False,
+            "stability": 1.0,
+        },
+        "surface": {
+            "price_axis": np.array([], dtype=np.float64),
+            "expiry_axis": np.array([], dtype=np.float64),
+            "gex_z": np.zeros((0, 0), dtype=np.float64),
+            "cascade_z": np.zeros((0, 0), dtype=np.float64),
+            "zone_mask": np.zeros((0, 0), dtype=bool),
+            "ok": False,
+        },
+        "gex_audit": {
+            "ok": False,
+            "message": message,
+            "gex_normalized": np.array([], dtype=np.float64),
+            "halt_render": True,
+        },
+        "net_gex": 0.0,
+        "liquidation_zone_count": 0,
+    }
+
+
+def test_calculate_liquidation_waterfall(
+    ticker: str,
+    *,
+    repo: DataRepository | None = None,
+    frame: pd.DataFrame | None = None,
+    spot: float | None = None,
+) -> dict[str, Any]:
+    """Liquidation Waterfall: GEX surface, Gamma Flips, cascade / Liquidation Zones.
+
+    Conceptual entry ``calculate_liquidation_waterfall(ticker)`` — implemented
+    under the ``test_`` isolation prefix. Builds full-strike GEX, detects flips
+    (GEX + → −), scores cascade risk per strike, and audits GEX finiteness before
+    any heatmap render.
+
+    Args:
+        ticker: Underlying symbol (DataRepository when ``frame`` omitted).
+        repo: Optional repository override.
+        frame: Optional chain DataFrame (``.copy()`` used; caller untouched).
+        spot: Optional spot override for stability distance.
+
+    Returns:
+        Dict with surface grids, flip list, stability metrics, and audit payload.
+    """
+    symbol = str(ticker or "").strip().upper()
+    if frame is None:
+        chain, snap_spot = _snapshot_chain_frame(symbol, repo=repo)
+        use_spot = spot if spot is not None else snap_spot
+    else:
+        chain = frame.copy() if isinstance(frame, pd.DataFrame) else pd.DataFrame()
+        use_spot = spot
+        if use_spot is None and not chain.empty:
+            use_spot = DataRepository()._spot_from_frame(chain)
+
+    if chain is None or not isinstance(chain, pd.DataFrame) or chain.empty:
+        return _test_liquidation_empty(symbol, "No option chain available for liquidation waterfall.")
+
+    working = chain.copy()
+    strike_frame = test_net_gex_by_strike(working)
+    if strike_frame.empty:
+        return _test_liquidation_empty(symbol, "GEX surface could not be built from chain.")
+
+    prices = strike_frame["Price"].to_numpy(dtype=np.float64)
+    gex_vals = strike_frame["GEX"].to_numpy(dtype=np.float64)
+    flips = test_detect_gamma_flips(prices, gex_vals)
+    next_flip = test_next_gamma_flip(use_spot, flips)
+    stability = test_market_stability_distance(use_spot, next_flip)
+    surface = test_build_gex_surface(working)
+    # Auditor operates on the heatmap cascade / GEX grid (prefer surface GEX).
+    audit_source = surface.get("gex_z") if surface.get("ok") else gex_vals
+    gex_audit = test_audit_gex_normalized(audit_source)
+    net_gex = float(np.nansum(gex_vals)) if np.any(np.isfinite(gex_vals)) else 0.0
+    zone_count = int(np.count_nonzero(strike_frame["Zone"].to_numpy() == TEST_LIQUIDATION_ZONE))
+
+    return {
+        "ticker": symbol,
+        "ok": True,
+        "message": "ok",
+        "spot": float(use_spot) if use_spot is not None and np.isfinite(float(use_spot)) else None,
+        "strike_frame": strike_frame.copy(),
+        "gamma_flips": np.array(flips, dtype=np.float64, copy=True),
+        "next_gamma_flip": next_flip,
+        "stability": stability,
+        "surface": surface,
+        "gex_audit": gex_audit,
+        "net_gex": net_gex,
+        "liquidation_zone_count": zone_count,
+    }
+
+
+# Public alias (no collision with other tabs); isolation entry remains test_*.
+calculate_liquidation_waterfall = test_calculate_liquidation_waterfall
