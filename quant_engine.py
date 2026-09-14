@@ -1238,6 +1238,60 @@ class DataRepository:
             "token_missing": False,
             "is_mock": False,
         }
+        # Global data-source mode for LIVE / HISTORICAL status indicator.
+        self._is_historical: bool = False
+        self._status_date: str | None = None
+
+    @property
+    def is_historical(self) -> bool:
+        """True when the current source is a historical API call or loaded snapshot."""
+        return bool(self._is_historical)
+
+    @property
+    def status_date(self) -> str | None:
+        """``YYYY-MM-DD`` when historical; else ``None`` (live)."""
+        return self._status_date
+
+    def _mark_live(self) -> None:
+        self._is_historical = False
+        self._status_date = None
+
+    def _mark_historical(self, as_of: Any = None) -> None:
+        self._is_historical = True
+        text = self._normalize_status_date(as_of)
+        self._status_date = text
+
+    @staticmethod
+    def _normalize_status_date(value: Any) -> str | None:
+        if value is None or value == "":
+            return None
+        if isinstance(value, datetime):
+            return value.date().isoformat()
+        if isinstance(value, date):
+            return value.isoformat()
+        text = str(value).strip()
+        if len(text) >= 10 and text[4] == "-" and text[7] == "-":
+            return text[:10]
+        digits = "".join(ch for ch in text if ch.isdigit())
+        if len(digits) >= 8:
+            return f"{digits[:4]}-{digits[4:6]}-{digits[6:8]}"
+        return None
+
+    def _status_date_from_payload(self, payload: Mapping[str, Any] | None, stamp: Any = None) -> str | None:
+        if isinstance(payload, Mapping):
+            meta = payload.get("metadata") if isinstance(payload.get("metadata"), Mapping) else {}
+            for key in ("as_of_date", "date", "as_of"):
+                for source in (payload, meta):
+                    if not isinstance(source, Mapping):
+                        continue
+                    normalized = self._normalize_status_date(source.get(key))
+                    if normalized:
+                        return normalized
+            for key in ("saved_at", "timestamp", "stamp"):
+                normalized = self._normalize_status_date(payload.get(key))
+                if normalized:
+                    return normalized
+        return self._normalize_status_date(stamp)
 
     def _safe_ticker(self, ticker: str) -> str:
         symbol = str(ticker or "").strip().upper() or "_"
@@ -1902,7 +1956,10 @@ class DataRepository:
         payload = self._read_json(path)
         if not payload:
             return None
-        return self._ensure_surfaces(payload, path)
+        ensured = self._ensure_surfaces(payload, path)
+        if timestamp is not None:
+            self._mark_historical(self._status_date_from_payload(ensured, timestamp))
+        return ensured
 
     def _resolve_snapshot_path(self, ticker: str, timestamp: Any) -> Path | None:
         text = str(timestamp or "").strip()
@@ -2148,8 +2205,10 @@ class DataRepository:
     def get_data(self, ticker: str, expiry: Any = None, date: str | None = None) -> pd.DataFrame:
         if date:
             # Historical EOD request: bypass the live TTL cache and never overwrite it.
+            self._mark_historical(date)
             frame = self._fetch(ticker, expiry, date=date)
             return frame if isinstance(frame, pd.DataFrame) else pd.DataFrame()
+        self._mark_live()
         if self.is_fresh(ticker):
             payload = self._read_payload(ticker) or {}
             records = payload.get("data") or []

@@ -208,6 +208,67 @@ PANEL_BG = "#161b22"
 CARD_BG = "#1c2330"
 GRID = "#30363d"
 TEXT = "#e6edf3"
+STATUS_LIVE = "#3fb950"
+STATUS_HISTORICAL = "#d29922"
+
+
+def _data_status_parts(repo: DataRepository | None = None) -> tuple[bool, str | None]:
+    """Return ``(is_historical, YYYY-MM-DD|None)`` for the global status badge."""
+    as_of = _historical_date_iso()
+    if as_of:
+        return True, as_of
+    source = repo if repo is not None else _get_repo()
+    if getattr(source, "is_historical", False):
+        return True, getattr(source, "status_date", None)
+    return False, None
+
+
+def render_global_data_status(repo: DataRepository | None = None) -> None:
+    """Persistent LIVE / HISTORICAL badge (sidebar + main header)."""
+    historical, as_of = _data_status_parts(repo)
+    if historical:
+        label = f"HISTORICAL: {as_of}" if as_of else "HISTORICAL"
+        css_class = "historical"
+        color = STATUS_HISTORICAL
+    else:
+        label = "LIVE"
+        css_class = "live"
+        color = STATUS_LIVE
+    st.markdown(
+        f"""
+        <style>
+        .data-status-badge {{
+            display: inline-block;
+            font-weight: 700;
+            letter-spacing: 0.06em;
+            font-variant-numeric: tabular-nums;
+            padding: 0.35rem 0.75rem;
+            border-radius: 999px;
+            border: 1px solid {color};
+            background: rgba(22, 27, 34, 0.85);
+        }}
+        .data-status-badge.live {{
+            color: {STATUS_LIVE};
+            text-shadow: 0 0 8px {STATUS_LIVE}, 0 0 18px rgba(63, 185, 80, 0.55);
+            box-shadow: 0 0 12px rgba(63, 185, 80, 0.35);
+        }}
+        .data-status-badge.historical {{
+            color: {STATUS_HISTORICAL};
+            text-shadow: 0 0 8px {STATUS_HISTORICAL}, 0 0 18px rgba(210, 153, 34, 0.55);
+            box-shadow: 0 0 12px rgba(210, 153, 34, 0.35);
+        }}
+        .data-status-wrap {{
+            display: flex;
+            justify-content: flex-end;
+            margin: 0.15rem 0 0.6rem 0;
+        }}
+        </style>
+        <div class="data-status-wrap">
+            <span class="data-status-badge {css_class}">{label}</span>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
 def _init_state() -> None:
@@ -1080,6 +1141,7 @@ def _active_strike(ticker: str, expiry: date, current_price: float) -> float:
 
 def _sidebar_inputs() -> tuple[str, float, date, float, str, bool, Any]:
     with st.sidebar:
+        render_global_data_status(_get_repo())
         st.header("Contract")
         ticker = st.text_input(
             "Ticker",
@@ -4283,6 +4345,10 @@ def main() -> None:
     _init_state()
     _apply_theme()
     repo = _get_repo()
+    # Global header: LIVE / HISTORICAL badge (visible on every tab).
+    _hdr_left, _hdr_right = st.columns([5, 2])
+    with _hdr_right:
+        render_global_data_status(repo)
     shown_alerts: set[str] = set()
     try:
         health = repo.verify_connection("SPY")
