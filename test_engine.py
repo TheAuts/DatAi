@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import math
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -656,6 +657,48 @@ def test_snapshot_vol_surface_from_history(tmp_path) -> None:
     assert isinstance(surface, pd.DataFrame)
     assert {"Strike", "DaysToExpiry", "IV"}.issubset(surface.columns)
     assert len(surface.index) >= 10
+
+
+def test_snapshot_stamp_second_resolution_and_top_level_keys(tmp_path) -> None:
+    """Saves use %Y%m%d%H%M%S stamps and embed ticker/strike/expiry/contract_type top-level."""
+    repo = DataRepository(cache_dir=tmp_path, history_dir=tmp_path / "data_history", status_probe=lambda: {"ok": True})
+    frame = pd.DataFrame(
+        {
+            "Strike": [580.0, 580.0],
+            "DaysToExpiry": [7.0, 30.0],
+            "Delta": [0.55, 0.52],
+        }
+    )
+    repo.save_to_cache(
+        "SPY",
+        frame,
+        metadata={
+            "ticker": "SPY",
+            "strike": 580.0,
+            "expiry": "2026-10-16",
+            "contract_type": "call",
+        },
+    )
+    stamp = repo.get_available_snapshots("SPY")[-1]
+    assert len(stamp) >= 14
+    assert stamp[:14].isdigit()
+    assert datetime.strptime(stamp[:14], "%Y%m%d%H%M%S")
+    path = Path(repo.get_historical_snapshots("SPY")[-1])
+    assert path.name.startswith("SPY_")
+    assert path.name.endswith(".json")
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert payload["ticker"] == "SPY"
+    assert payload["strike"] == 580.0
+    assert payload["expiry"] == "2026-10-16"
+    assert payload["contract_type"] == "Call"
+    assert isinstance(payload.get("metadata"), dict)
+    assert payload["metadata"]["strike"] == 580.0
+    assert payload["metadata"]["contract_type"] == "Call"
+    label = DataRepository.format_snapshot_label(payload, stamp)
+    assert label.startswith("SPY 580 Call 2026-10-16 @ ")
+    # Legacy / sparse payload still yields a usable fallback label.
+    assert DataRepository.format_snapshot_label({}, "20260101123045") == "20260101123045"
+    assert DataRepository.format_snapshot_label({"ticker": "QQQ"}, "2026-01-01_1230").startswith("QQQ @ ")
 
 
 def test_prepare_plotly_surface_xyz_reshape_and_axis_gate() -> None:
