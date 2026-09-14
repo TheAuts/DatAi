@@ -11,3 +11,5 @@ numpy>=1.24.0
 streamlit>=1.32.0
 plotly>=5.18.0
 yfinance>=0.2.40
+vaderSentiment>=3.3.2
+praw>=7.7.0

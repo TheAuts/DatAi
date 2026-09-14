@@ -19,6 +19,7 @@ Specialist roles (`.cursor/rules/*.mdc`):
 - ux — docstrings, tooltips, user-friendly labels
 - quant — Quant Strategist (Godlike Tier): HMM regime, Vanna/Volga, MC PoP/PoT (≥10k paths), Mathematician's Rule
 - council — Council of Experts: Momentum (GEX/velocity/reflexivity), Mean Reversion (IV Rank/percentile), Volatility Arb (Vanna/Volga/MC)
+- sentiment — Social Sentiment Specialist: Reddit + 4chan scan, VADER scoring, UOA/novelty flags, MC Sentiment Factor
 
 Institutional Tier readiness: compliance, perf, qa, and ux required alongside core roles.
 

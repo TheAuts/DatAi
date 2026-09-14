@@ -107,6 +107,7 @@ from quant_engine import (
     clip_confidence,
     compute_iv_rank_percentile,
     run_council_debate,
+    calculate_sentiment_alpha,
 )
 
 STANDARD = {"S": 100.0, "K": 100.0, "T": 1.0, "r": 0.05, "sigma": 0.2, "option_type": "call"}
@@ -1914,3 +1915,232 @@ def test_run_council_debate_empty_frame() -> None:
     for pred in out["predictions"]:
         assert pred["stance"] == STANCE_NEUTRAL
         assert 0.0 <= float(pred["confidence"]) <= 100.0
+
+
+# ---------------------------------------------------------------------------
+# Social Sentiment Specialist / Sentiment Lab
+# ---------------------------------------------------------------------------
+
+
+def test_normalize_compound_and_audit_sentiment_01() -> None:
+    from sentiment_engine import (
+        SENTIMENT_UNSTABLE_MSG,
+        audit_sentiment_normalized,
+        normalize_compound_to_01,
+    )
+
+    assert normalize_compound_to_01(-1.0) == pytest.approx(0.0)
+    assert normalize_compound_to_01(0.0) == pytest.approx(0.5)
+    assert normalize_compound_to_01(1.0) == pytest.approx(1.0)
+    assert normalize_compound_to_01(float("nan")) == pytest.approx(0.5)
+
+    ok = audit_sentiment_normalized([0.0, 0.5, 1.0])
+    assert ok["ok"] is True
+    assert ok["halt_render"] is False
+    assert np.all((ok["scores_01"] >= 0.0) & (ok["scores_01"] <= 1.0))
+
+    bad_nan = audit_sentiment_normalized([0.1, float("nan")])
+    assert bad_nan["ok"] is False
+    assert bad_nan["halt_render"] is True
+    assert bad_nan["message"] == SENTIMENT_UNSTABLE_MSG
+
+    bad_range = audit_sentiment_normalized([0.1, 1.5])
+    assert bad_range["ok"] is False
+    assert bad_range["halt_render"] is True
+
+    empty = audit_sentiment_normalized([])
+    assert empty["ok"] is False
+    assert empty["halt_render"] is True
+
+
+def test_filter_social_posts_drops_bots_and_low_karma() -> None:
+    from sentiment_engine import filter_social_posts, is_bot_like_author, stub_social_posts
+
+    assert is_bot_like_author("NewsBot", karma=5000) is True
+    assert is_bot_like_author("human_trader", karma=5) is True
+    assert is_bot_like_author("human_trader", karma=250) is False
+    assert is_bot_like_author("alice", karma=200, is_bot=True) is True
+
+    posts = stub_social_posts("SPY", n=8, seed=3)
+    filtered = filter_social_posts(posts)
+    authors = {str(p.get("author", "")).lower() for p in filtered}
+    assert "marketnewsbot" not in authors
+    assert "newbie42" not in authors
+    assert all(int(p.get("karma") or 0) >= 100 for p in filtered)
+    assert len(filtered) == 8
+
+
+def test_fourchan_filter_and_parse_catalog() -> None:
+    from sentiment_engine import (
+        configured_fourchan_boards,
+        filter_social_posts,
+        parse_fourchan_catalog,
+        stub_fourchan_posts,
+        text_mentions_ticker,
+    )
+
+    assert configured_fourchan_boards({"FOURCHAN_BOARDS": "biz, pol"}) == ("biz", "pol")
+    assert text_mentions_ticker("$SPY calls", "SPY") is True
+    assert text_mentions_ticker("SPYX noise", "SPY") is False
+
+    posts = stub_fourchan_posts("SPY", n=6, seed=2)
+    filtered = filter_social_posts(posts, ticker="SPY")
+    assert all(str(p.get("source")) == "4chan_stub" for p in filtered)
+    assert all(len(f"{p.get('title','')} {p.get('body','')}".strip()) >= 15 for p in filtered)
+    assert not any(bool(p.get("is_bot")) for p in filtered)
+    assert len(filtered) == 6
+
+    catalog = [
+        {
+            "threads": [
+                {
+                    "no": 1,
+                    "sub": "$SPY bullish",
+                    "com": "buying calls on SPY",
+                    "name": "Anonymous",
+                    "replies": 12,
+                    "time": 1700000000,
+                },
+                {
+                    "no": 2,
+                    "sub": "unrelated",
+                    "com": "no ticker here",
+                    "name": "Anonymous",
+                    "replies": 1,
+                    "time": 1700000001,
+                },
+                {
+                    "no": 3,
+                    "sub": "",
+                    "com": "QQQ dump incoming",
+                    "name": "Anonymous",
+                    "replies": 3,
+                    "time": 1700000002,
+                },
+            ]
+        }
+    ]
+    parsed = parse_fourchan_catalog(catalog, "SPY", board="biz", limit=20)
+    assert len(parsed) == 1
+    assert parsed[0]["source"] == "4chan"
+    assert parsed[0]["board"] == "biz"
+    assert "SPY" in parsed[0]["body"].upper() or "SPY" in parsed[0]["title"].upper()
+
+
+def test_fourchan_fetch_uses_mock_http_and_degrades() -> None:
+    import io
+    import json
+    from sentiment_engine import fetch_fourchan_posts, extract_ticker_sentiment
+
+    catalog = [
+        {
+            "threads": [
+                {
+                    "no": 99,
+                    "sub": "UOA",
+                    "com": "Unusual options activity in AAPL today",
+                    "name": "Anonymous",
+                    "replies": 8,
+                    "time": 1700000100,
+                }
+            ]
+        }
+    ]
+    payload = json.dumps(catalog).encode("utf-8")
+
+    class _Resp:
+        def read(self) -> bytes:
+            return payload
+
+        def __enter__(self) -> "_Resp":
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            return None
+
+    def _opener(req: object, timeout: float = 8.0) -> _Resp:  # noqa: ARG001
+        return _Resp()
+
+    live = fetch_fourchan_posts("AAPL", force_stub=False, boards=("biz",), opener=_opener)
+    assert live
+    assert all(p.get("source") == "4chan" for p in live)
+    assert any("AAPL" in f"{p.get('title')} {p.get('body')}" for p in live)
+
+    def _fail(req: object, timeout: float = 8.0):  # noqa: ARG001
+        raise OSError("network down")
+
+    stubbed = fetch_fourchan_posts("AAPL", force_stub=False, boards=("biz",), opener=_fail)
+    assert stubbed
+    assert all(str(p.get("source")) == "4chan_stub" for p in stubbed)
+
+    multi = extract_ticker_sentiment("AAPL", force_stub=True)
+    assert "reddit" in multi and "fourchan" in multi
+    assert "sources" in multi
+    assert 0.0 <= float(multi["score_01"]) <= 1.0
+    assert 0.0 <= float(multi["reddit"]["score_01"]) <= 1.0
+    assert 0.0 <= float(multi["fourchan"]["score_01"]) <= 1.0
+    assert int(multi["mention_count"]) == int(multi["reddit"]["mention_count"]) + int(
+        multi["fourchan"]["mention_count"]
+    )
+
+
+def test_calculate_sentiment_alpha_shape_and_bounds() -> None:
+    out = calculate_sentiment_alpha("SPY", force_stub=True)
+    assert out["ok"] is True
+    assert out["ticker"] == "SPY"
+    assert 0.0 <= float(out["score_01"]) <= 1.0
+    assert 0.0 <= float(out["alpha_01"]) <= 1.0
+    assert 0.0 <= float(out["buzz"]) <= 1.0
+    scores = np.asarray(out["scores_01"], dtype=float)
+    assert scores.ndim == 1 and scores.size >= 1
+    assert np.all((scores >= 0.0) & (scores <= 1.0))
+    assert out["audit"]["ok"] is True
+    assert out["audit"]["halt_render"] is False
+    factor = out["sentiment_factor"]
+    assert 0.0 <= float(factor["sentiment_factor"]) <= 1.0
+    assert "drift_bias" in factor and "vol_mult" in factor
+    assert out["chart_sentiment"].shape[0] == out["chart_realized_vol"].shape[0]
+    assert "reddit" in out and "fourchan" in out
+    assert 0.0 <= float(out["reddit"]["score_01"]) <= 1.0
+    assert 0.0 <= float(out["fourchan"]["score_01"]) <= 1.0
+
+    injected = calculate_sentiment_alpha(
+        "QQQ",
+        sentiment_scores=[0.2, 0.4, 0.6, 0.8],
+        prices=np.linspace(100.0, 110.0, 20),
+        force_stub=True,
+    )
+    assert injected["ok"] is True
+    assert 0.0 <= float(injected["alpha_01"]) <= 1.0
+    assert injected["source"] == "injected"
+
+
+def test_sentiment_factor_wires_into_montecarlo() -> None:
+    from quant_engine import evaluate_position_montecarlo, sentiment_factor_for_montecarlo
+
+    factor = sentiment_factor_for_montecarlo(0.9)
+    assert factor["vol_mult"] < 1.0
+    assert factor["drift_bias"] > 0.0
+    base = evaluate_position_montecarlo(
+        100.0,
+        90.0,
+        sigma=0.25,
+        time_years=10.0 / 252.0,
+        n_paths=MC_MIN_PATHS,
+        seed=11,
+    )
+    tilted = evaluate_position_montecarlo(
+        100.0,
+        90.0,
+        sigma=0.25,
+        time_years=10.0 / 252.0,
+        n_paths=MC_MIN_PATHS,
+        seed=11,
+        sentiment_factor=0.9,
+    )
+    assert tilted["sentiment_factor"] == pytest.approx(0.9)
+    assert tilted["sigma_effective"] == pytest.approx(0.25 * factor["vol_mult"])
+    assert tilted["rate_effective"] == pytest.approx(factor["drift_bias"])
+    assert 0.0 <= float(tilted["pop"]) <= 1.0
+    assert 0.0 <= float(tilted["pot"]) <= 1.0
+    assert int(base["n_paths"]) >= MC_MIN_PATHS
