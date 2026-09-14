@@ -734,3 +734,35 @@ def test_generate_greek_curve_uses_injected_repo() -> None:
     frame = generate_greek_curve("QQQ", 100.0, 1.0, [100.0], repo=repo)
     assert repo.calls == [("QQQ", 1.0)]
     assert "Gamma" in frame.columns
+
+
+def test_fetch_option_chain_live_uses_expiration_omits_date(monkeypatch) -> None:
+    """Live/future chain: MarketData query includes ``expiration`` and omits ``date``."""
+    import data_ingestion as ingest
+
+    monkeypatch.setenv("MARKETDATA_API_KEY", "test-token")
+    captured: dict[str, Any] = {}
+
+    def _fake_get(path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+        captured["path"] = path
+        captured["params"] = dict(params or {})
+        return {"s": "no_data"}
+
+    monkeypatch.setattr(ingest, "_marketdata_get", _fake_get)
+    frame = ingest.fetch_option_chain("SPY", expiration="2026-10-16")
+    assert frame.empty
+    assert captured["params"].get("expiration") == "2026-10-16"
+    assert "date" not in captured["params"]
+    assert "date=" not in str(captured["path"])
+
+    # Positional ``expiry`` alias still maps to the same query param.
+    captured.clear()
+    ingest.fetch_option_chain("SPY", "2026-12-18")
+    assert captured["params"].get("expiration") == "2026-12-18"
+    assert "date=" not in str(captured["path"])
+
+    # Historical EOD keeps ``date=`` on the path while still sending expiration.
+    captured.clear()
+    ingest.fetch_option_chain("SPY", expiration="2026-10-16", date="2025-06-01")
+    assert captured["params"].get("expiration") == "2026-10-16"
+    assert "date=2025-06-01" in str(captured["path"])

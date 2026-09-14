@@ -402,10 +402,24 @@ def _historical_date_iso() -> str | None:
     return None
 
 
+def _expiry_to_iso(expiry: Any) -> str | None:
+    """Normalize sidebar expiry (date / ISO string) to ``YYYY-MM-DD`` for API ``expiration``."""
+    if expiry is None:
+        return None
+    if isinstance(expiry, date):
+        return expiry.isoformat()
+    text = str(expiry).strip()[:10]
+    try:
+        return date.fromisoformat(text).isoformat()
+    except ValueError:
+        return None
+
+
 def _repo_chain(ticker: str, expiry: Any = None) -> pd.DataFrame:
     repo = _get_repo()
     symbol = str(ticker or "").strip().upper()
     as_of = _historical_date_iso()
+    expiration = _expiry_to_iso(expiry)
     try:
         health = repo.verify_connection("SPY")
         if isinstance(health, dict) and health.get("token_missing"):
@@ -418,9 +432,24 @@ def _repo_chain(ticker: str, expiry: Any = None) -> pd.DataFrame:
         pass
     try:
         if as_of:
-            frame = repo.get_data(symbol, expiry, date=as_of)
+            # Historical EOD: keep ``date`` path; still forward selected expiration when set.
+            frame = repo.get_data(symbol, expiration, date=as_of)
         else:
-            frame = repo.get_data(symbol, expiry)
+            # Live/future: pass expiration through so MarketData gets ``?expiration=``.
+            frame = repo.get_data(symbol, expiration)
+            # Empty future expiry → warn and show next available monthly (no expiration filter).
+            from data_ingestion import is_mock_frame
+
+            if (
+                expiration
+                and isinstance(frame, pd.DataFrame)
+                and frame.empty
+                and not is_mock_frame(frame)
+            ):
+                st.warning(
+                    "No contracts found for this expiry. Trying next available monthly expiry..."
+                )
+                frame = repo.get_data(symbol)
     except Exception as exc:
         from data_ingestion import mock_option_chain
 
@@ -467,8 +496,12 @@ def _fresh_chain_for_snapshot(symbol: str, expiry: Any = None) -> pd.DataFrame:
                 pass
     frame = pd.DataFrame()
     as_of = _historical_date_iso()
+    expiration = _expiry_to_iso(expiry)
     try:
-        frame = repo._fetch(symbol, expiry, date=as_of) if as_of else repo._fetch(symbol, expiry)
+        if as_of:
+            frame = repo._fetch(symbol, expiration, date=as_of)
+        else:
+            frame = repo._fetch(symbol, expiration)
     except Exception:
         frame = pd.DataFrame()
     if not isinstance(frame, pd.DataFrame) or frame.empty:

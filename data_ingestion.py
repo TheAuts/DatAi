@@ -388,14 +388,25 @@ def _with_date_query(path: str, date: str | None) -> str:
     return f"{path}{separator}date={text}"
 
 
-def fetch_option_chain(ticker: str, expiry: Any = None, date: str | None = None) -> pd.DataFrame:
+def fetch_option_chain(
+    ticker: str,
+    expiry: Any = None,
+    date: str | None = None,
+    *,
+    expiration: Any = None,
+) -> pd.DataFrame:
     """Fetch the MarketData.app options chain for ``ticker``.
 
     Args:
         ticker: Underlying symbol.
-        expiry: Optional ``YYYY-MM-DD``. If omitted, the API returns the next monthly expiry.
+        expiry: Optional ``YYYY-MM-DD`` (legacy positional alias for ``expiration``).
         date: Optional ``YYYY-MM-DD``. When given, requests the historical end-of-day
             chain as of that date (``?date=`` query parameter) instead of live data.
+            Omitted for current/future live chain fetches — only ``expiration`` is sent.
+        expiration: Optional ``YYYY-MM-DD`` contract expiry filter. Prefer this over
+            ``expiry``. Mapped to the MarketData ``expiration`` query param
+            (e.g. ``&expiration=2026-10-16``). If omitted, the API returns the next
+            monthly expiry.
 
     Returns:
         DataFrame with strike, expiration, bid, ask, underlyingPrice, plus S/K/T/sigma.
@@ -416,11 +427,14 @@ def fetch_option_chain(ticker: str, expiry: Any = None, date: str | None = None)
         return mock_option_chain(symbol, token_missing=True, message="API Token Missing")
 
     params: dict[str, Any] = {}
-    expiry_iso = _expiry_iso(expiry)
+    # ``expiration`` wins when both are provided; ``expiry`` remains a positional alias.
+    expiry_iso = _expiry_iso(expiration if expiration is not None else expiry)
     if expiry_iso:
         params["expiration"] = expiry_iso
 
-    path = _with_date_query(CHAIN_PATH.format(symbol=symbol), _expiry_iso(date) if date else None)
+    # Live/future: path has no ``date=``. Historical EOD: append ``?date=`` only.
+    hist_iso = _expiry_iso(date) if date else None
+    path = _with_date_query(CHAIN_PATH.format(symbol=symbol), hist_iso)
     try:
         payload = _marketdata_get(path, params)
     except Exception as exc:

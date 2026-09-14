@@ -1696,7 +1696,20 @@ class DataRepository:
         if self.is_fresh(ticker):
             payload = self._read_payload(ticker) or {}
             records = payload.get("data") or []
-            return pd.DataFrame(records)
+            cached = pd.DataFrame(records)
+            if expiry is None:
+                return cached
+            # Specific expiration requested: reuse cache only when it contains that expiry.
+            if not cached.empty and "expiration" in cached.columns:
+                want = str(expiry).strip()[:10]
+                matched = cached[
+                    cached["expiration"].astype(str).str.slice(0, 10) == want
+                ]
+                if not matched.empty:
+                    return matched
+                # Different expiry in cache — fall through to live fetch with expiration.
+            else:
+                return cached
         frame = self._fetch(ticker, expiry)
         if isinstance(frame, pd.DataFrame) and not frame.empty and not self._frame_is_mock(frame):
             self.save_to_cache(ticker, frame)
@@ -1934,7 +1947,16 @@ class DataRepository:
         if self._fetcher is not None:
             try:
                 # Only forward ``date`` when set so two-argument fetchers keep working.
-                frame = self._fetcher(ticker, expiry, date=date) if date else self._fetcher(ticker, expiry)
+                # Prefer ``expiration=`` for live/future so MarketData gets the right filter.
+                if date:
+                    frame = self._fetcher(ticker, expiry, date=date)
+                elif expiry is not None:
+                    try:
+                        frame = self._fetcher(ticker, expiration=expiry)
+                    except TypeError:
+                        frame = self._fetcher(ticker, expiry)
+                else:
+                    frame = self._fetcher(ticker, expiry)
             except Exception as exc:
                 _LOG.warning("DataRepository fetch failed ticker=%s expiry=%s error=%s", ticker, expiry, exc)
                 return self._mock_on_failure(ticker, message=str(exc))
@@ -1953,7 +1975,13 @@ class DataRepository:
         try:
             from data_ingestion import fetch_option_chain
 
-            frame = fetch_option_chain(ticker, expiry, date=date) if date else fetch_option_chain(ticker, expiry)
+            # Live/future: pass ``expiration`` only (no historical ``date``).
+            if date:
+                frame = fetch_option_chain(ticker, expiry, date=date)
+            elif expiry is not None:
+                frame = fetch_option_chain(ticker, expiration=expiry)
+            else:
+                frame = fetch_option_chain(ticker)
         except Exception as exc:
             _LOG.warning("DataRepository fetch failed ticker=%s expiry=%s error=%s", ticker, expiry, exc)
             return self._mock_on_failure(ticker, message=str(exc))
