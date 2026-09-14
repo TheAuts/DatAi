@@ -110,6 +110,49 @@ def prepare_plotly_surface_xyz(
     return z2d.astype(float, copy=False), None, None, warning
 
 
+def reshape_to_surface(data_array: Any) -> np.ndarray:
+    """Force ``float64`` and reshape flat/1D data to a 2D surface grid.
+
+    - Already 2D → ``float64`` copy (rectangular grids preserved).
+    - 1D perfect square → ``(n, n)`` with ``n = int(sqrt(len))``.
+    - 1D non-square → pad with the array median up to ``ceil(sqrt(len))**2``.
+    - Empty / invalid → ``(0, 0)`` ``float64`` (never raises on bad input).
+    """
+    try:
+        if data_array is None:
+            return np.empty((0, 0), dtype=np.float64)
+        if isinstance(data_array, (list, tuple)):
+            coerced = [np.nan if v is None else v for v in data_array]
+            raw = np.asarray(coerced, dtype=np.float64)
+        else:
+            raw = np.asarray(data_array, dtype=np.float64)
+    except (TypeError, ValueError):
+        return np.empty((0, 0), dtype=np.float64)
+
+    if raw.size == 0:
+        return np.empty((0, 0), dtype=np.float64)
+
+    if raw.ndim == 2:
+        return np.array(raw, dtype=np.float64, copy=True)
+
+    flat = np.array(raw.reshape(-1), dtype=np.float64, copy=True)
+    n_els = int(flat.size)
+    n = int(np.sqrt(n_els))
+    if n > 0 and n * n == n_els:
+        return flat.reshape(n, n).copy()
+
+    n = int(np.ceil(np.sqrt(float(n_els))))
+    if n <= 0:
+        return np.empty((0, 0), dtype=np.float64)
+    target = n * n
+    finite = flat[np.isfinite(flat)]
+    pad_val = float(np.median(finite)) if finite.size else 0.0
+    padded = np.empty(target, dtype=np.float64)
+    padded[:n_els] = flat
+    padded[n_els:] = pad_val
+    return padded.reshape(n, n).copy()
+
+
 def minmax_normalize_01(values: Any) -> np.ndarray:
     """Min-max normalize ``values`` to ``[0, 1]`` independently.
 
@@ -405,7 +448,8 @@ def generate_integrated_risk_surface(
     else:
         opacityscale = [[0.0, 1.0], [1.0, 1.0]]
 
-    z2d, x_ok, y_ok, _warning = prepare_plotly_surface_xyz(vol_n, x_axis, y_axis)
+    z_surface = reshape_to_surface(vol_n)
+    z2d, x_ok, y_ok, _warning = prepare_plotly_surface_xyz(z_surface, x_axis, y_axis)
     color_title = "GEX (Δ-opacity)"
     if not include_gamma and not include_delta:
         color_title = "Neutral"
@@ -413,9 +457,15 @@ def generate_integrated_risk_surface(
         color_title = "Δ-opacity"
     elif not include_delta:
         color_title = "GEX"
+    # surfacecolor must match z after reshape / axis gate.
+    color_grid = reshape_to_surface(encoded)
+    if color_grid.shape != z2d.shape:
+        color_grid = np.array(encoded, dtype=np.float64, copy=True)
+        if color_grid.shape != z2d.shape and color_grid.size == z2d.size:
+            color_grid = color_grid.reshape(z2d.shape)
     payload: dict[str, Any] = {
         "z": np.array(z2d, dtype=np.float64, copy=True),
-        "surfacecolor": np.array(encoded, dtype=np.float64, copy=True),
+        "surfacecolor": np.array(color_grid, dtype=np.float64, copy=True),
         "cmin": 0.0,
         "cmax": 1.0,
         "colorscale": colorscale,

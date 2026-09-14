@@ -32,6 +32,7 @@ from quant_engine import (
     MODEL_HESTON,
     DataRepository,
     prepare_plotly_surface_xyz,
+    reshape_to_surface,
     analyze_event_outlook,
     analyze_gex_outlook,
     analyze_market_sentiment,
@@ -1930,38 +1931,42 @@ def render_delta_term_structure(frame: pd.DataFrame) -> None:
 
 def render_integrated_risk_surface(surface: go.Surface) -> None:
     """Plot a single Total Risk Profile ``go.Surface`` (Integrated Risk View)."""
-    z = getattr(surface, "z", None)
-    arr = np.asarray(z if z is not None else [], dtype=float)
-    if arr.size == 0 or not np.any(np.isfinite(arr)):
-        st.info("No integrated risk surface data to plot.")
-        return
-    fig = go.Figure(data=[surface])
-    fig.update_layout(
-        template="plotly_dark",
-        paper_bgcolor=DARK_BG,
-        font={"color": TEXT},
-        height=560,
-        title={"text": "Total Risk Profile", "x": 0.0, "xanchor": "left"},
-        scene={
-            "xaxis_title": "Price",
-            "yaxis_title": "Days to Expiry",
-            "zaxis_title": "Volatility (norm)",
-            "bgcolor": PANEL_BG,
-            "dragmode": "orbit",
-        },
-        margin={"l": 8, "r": 8, "t": 48, "b": 8},
-        uirevision="integrated-risk-surface",
-    )
-    st.caption(
-        "Z = normalized Volatility · color = GEX (normalized Gamma) · "
-        "opacity = normalized |Delta| (ghost at low delta)."
-    )
-    st.plotly_chart(
-        fig,
-        use_container_width=True,
-        config={"displayModeBar": True, "scrollZoom": True},
-        key="integrated-risk-surface-chart",
-    )
+    try:
+        raw = getattr(surface, "z", None)
+        z_data = reshape_to_surface(raw if raw is not None else [])
+        if z_data.ndim != 2 or z_data.size == 0 or not np.any(np.isfinite(z_data)):
+            st.info("No integrated risk surface data to plot.")
+            return
+        surface.update(z=z_data)
+        fig = go.Figure(data=[surface])
+        fig.update_layout(
+            template="plotly_dark",
+            paper_bgcolor=DARK_BG,
+            font={"color": TEXT},
+            height=560,
+            title={"text": "Total Risk Profile", "x": 0.0, "xanchor": "left"},
+            scene={
+                "xaxis_title": "Price",
+                "yaxis_title": "Days to Expiry",
+                "zaxis_title": "Volatility (norm)",
+                "bgcolor": PANEL_BG,
+                "dragmode": "orbit",
+            },
+            margin={"l": 8, "r": 8, "t": 48, "b": 8},
+            uirevision="integrated-risk-surface",
+        )
+        st.caption(
+            "Z = normalized Volatility · color = GEX (normalized Gamma) · "
+            "opacity = normalized |Delta| (ghost at low delta)."
+        )
+        st.plotly_chart(
+            fig,
+            use_container_width=True,
+            config={"displayModeBar": True, "scrollZoom": True},
+            key="integrated-risk-surface-chart",
+        )
+    except Exception:
+        st.error("Surface rendering failed: Invalid data shape.")
 
 
 def _build_integrated_risk_frame(
@@ -2598,15 +2603,24 @@ def _plotly_surface(
     cols: int | None = None,
     **surface_kwargs: Any,
 ) -> go.Surface:
-    """Build ``go.Surface`` with 2D ``z`` and gated ``x``/``y`` axes."""
-    z2d, x_ok, y_ok, warning = prepare_plotly_surface_xyz(z_data, x, y, rows=rows, cols=cols)
-    if warning:
-        st.warning(warning)
-    payload: dict[str, Any] = {"z": z2d, **surface_kwargs}
-    if x_ok is not None and y_ok is not None:
-        payload["x"] = x_ok
-        payload["y"] = y_ok
-    return go.Surface(**payload)
+    """Build ``go.Surface`` with 2D ``z`` via ``reshape_to_surface`` + axis gate."""
+    try:
+        z_data = reshape_to_surface(z_data)
+        if z_data.ndim != 2 or z_data.size == 0:
+            raise ValueError("invalid surface shape")
+        z2d, x_ok, y_ok, warning = prepare_plotly_surface_xyz(z_data, x, y, rows=rows, cols=cols)
+        if z2d.ndim != 2 or z2d.size == 0:
+            raise ValueError("invalid surface shape")
+        if warning:
+            st.warning(warning)
+        payload: dict[str, Any] = {"z": z2d, **surface_kwargs}
+        if x_ok is not None and y_ok is not None:
+            payload["x"] = x_ok
+            payload["y"] = y_ok
+        return go.Surface(**payload)
+    except Exception:
+        st.error("Surface rendering failed: Invalid data shape.")
+        return go.Surface(z=np.array([[np.nan]], dtype=np.float64))
 
 
 def _snapshot_ui_metadata(payload: Mapping[str, Any] | None, stamp: str) -> dict[str, Any]:
@@ -2707,10 +2721,17 @@ def render_delta_drift_surface(
         st.info("No real drift detected. Showing synthetic test surface.")
     Z = Z.astype(float)
     Z[~np.isfinite(Z)] = np.nan
-    z2d, _, _, _ = prepare_plotly_surface_xyz(Z, x_axis, y_axis)
-    if z2d.ndim != 2 or not np.isfinite(z2d).any():
-        st.write(f"Z-matrix shape: {z2d.shape}")
-        st.error("Delta drift Z-matrix is not a 2D grid or contains no finite values; refusing to render a flat plane.")
+    try:
+        z_data = reshape_to_surface(Z)
+        if z_data.ndim != 2 or z_data.size == 0:
+            raise ValueError("invalid surface shape")
+        z2d, _, _, _ = prepare_plotly_surface_xyz(z_data, x_axis, y_axis)
+        if z2d.ndim != 2 or not np.isfinite(z2d).any():
+            st.write(f"Z-matrix shape: {z2d.shape}")
+            st.error("Delta drift Z-matrix is not a 2D grid or contains no finite values; refusing to render a flat plane.")
+            return
+    except Exception:
+        st.error("Surface rendering failed: Invalid data shape.")
         return
     z_min, z_max = float(np.nanmin(z2d)), float(np.nanmax(z2d))
     st.write(f"Z-matrix shape: {z2d.shape}, Min: {z_min}, Max: {z_max}")
@@ -2784,28 +2805,31 @@ def render_time_machine_vol_surface(frame: pd.DataFrame | str, timestamp: str) -
     _mesh_x, _mesh_y = np.meshgrid(x_axis, y_axis)
     z = np.array(pivot.to_numpy(dtype=float), copy=True)
     z[~np.isfinite(z)] = np.nan
-    z2d, x_ok, y_ok, axis_warning = prepare_plotly_surface_xyz(
-        z, x_axis, y_axis, rows=_mesh_y.shape[0], cols=_mesh_x.shape[1]
-    )
-    if z2d.ndim != 2:
-        st.error("Volatility surface data is not in the expected 2D format.")
+    try:
+        z_data = reshape_to_surface(z)
+        if z_data.ndim != 2 or z_data.size == 0:
+            raise ValueError("invalid surface shape")
+        z2d, x_ok, y_ok, axis_warning = prepare_plotly_surface_xyz(
+            z_data, x_axis, y_axis, rows=_mesh_y.shape[0], cols=_mesh_x.shape[1]
+        )
+        if z2d.ndim != 2 or z2d.size == 0:
+            raise ValueError("invalid surface shape")
+        if not np.isfinite(z2d).any():
+            st.warning("No data available for the Volatility Surface.")
+            return
+        if axis_warning:
+            st.warning(axis_warning)
+        st.write(f"IV Z-matrix shape: {z2d.shape}, Min: {np.nanmin(z2d)}, Max: {np.nanmax(z2d)}")
+        surface_kwargs: dict[str, Any] = {
+            "colorscale": "Viridis",
+            "colorbar": {"title": "IV"},
+            "hovertemplate": "Strike=%{x:.2f}<br>DTE=%{y:.1f}<br>IV=%{z:.4f}<extra></extra>",
+        }
+        # Axes gated inside _plotly_surface (reshape already applied).
+        surface_trace = _plotly_surface(z2d, x_ok if x_ok is not None else x_axis, y_ok if y_ok is not None else y_axis, **surface_kwargs)
+    except Exception:
+        st.error("Surface rendering failed: Invalid data shape.")
         return
-    if z2d.size == 0 or not np.isfinite(z2d).any():
-        st.warning("No data available for the Volatility Surface.")
-        return
-    if axis_warning:
-        st.warning(axis_warning)
-    st.write(f"IV Z-matrix shape: {z2d.shape}, Min: {np.nanmin(z2d)}, Max: {np.nanmax(z2d)}")
-    surface_kwargs: dict[str, Any] = {
-        "colorscale": "Viridis",
-        "colorbar": {"title": "IV"},
-        "hovertemplate": "Strike=%{x:.2f}<br>DTE=%{y:.1f}<br>IV=%{z:.4f}<extra></extra>",
-    }
-    # Pass 1D axes only when they match z shape; otherwise omit (Plotly index fallback).
-    if x_ok is not None and y_ok is not None and len(y_ok) == z2d.shape[0] and len(x_ok) == z2d.shape[1]:
-        surface_trace = go.Surface(z=z2d, x=x_ok, y=y_ok, **surface_kwargs)
-    else:
-        surface_trace = go.Surface(z=z2d, **surface_kwargs)
     fig = go.Figure(data=[surface_trace])
     fig.update_layout(
         template="plotly_dark",
@@ -3975,33 +3999,36 @@ def event_impact_render_shock_surface(result: Mapping[str, Any]) -> None:
     """Plotly ``go.Surface`` for Shock Surface with RdBu colorscale."""
     if not result or not result.get("ok"):
         return
-    z = np.asarray(result.get("shock_z"), dtype=float)
-    x = np.asarray(result.get("strike_axis"), dtype=float)
-    y = np.asarray(result.get("dte_axis"), dtype=float)
-    if z.size == 0 or x.size == 0 or y.size == 0:
-        st.warning("Shock surface is empty.")
+    try:
+        z_data = reshape_to_surface(result.get("shock_z"))
+        if z_data.ndim != 2 or z_data.size == 0:
+            raise ValueError("invalid surface shape")
+        x = np.asarray(result.get("strike_axis"), dtype=float)
+        y = np.asarray(result.get("dte_axis"), dtype=float)
+        if z_data.size == 0 or x.size == 0 or y.size == 0:
+            st.warning("Shock surface is empty.")
+            return
+        finite = z_data[np.isfinite(z_data)]
+        if finite.size == 0:
+            st.warning("Shock surface has no finite values.")
+            return
+        zmax = float(np.max(np.abs(finite)))
+        if zmax <= 0:
+            zmax = 1e-6
+        surface_trace = _plotly_surface(
+            z_data,
+            x,
+            y,
+            colorscale="RdBu",
+            cmin=-zmax,
+            cmax=zmax,
+            colorbar={"title": "ΔΔ"},
+            hovertemplate="Strike=%{x:.2f}<br>DTE=%{y:.1f}<br>Shock=%{z:.6f}<extra></extra>",
+        )
+    except Exception:
+        st.error("Surface rendering failed: Invalid data shape.")
         return
-    finite = z[np.isfinite(z)]
-    if finite.size == 0:
-        st.warning("Shock surface has no finite values.")
-        return
-    zmax = float(np.max(np.abs(finite)))
-    if zmax <= 0:
-        zmax = 1e-6
-    fig = go.Figure(
-        data=[
-            go.Surface(
-                z=z,
-                x=x,
-                y=y,
-                colorscale="RdBu",
-                cmin=-zmax,
-                cmax=zmax,
-                colorbar={"title": "ΔΔ"},
-                hovertemplate="Strike=%{x:.2f}<br>DTE=%{y:.1f}<br>Shock=%{z:.6f}<extra></extra>",
-            )
-        ]
-    )
+    fig = go.Figure(data=[surface_trace])
     fig.update_layout(
         template="plotly_dark",
         paper_bgcolor=DARK_BG,
@@ -4137,43 +4164,51 @@ def liquidation_waterfall_cached(ticker: str) -> dict[str, Any]:
 
 
 def liquidation_waterfall_build_heatmap(surface: Mapping[str, Any]) -> go.Figure:
-    """``go.Heatmap``: X=Price, Y=Time/Expiry, Z=cascade score (Liquidation Zones bright red)."""
+    """3D cascade surface: X=Price, Y=Time/Expiry, Z=cascade score (Liquidation Zones)."""
     price = np.asarray(surface.get("price_axis"), dtype=float)
     expiry = np.asarray(surface.get("expiry_axis"), dtype=float)
-    cascade = np.asarray(surface.get("cascade_z"), dtype=float)
-    if price.size == 0 or expiry.size == 0 or cascade.size == 0:
-        return go.Figure()
-    colorscale = [
-        [0.0, "#0d1b2a"],
-        [0.35, "#1b4332"],
-        [0.55, "#ca6702"],
-        [0.75, "#e63946"],
-        [1.0, "#ff1744"],
-    ]
-    fig = go.Figure(
-        data=[
-            go.Heatmap(
-                x=price,
-                y=expiry,
-                z=cascade,
-                colorscale=colorscale,
-                zmin=0.0,
-                zmax=1.0,
-                colorbar={"title": "Cascade"},
-                hovertemplate=(
-                    "Price=%{x:.2f}<br>DTE=%{y:.1f}<br>Cascade=%{z:.3f}<extra></extra>"
-                ),
-            )
+    try:
+        z_data = reshape_to_surface(surface.get("cascade_z"))
+        if z_data.ndim != 2 or z_data.size == 0:
+            raise ValueError("invalid surface shape")
+        if price.size == 0 or expiry.size == 0:
+            return go.Figure()
+        colorscale = [
+            [0.0, "#0d1b2a"],
+            [0.35, "#1b4332"],
+            [0.55, "#ca6702"],
+            [0.75, "#e63946"],
+            [1.0, "#ff1744"],
         ]
-    )
+        surface_trace = _plotly_surface(
+            z_data,
+            price,
+            expiry,
+            colorscale=colorscale,
+            cmin=0.0,
+            cmax=1.0,
+            colorbar={"title": "Cascade"},
+            hovertemplate=(
+                "Price=%{x:.2f}<br>DTE=%{y:.1f}<br>Cascade=%{z:.3f}<extra></extra>"
+            ),
+        )
+    except Exception:
+        st.error("Surface rendering failed: Invalid data shape.")
+        return go.Figure()
+    fig = go.Figure(data=[surface_trace])
     fig.update_layout(
         template="plotly_dark",
         paper_bgcolor=DARK_BG,
         font={"color": TEXT},
         height=520,
-        title={"text": "Liquidation Waterfall — GEX Cascade Heatmap", "x": 0.0, "xanchor": "left"},
-        xaxis_title="Price",
-        yaxis_title="Time / Expiry (DTE)",
+        title={"text": "Liquidation Waterfall — GEX Cascade Surface", "x": 0.0, "xanchor": "left"},
+        scene={
+            "xaxis_title": "Price",
+            "yaxis_title": "Time / Expiry (DTE)",
+            "zaxis_title": "Cascade",
+            "bgcolor": PANEL_BG,
+            "dragmode": "orbit",
+        },
         margin={"l": 48, "r": 24, "t": 48, "b": 48},
         uirevision="liquidation-waterfall-heatmap",
     )
@@ -4915,16 +4950,23 @@ def build_market_timelapse_figure(frames: list[dict[str, Any]]) -> go.Figure:
     first = frames[0]
 
     def _surface(item: dict[str, Any]) -> go.Surface:
-        return go.Surface(
-            z=item["z"],
-            x=item["x"],
-            y=item["y"],
-            cmin=z_min,
-            cmax=z_max,
-            colorscale="Viridis",
-            colorbar={"title": "Delta"},
-            hovertemplate="Strike=%{x:.2f}<br>DTE=%{y:.1f}<br>Delta=%{z:.4f}<extra></extra>",
-        )
+        try:
+            z_data = reshape_to_surface(item["z"])
+            if z_data.ndim != 2 or z_data.size == 0:
+                raise ValueError("invalid surface shape")
+            return _plotly_surface(
+                z_data,
+                item["x"],
+                item["y"],
+                cmin=z_min,
+                cmax=z_max,
+                colorscale="Viridis",
+                colorbar={"title": "Delta"},
+                hovertemplate="Strike=%{x:.2f}<br>DTE=%{y:.1f}<br>Delta=%{z:.4f}<extra></extra>",
+            )
+        except Exception:
+            st.error("Surface rendering failed: Invalid data shape.")
+            return go.Surface(z=np.array([[np.nan]], dtype=np.float64))
 
     fig = go.Figure(data=[_surface(first)])
     fig.frames = [
