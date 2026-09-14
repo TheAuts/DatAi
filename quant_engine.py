@@ -829,6 +829,10 @@ def prefill_drift_data(
     start_payload = repository._payload_from_data(symbol, frame)
     start_payload["stamp"] = start_stamp
     start_payload["metadata"] = dict(metadata)
+    for key in DataRepository.CONTRACT_TOP_LEVEL_KEYS:
+        value = metadata.get(key)
+        if value is not None:
+            start_payload[key] = value
     start_payload["snapshot_id"] = uuid.uuid4().hex
     start_payload["saved_at"] = time.time()
 
@@ -841,6 +845,10 @@ def prefill_drift_data(
     )
     end_payload["stamp"] = end_stamp
     end_payload["metadata"] = dict(metadata)
+    for key in DataRepository.CONTRACT_TOP_LEVEL_KEYS:
+        value = metadata.get(key)
+        if value is not None:
+            end_payload[key] = value
     end_payload["snapshot_id"] = uuid.uuid4().hex
     end_payload["saved_at"] = time.time() + 1e-3
 
@@ -912,8 +920,9 @@ class DataRepository:
         return self.cache_dir / f"{self._safe_ticker(ticker)}.json"
 
     def _history_stamp(self, when: datetime | None = None) -> str:
-        moment = when or datetime.now(timezone.utc)
-        return moment.strftime("%Y-%m-%d_%H%M")
+        """Second-resolution stamp for unique snapshot filenames (``%Y%m%d%H%M%S``)."""
+        moment = when or datetime.now()
+        return moment.strftime("%Y%m%d%H%M%S")
 
     def _history_path(self, ticker: str, stamp: str | None = None) -> Path:
         label = stamp or self._history_stamp()
@@ -926,12 +935,24 @@ class DataRepository:
             path = Path(self.history_dir) / os.path.basename(joined)
         return path
 
+    CONTRACT_TOP_LEVEL_KEYS: tuple[str, ...] = ("ticker", "strike", "expiry", "contract_type")
+
+    def _embed_contract_fields(self, payload: dict[str, Any], metadata: Mapping[str, Any] | None) -> None:
+        """Write contract fields to nested ``metadata`` and matching top-level keys."""
+        if not metadata:
+            return
+        normalized = self._normalize_metadata(str(payload.get("ticker") or ""), metadata)
+        payload["metadata"] = normalized
+        for key in self.CONTRACT_TOP_LEVEL_KEYS:
+            value = normalized.get(key)
+            if value is not None:
+                payload[key] = value
+
     def save_to_cache(self, ticker: str, data: Any, metadata: Mapping[str, Any] | None = None) -> Path:
         os.makedirs("data_history", exist_ok=True)
         os.makedirs(self.history_dir, exist_ok=True)
         payload = self._payload_from_data(ticker, data)
-        if metadata:
-            payload["metadata"] = self._normalize_metadata(ticker, metadata)
+        self._embed_contract_fields(payload, metadata)
         # Mandatory: every computed surface must exist (actually computed from the
         # raw chain, not defaulted) before anything is written to disk.
         frame = self._records_to_frame(payload.get("data"))
@@ -958,7 +979,18 @@ class DataRepository:
         print(f"Successfully saved {saved_keys} to snapshot.")
         return live if live else history
 
-    METADATA_KEYS: tuple[str, ...] = ("ticker", "strike", "expiry", "as_of_date")
+    METADATA_KEYS: tuple[str, ...] = ("ticker", "strike", "expiry", "contract_type", "as_of_date")
+
+    @staticmethod
+    def _normalize_contract_type(value: Any) -> str | None:
+        if value is None or value == "":
+            return None
+        text = str(value).strip().lower()
+        if text.startswith("c"):
+            return "Call"
+        if text.startswith("p"):
+            return "Put"
+        return None
 
     def _normalize_metadata(self, ticker: str, metadata: Mapping[str, Any]) -> dict[str, Any]:
         out: dict[str, Any] = {key: None for key in self.METADATA_KEYS}
@@ -973,7 +1005,61 @@ class DataRepository:
             if value is None or value == "":
                 continue
             out[key] = value.isoformat() if isinstance(value, (date, datetime)) else str(value).strip()[:10]
+        out["contract_type"] = self._normalize_contract_type(
+            metadata.get("contract_type") if metadata.get("contract_type") not in (None, "") else metadata.get("option_type")
+        )
         return out
+
+    @classmethod
+    def format_snapshot_label(cls, payload: Any, stamp: str | None = None) -> str:
+        """Human label like ``SPY 580 Call 2026-10-16 @ 14:30:05``; falls back to stamp."""
+        if not isinstance(payload, dict):
+            return str(stamp or "")
+        meta = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+        ticker = payload.get("ticker") or meta.get("ticker")
+        strike = payload.get("strike") if payload.get("strike") is not None else meta.get("strike")
+        expiry = payload.get("expiry") or meta.get("expiry")
+        ctype = payload.get("contract_type") or meta.get("contract_type")
+        ctype = cls._normalize_contract_type(ctype) or ctype
+        stamp_text = str(stamp or payload.get("stamp") or "").strip()
+        time_part = cls._format_stamp_clock(stamp_text)
+        parts: list[str] = []
+        if ticker:
+            parts.append(str(ticker).strip().upper())
+        if strike is not None and strike != "":
+            try:
+                parts.append(f"{float(strike):g}")
+            except (TypeError, ValueError):
+                parts.append(str(strike))
+        if ctype:
+            parts.append(str(ctype))
+        if expiry:
+            parts.append(str(expiry).strip()[:10])
+        if not parts:
+            return stamp_text or "?"
+        label = " ".join(parts)
+        if time_part:
+            label = f"{label} @ {time_part}"
+        return label
+
+    @staticmethod
+    def _format_stamp_clock(stamp: str) -> str:
+        """Extract ``HH:MM:SS`` (or ``HH:MM``) from new or legacy stamps."""
+        text = str(stamp or "").strip()
+        if not text:
+            return ""
+        # New high-res: YYYYMMDDHHMMSS (optionally with _<epoch> collision suffix)
+        head = text.split("_", 1)[0]
+        if len(head) >= 14 and head[:14].isdigit():
+            hh, mm, ss = head[8:10], head[10:12], head[12:14]
+            return f"{hh}:{mm}:{ss}"
+        # Legacy minute stamp: YYYY-MM-DD_HHMM
+        try:
+            moment = datetime.strptime(text[:15], "%Y-%m-%d_%H%M")
+            return moment.strftime("%H:%M:%S")
+        except ValueError:
+            pass
+        return ""
 
     @classmethod
     def validate_snapshot_match(cls, snapshot_a: Any, snapshot_b: Any) -> tuple[bool, str]:
@@ -981,6 +1067,7 @@ class DataRepository:
 
         Only fields recorded on both sides are compared (legacy snapshots without
         ``metadata`` remain comparable); any differing field is reported.
+        Prefers nested ``metadata``, then top-level keys (additive embedding).
         """
         if not isinstance(snapshot_a, dict) or not isinstance(snapshot_b, dict):
             return False, "Snapshot payload missing or not a JSON object."
@@ -989,8 +1076,8 @@ class DataRepository:
 
         def _field(payload: dict[str, Any], meta: dict[str, Any], key: str) -> Any:
             value = meta.get(key)
-            if value is None and key == "ticker":
-                value = payload.get("ticker")
+            if value is None or value == "":
+                value = payload.get(key)
             if value is None or value == "":
                 return None
             if key == "ticker":
@@ -1000,10 +1087,12 @@ class DataRepository:
                     return round(float(value), 6)
                 except (TypeError, ValueError):
                     return str(value)
+            if key == "contract_type":
+                return cls._normalize_contract_type(value) or str(value).strip()
             return str(value).strip()[:10]
 
         problems: list[str] = []
-        for key in ("ticker", "strike", "expiry"):
+        for key in ("ticker", "strike", "expiry", "contract_type"):
             left, right = _field(snapshot_a, meta_a, key), _field(snapshot_b, meta_b, key)
             if left is None or right is None:
                 continue

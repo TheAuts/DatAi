@@ -482,7 +482,51 @@ def _fresh_chain_for_snapshot(symbol: str, expiry: Any = None) -> pd.DataFrame:
     return frame
 
 
-def _capture_snapshot(ticker: str, expiry: Any = None, strike: float | None = None) -> None:
+def _ui_contract_from_widgets(
+    fallback_ticker: str,
+    fallback_expiry: Any,
+    fallback_strike: float | None,
+    fallback_option_type: str | None = None,
+) -> tuple[str, Any, float | None, str | None]:
+    """Read ticker / strike / expiry / type from current widget session values (this render)."""
+    symbol = str(st.session_state.get("ticker") or fallback_ticker or "").strip().upper() or DEFAULT_TICKER
+    expiry: Any = st.session_state.get("expiry_iso")
+    if expiry in (None, ""):
+        expiry = st.session_state.get("expiry")
+    if expiry in (None, ""):
+        expiry = fallback_expiry
+    strike: float | None
+    if bool(st.session_state.get("manual_strike")):
+        strike = _parse_manual_strike(str(st.session_state.get("manual_strike_text") or ""))
+        if strike is None:
+            try:
+                strike = float(fallback_strike) if fallback_strike is not None else None
+            except (TypeError, ValueError):
+                strike = None
+    else:
+        raw_strike = st.session_state.get("listed_strike")
+        if raw_strike is None or raw_strike == "" or raw_strike == "—":
+            try:
+                strike = float(fallback_strike) if fallback_strike is not None else None
+            except (TypeError, ValueError):
+                strike = None
+        else:
+            try:
+                strike = float(raw_strike)
+            except (TypeError, ValueError):
+                strike = None
+    option_type = st.session_state.get("option_type")
+    if option_type in (None, ""):
+        option_type = fallback_option_type
+    return symbol, expiry, strike, str(option_type) if option_type not in (None, "") else None
+
+
+def _capture_snapshot(
+    ticker: str,
+    expiry: Any = None,
+    strike: float | None = None,
+    contract_type: str | None = None,
+) -> None:
     symbol = str(ticker or "").strip().upper() or DEFAULT_TICKER
     repo = _get_repo()
     data = _fresh_chain_for_snapshot(symbol, expiry)
@@ -491,6 +535,7 @@ def _capture_snapshot(ticker: str, expiry: Any = None, strike: float | None = No
         "ticker": symbol,
         "strike": strike,
         "expiry": expiry.isoformat() if isinstance(expiry, date) else (str(expiry)[:10] if expiry else None),
+        "contract_type": contract_type,
         "as_of_date": as_of,
     }
     before = len(repo.get_historical_snapshots(symbol))
@@ -1032,7 +1077,10 @@ def _sidebar_inputs() -> tuple[str, float, date, float, str, bool, Any]:
             st.caption(f"Historical mode: chain as of {historical.isoformat()}")
 
         if st.button("Capture Snapshot", width="stretch"):
-            _capture_snapshot(ticker_norm, expiry, strike)
+            ui_ticker, ui_expiry, ui_strike, ui_type = _ui_contract_from_widgets(
+                ticker_norm, expiry, strike, str(option_type)
+            )
+            _capture_snapshot(ui_ticker, ui_expiry, ui_strike, contract_type=ui_type)
             st.rerun()
         if st.session_state.pop("snapshot_saved", False):
             st.success("Snapshot saved!")
@@ -2241,15 +2289,26 @@ def _plotly_surface(
 
 
 def _snapshot_ui_metadata(payload: Mapping[str, Any] | None, stamp: str) -> dict[str, Any]:
-    """Ticker / Strike / Expiry / Timestamp for the Snapshot Details expander."""
+    """Ticker / Strike / Expiry / Type / Timestamp for the Snapshot Details expander."""
     payload = payload if isinstance(payload, dict) else {}
     meta = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
     return {
-        "Ticker": meta.get("ticker") or payload.get("ticker"),
-        "Strike": meta.get("strike"),
-        "Expiry": meta.get("expiry"),
+        "Ticker": payload.get("ticker") or meta.get("ticker"),
+        "Strike": payload.get("strike") if payload.get("strike") is not None else meta.get("strike"),
+        "Expiry": payload.get("expiry") or meta.get("expiry"),
+        "Type": payload.get("contract_type") or meta.get("contract_type"),
         "Timestamp": payload.get("stamp") or stamp,
+        "Label": DataRepository.format_snapshot_label(payload, stamp),
     }
+
+
+def _snapshot_option_labels(repo: DataRepository, ticker: str, snapshots: list[str]) -> dict[str, str]:
+    """Map stamp → full metadata label for Time Machine dropdowns."""
+    labels: dict[str, str] = {}
+    for stamp in snapshots:
+        payload = repo._snapshot_payload(ticker, stamp) or {}
+        labels[str(stamp)] = DataRepository.format_snapshot_label(payload, str(stamp))
+    return labels
 
 
 def _write_snapshot_delta_ranges(payload_a: dict, payload_b: dict, label_a: str, label_b: str) -> None:
@@ -2481,6 +2540,12 @@ def add_time_machine_tab(
         if not snapshots:
             st.info("No snapshots in data_history/ for this ticker.")
             return
+        stamp_labels = _snapshot_option_labels(repo, ticker, snapshots)
+
+        def _label_for(stamp: Any) -> str:
+            key = str(stamp)
+            return stamp_labels.get(key) or DataRepository.format_snapshot_label({}, key)
+
         st.subheader("Delta drift")
         start_col, end_col = st.columns([1, 1])
         start_key = f"tm_start_{ticker}"
@@ -2496,9 +2561,21 @@ def add_time_machine_tab(
             snapshots.index(preferred_end) if preferred_end in snapshots else max(0, len(snapshots) - 1)
         )
         with start_col:
-            start = st.selectbox("Start Snapshot", snapshots, index=start_index, key=start_key)
+            start = st.selectbox(
+                "Start Snapshot",
+                snapshots,
+                index=start_index,
+                key=start_key,
+                format_func=_label_for,
+            )
         with end_col:
-            end = st.selectbox("End Snapshot", snapshots, index=end_index, key=end_key)
+            end = st.selectbox(
+                "End Snapshot",
+                snapshots,
+                index=end_index,
+                key=end_key,
+                format_func=_label_for,
+            )
         payload_a = repo._snapshot_payload(ticker, start) or {}
         payload_b = repo._snapshot_payload(ticker, end) or {}
         with st.expander("Snapshot Details", expanded=False):
@@ -2562,7 +2639,13 @@ def add_time_machine_tab(
             prefix = f"{repo._safe_ticker(ticker)}_"
             if name.startswith(prefix) and name.endswith(".json"):
                 stamp_to_file.setdefault(name[len(prefix) : -len(".json")], path)
-        stamp = st.select_slider("Snapshot", options=snapshots, value=snapshots[-1], key=f"tm_scrub_{ticker}")
+        stamp = st.select_slider(
+            "Snapshot",
+            options=snapshots,
+            value=snapshots[-1],
+            key=f"tm_scrub_{ticker}",
+            format_func=_label_for,
+        )
         snapshot_file = stamp_to_file.get(str(stamp), str(stamp))
         scrub_payload = repo._snapshot_payload(ticker, snapshot_file) or repo._snapshot_payload(ticker, stamp) or {}
         with st.expander("Selected Snapshot Details", expanded=False):
