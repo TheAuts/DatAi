@@ -39,6 +39,7 @@ from quant_engine import (
     calculate_charm,
     calculate_color,
     calculate_gamma_theta_ratio,
+    calculate_greeks,
     calculate_portfolio_risk,
     calculate_speed,
     calculate_ultima,
@@ -60,6 +61,7 @@ from quant_engine import (
     generate_pro_surface_data,
     generate_vol_surface_data,
     prefill_drift_data,
+    test_simulated_pnl,
 )
 
 DATA_REPO = DataRepository()
@@ -3111,6 +3113,240 @@ def _load_vol_surface(ticker: str) -> pd.DataFrame | str:
     return surface
 
 
+def test_fetch_data(ticker: str) -> dict[str, Any]:
+    """Fetch chain + market-flow payloads for the Test Dashboard (isolated)."""
+    symbol = str(ticker or "").strip().upper() or DEFAULT_TICKER
+    chain = pd.DataFrame()
+    sentiment: dict[str, Any] = {}
+    gex: dict[str, Any] = {}
+    try:
+        chain = cached_analyst_chain(symbol)
+    except Exception:
+        chain = pd.DataFrame()
+    try:
+        sentiment = cached_market_sentiment(symbol)
+    except Exception:
+        sentiment = {}
+    try:
+        gex = cached_gex_outlook(symbol)
+    except Exception:
+        gex = {}
+    return {"ticker": symbol, "chain": chain, "sentiment": sentiment, "gex": gex}
+
+
+def test_fetch_portfolio_risk() -> dict[str, Any]:
+    """Score session portfolio via existing risk helper (Test Dashboard only)."""
+    positions = _normalize_portfolio_frame(st.session_state.get("portfolio_positions"))
+    book = positions.copy()
+    if "Ticker" in book.columns:
+        book = book[book["Ticker"].astype(str).str.strip().ne("")]
+    if "Strike" in book.columns:
+        strikes = pd.to_numeric(book["Strike"], errors="coerce")
+        book = book[strikes.notna() & (strikes > 0)]
+    if book.empty:
+        return {}
+    try:
+        return cached_portfolio_risk(book)
+    except Exception:
+        return {}
+
+
+def test_estimate_ticket_greeks(
+    spot: float,
+    strike: float,
+    sigma: float,
+    option_type: str,
+    *,
+    time_years: float = 30.0 / DAYS_PER_YEAR,
+) -> dict[str, float | None]:
+    """BS Greeks for the mock trade ticket using ``calculate_greeks``."""
+    try:
+        return calculate_greeks(
+            {
+                "S": float(spot),
+                "K": float(strike),
+                "T": float(time_years),
+                "r": float(DEFAULT_RATE),
+                "sigma": float(sigma),
+                "option_type": str(option_type or "call"),
+            }
+        )
+    except Exception:
+        return {"Delta": None, "Gamma": None, "Theta": None, "Vega": None, "Rho": None}
+
+
+def test_render_options_chain(ticker: str) -> None:
+    """Top-left: Options Chain & Market Flow."""
+    st.subheader("Options Chain & Market Flow")
+    payload = test_fetch_data(ticker)
+    chain = payload.get("chain")
+    sentiment = payload.get("sentiment") or {}
+    gex = payload.get("gex") or {}
+    with st.container(horizontal=True):
+        st.metric("Skew", str(sentiment.get("Skew", "—")), border=True)
+        st.metric("Term", str(sentiment.get("TermStructure", "—")), border=True)
+        flip = gex.get("GammaFlip")
+        flip_label = f"{float(flip):.2f}" if flip is not None and np.isfinite(float(flip)) else "—"
+        st.metric("Gamma Flip", flip_label, border=True)
+    if isinstance(chain, pd.DataFrame) and not chain.empty:
+        show = [c for c in ("Strike", "expiry", "Expiration", "type", "option_type", "bid", "ask", "lastPrice", "impliedVolatility", "volume", "openInterest") if c in chain.columns]
+        st.dataframe(chain.loc[:, show].head(40) if show else chain.head(40), hide_index=True, width="stretch")
+    else:
+        st.info("No live chain data available for this ticker.")
+    outlook = str(gex.get("Outlook") or sentiment.get("Summary") or "")
+    if outlook:
+        st.caption(outlook)
+
+
+def test_render_portfolio_risk_pane() -> None:
+    """Top-right: Portfolio Risk (Net Greeks, Concentration)."""
+    st.subheader("Portfolio Risk")
+    risk = test_fetch_portfolio_risk()
+    if not risk:
+        st.info("Add positions in Portfolio & Risk to populate net Greeks.")
+        return
+    with st.container(horizontal=True):
+        st.metric("Net Delta", _format_greek_metric(risk.get("Delta")), border=True)
+        st.metric("Net Gamma", _format_greek_metric(risk.get("Gamma")), border=True)
+        st.metric("Net Theta", _format_greek_metric(risk.get("Theta")), border=True)
+        st.metric("Net Vega", _format_greek_metric(risk.get("Vega")), border=True)
+    concentration = risk.get("TickerConcentration")
+    if concentration is None:
+        concentration = risk.get("LargestPosition")
+    try:
+        conc_pct = float(concentration) if concentration is not None else float("nan")
+    except (TypeError, ValueError):
+        conc_pct = float("nan")
+    name = str(risk.get("ConcentratedTicker") or "—")
+    if np.isfinite(conc_pct):
+        st.metric("Concentration", f"{name}: {conc_pct:.0f}%", border=True)
+        if conc_pct > CONCENTRATION_WARN_PCT:
+            st.warning(
+                f"Concentration risk: {name} is {conc_pct:.0f}% of portfolio "
+                f"(above {CONCENTRATION_WARN_PCT:.0f}%)."
+            )
+
+
+def test_render_trade_ticket(ticker: str, spot: float, sigma: float) -> None:
+    """Bottom-left: mock Trade Ticket with Simulated P&L from Greeks."""
+    st.subheader("Trade Ticket")
+    t_col, k_col = st.columns(2)
+    with t_col:
+        ticket_ticker = st.text_input("Ticker", value=str(ticker).upper(), key="test_ticket_ticker")
+    with k_col:
+        ticket_strike = st.number_input(
+            "Strike",
+            min_value=0.01,
+            value=float(spot) if spot and spot > 0 else 100.0,
+            step=1.0,
+            key="test_ticket_strike",
+        )
+    s_col, q_col = st.columns(2)
+    with s_col:
+        ticket_side = st.selectbox("Side", options=("Buy", "Sell"), key="test_ticket_side")
+    with q_col:
+        ticket_qty = st.number_input("Quantity", min_value=1.0, value=1.0, step=1.0, key="test_ticket_qty")
+    opt_type = st.selectbox("Option type", options=("call", "put"), key="test_ticket_type")
+    use_spot = float(spot) if spot and spot > 0 else float(ticket_strike)
+    use_sigma = float(sigma) if sigma and sigma > 0 else float(DEFAULT_SIGMA)
+    greeks = test_estimate_ticket_greeks(use_spot, float(ticket_strike), use_sigma, str(opt_type))
+    with st.container(horizontal=True):
+        st.metric("Δ", _format_greek_metric(greeks.get("Delta")), border=True)
+        st.metric("Γ", _format_greek_metric(greeks.get("Gamma")), border=True)
+        st.metric("Θ", _format_greek_metric(greeks.get("Theta")), border=True)
+        st.metric("ν", _format_greek_metric(greeks.get("Vega")), border=True)
+    pnl = test_simulated_pnl(
+        float(greeks.get("Delta") or 0.0),
+        float(greeks.get("Gamma") or 0.0),
+        float(greeks.get("Theta") or 0.0),
+        float(greeks.get("Vega") or 0.0),
+        float(ticket_qty),
+        str(ticket_side),
+    )
+    st.metric("Simulated P&L", _format_greek_metric(pnl), border=True)
+    st.caption(
+        f"Mock only · {ticket_ticker} {ticket_side} {int(ticket_qty)}× "
+        f"{opt_type} @ {ticket_strike:.2f} · see test_simulated_pnl docstring."
+    )
+    st.button("Submit (simulated)", key="test_ticket_submit", disabled=True)
+
+
+def test_render_alerts_compliance() -> None:
+    """Bottom-right: Alerts & Compliance risk-threshold monitors."""
+    st.subheader("Alerts & Compliance")
+    risk = test_fetch_portfolio_risk()
+    alerts: list[tuple[str, str]] = []
+    if not risk:
+        st.info("No portfolio loaded — compliance monitors idle.")
+        return
+    for greek, limit in (("Delta", 500.0), ("Gamma", 50.0), ("Vega", 200.0)):
+        try:
+            value = float(risk.get(greek) or 0.0)
+        except (TypeError, ValueError):
+            value = float("nan")
+        if np.isfinite(value) and abs(value) > limit:
+            alerts.append(("error", f"{greek} |net|={abs(value):.1f} exceeds limit {limit:.0f}."))
+        elif np.isfinite(value) and abs(value) > limit * 0.8:
+            alerts.append(("warning", f"{greek} |net|={abs(value):.1f} near limit {limit:.0f}."))
+    concentration = risk.get("TickerConcentration")
+    if concentration is None:
+        concentration = risk.get("LargestPosition")
+    try:
+        conc_pct = float(concentration) if concentration is not None else float("nan")
+    except (TypeError, ValueError):
+        conc_pct = float("nan")
+    if np.isfinite(conc_pct) and conc_pct > CONCENTRATION_WARN_PCT:
+        name = str(risk.get("ConcentratedTicker") or "ticker")
+        alerts.append(
+            ("warning", f"Concentration: {name} at {conc_pct:.0f}% > {CONCENTRATION_WARN_PCT:.0f}%.")
+        )
+    dte = risk.get("DaysToExpiration")
+    try:
+        dte_n = float(dte) if dte is not None else float("nan")
+    except (TypeError, ValueError):
+        dte_n = float("nan")
+    if np.isfinite(dte_n) and dte_n <= 7:
+        alerts.append(("warning", f"Nearest expiry in {dte_n:.0f} DTE — liquidity / pin risk."))
+    if not alerts:
+        st.success("All monitored risk thresholds within policy.")
+        return
+    for level, message in alerts:
+        if level == "error":
+            st.error(message)
+        else:
+            st.warning(message)
+
+
+def test_render_layout(ticker: str, spot: float = 0.0, sigma: float = DEFAULT_SIGMA) -> None:
+    """Four-pane 2×2 Test Dashboard layout."""
+    top_left, top_right = st.columns(2, gap="medium")
+    with top_left:
+        with st.container(border=True):
+            test_render_options_chain(ticker)
+    with top_right:
+        with st.container(border=True):
+            test_render_portfolio_risk_pane()
+    bottom_left, bottom_right = st.columns(2, gap="medium")
+    with bottom_left:
+        with st.container(border=True):
+            test_render_trade_ticket(ticker, float(spot or 0.0), float(sigma or DEFAULT_SIGMA))
+    with bottom_right:
+        with st.container(border=True):
+            test_render_alerts_compliance()
+
+
+def test_add_dashboard_tab(
+    tab: Any,
+    ticker: str,
+    spot: float = 0.0,
+    sigma: float = DEFAULT_SIGMA,
+) -> None:
+    """Entry point for the isolated Test Dashboard tab."""
+    with tab:
+        st.caption("Sandbox institutional layout — isolated from production tabs.")
+        test_render_layout(ticker, spot=spot, sigma=sigma)
+
+
 def main() -> None:
     st.set_page_config(
         page_title=PAGE_TITLE,
@@ -3255,6 +3491,7 @@ def main() -> None:
         "Market Analyst",
         "Portfolio & Risk",
         "Integrated Risk View",
+        "Test Dashboard",
     ]
     (
         greeks_tab,
@@ -3265,6 +3502,7 @@ def main() -> None:
         analyst_tab,
         portfolio_tab,
         integrated_tab,
+        test_dashboard_tab,
     ) = st.tabs(
         tab_labels,
         on_change="rerun",
@@ -3458,6 +3696,14 @@ def main() -> None:
                     )
             except Exception:
                 st.error("Could not render the Integrated Risk View surface.")
+
+    if test_dashboard_tab.open:
+        test_add_dashboard_tab(
+            test_dashboard_tab,
+            ticker,
+            spot=float(current_price or 0.0),
+            sigma=float(sigma) if sigma is not None else float(DEFAULT_SIGMA),
+        )
 
 
 if __name__ == "__main__":
