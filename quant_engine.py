@@ -6411,8 +6411,480 @@ calculate_liquidation_waterfall = test_calculate_liquidation_waterfall
 
 
 # ---------------------------------------------------------------------------
-# Godlike Quant Strategist — re-exports (HMM regime + Monte Carlo PoP/PoT)
+# Market Velocity & Order Flow Dynamics
 # ---------------------------------------------------------------------------
+FLOW_DATA_STALE_MSG = "Flow Data Stale: Velocity tracking paused."
+FLOW_VELOCITY_ROLL = 3
+FLOW_OFI_BOUNDS = (-1.0, 1.0)
+FLOW_VELOCITY_BOUNDS = (-1.0, 1.0)
+
+
+def _flow_num_column(frame: pd.DataFrame, *names: str, default: float = float("nan")) -> np.ndarray:
+    """Copied float64 column (``default`` fill when missing)."""
+    n = len(frame.index)
+    col = _sentiment_column(frame, *names)
+    if col is None:
+        return np.full(n, default, dtype=np.float64)
+    return np.array(pd.to_numeric(col, errors="coerce").to_numpy(dtype=np.float64), dtype=np.float64, copy=True)
+
+
+def _flow_mid_prices(frame: pd.DataFrame) -> np.ndarray:
+    """Mid from bid/ask when available; else last/mark/premium proxy."""
+    bid = _flow_num_column(frame, "bid", "Bid", "bidPrice")
+    ask = _flow_num_column(frame, "ask", "Ask", "askPrice")
+    last = _flow_num_column(frame, "lastPrice", "last", "mark", "mid", "premium", "option_price")
+    mid = np.full(len(frame.index), np.nan, dtype=np.float64)
+    both = np.isfinite(bid) & np.isfinite(ask) & (bid >= 0) & (ask >= bid)
+    mid = np.where(both, 0.5 * (bid + ask), mid)
+    mid = np.where(np.isfinite(mid), mid, last)
+    mid = np.where(np.isfinite(mid) & (mid >= 0), mid, np.nan)
+    return np.array(mid, dtype=np.float64, copy=True)
+
+
+def _flow_contract_sizes(frame: pd.DataFrame) -> np.ndarray:
+    size = _flow_num_column(frame, "contractSize", "contract_size", "multiplier", default=float(OPTIONS_CONTRACT_SIZE))
+    return np.array(
+        np.where(np.isfinite(size) & (size > 0), size, float(OPTIONS_CONTRACT_SIZE)),
+        dtype=np.float64,
+        copy=True,
+    )
+
+
+def _flow_trade_volumes(frame: pd.DataFrame) -> np.ndarray:
+    """Traded contracts; falls back to a unit proxy when volume is sparse."""
+    vol = _flow_num_column(frame, "volume", "Volume", "totalVolume", "traded_volume")
+    out = np.where(np.isfinite(vol) & (vol >= 0), vol, np.nan)
+    if not np.any(np.isfinite(out) & (out > 0)):
+        # Proxy: fractional open interest so Gross Flow stays informative offline.
+        oi = _flow_num_column(frame, "openInterest", "open_interest", "OI", "oi")
+        oi = np.where(np.isfinite(oi) & (oi >= 0), oi, 0.0)
+        out = np.maximum(oi * 0.05, 1.0)
+    else:
+        out = np.where(np.isfinite(out), out, 0.0)
+    return np.array(out, dtype=np.float64, copy=True)
+
+
+def _flow_buy_sell_masks(frame: pd.DataFrame, mid: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Lee–Ready-style aggressor masks; call/put signed proxy when quotes sparse."""
+    n = len(frame.index)
+    last = _flow_num_column(frame, "lastPrice", "last", "mark", "option_price")
+    bid = _flow_num_column(frame, "bid", "Bid", "bidPrice")
+    ask = _flow_num_column(frame, "ask", "Ask", "askPrice")
+    buy = np.zeros(n, dtype=bool)
+    sell = np.zeros(n, dtype=bool)
+    quote_ok = np.isfinite(mid) & np.isfinite(last)
+    buy = buy | (quote_ok & (last >= mid))
+    sell = sell | (quote_ok & (last < mid))
+    # Tick-rule fallback vs bid/ask when mid missing.
+    ba_ok = np.isfinite(bid) & np.isfinite(ask) & np.isfinite(last) & (ask > bid)
+    buy = buy | (ba_ok & ~quote_ok & (last >= ask))
+    sell = sell | (ba_ok & ~quote_ok & (last <= bid))
+    if not np.any(buy | sell):
+        is_call, is_put = _sentiment_type_mask(frame)
+        # Documented proxy: calls ≈ buy pressure, puts ≈ sell pressure.
+        buy = np.array(is_call, dtype=bool, copy=True)
+        sell = np.array(is_put, dtype=bool, copy=True)
+        if not np.any(buy | sell):
+            buy = np.ones(n, dtype=bool)
+            sell = np.zeros(n, dtype=bool)
+    # Unclassified rows with volume → split 50/50 later via weights.
+    return buy, sell
+
+
+def _flow_ofi_vector(frame: pd.DataFrame, mid: np.ndarray) -> np.ndarray:
+    """Per-row Order Flow Imbalance in ``[-1, 1]`` (numpy vectorized).
+
+    Prefer bid/ask size pressure. When sizes are absent, use Lee–Ready
+    last-vs-mid aggressor (``+1`` buy / ``−1`` sell). Next: quote location
+    ``2 * (mid - bid) / (ask - bid) - 1``. Final fallback: call=+1 / put=−1.
+    """
+    n = len(frame.index)
+    bid_sz = _flow_num_column(frame, "bidSize", "bid_size", "BidSize", "bid_sz")
+    ask_sz = _flow_num_column(frame, "askSize", "ask_size", "AskSize", "ask_sz")
+    size_ok = np.isfinite(bid_sz) & np.isfinite(ask_sz) & ((bid_sz + ask_sz) > 0)
+    ofi = np.zeros(n, dtype=np.float64)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        ofi = np.where(size_ok, (bid_sz - ask_sz) / (bid_sz + ask_sz), ofi)
+    last = _flow_num_column(frame, "lastPrice", "last", "mark", "option_price")
+    tick_ok = (~size_ok) & np.isfinite(mid) & np.isfinite(last)
+    ofi = np.where(tick_ok & (last >= mid), 1.0, ofi)
+    ofi = np.where(tick_ok & (last < mid), -1.0, ofi)
+    bid = _flow_num_column(frame, "bid", "Bid", "bidPrice")
+    ask = _flow_num_column(frame, "ask", "Ask", "askPrice")
+    spread_ok = (
+        (~size_ok)
+        & (~tick_ok)
+        & np.isfinite(bid)
+        & np.isfinite(ask)
+        & np.isfinite(mid)
+        & ((ask - bid) > 1e-12)
+    )
+    with np.errstate(invalid="ignore", divide="ignore"):
+        loc = 2.0 * (mid - bid) / (ask - bid) - 1.0
+    ofi = np.where(spread_ok, loc, ofi)
+    unclassified = ~(size_ok | tick_ok | spread_ok)
+    if np.any(unclassified):
+        is_call, is_put = _sentiment_type_mask(frame)
+        proxy = np.zeros(n, dtype=np.float64)
+        proxy = np.where(is_call, 1.0, proxy)
+        proxy = np.where(is_put, -1.0, proxy)
+        ofi = np.where(unclassified, proxy, ofi)
+    ofi = np.where(np.isfinite(ofi), ofi, 0.0)
+    return np.clip(ofi, FLOW_OFI_BOUNDS[0], FLOW_OFI_BOUNDS[1]).copy()
+
+
+def _flow_normalize_signed(values: Any) -> np.ndarray:
+    """Normalize finite values into ``[-1, 1]`` (zero-centered max-abs). Always copies."""
+    arr = np.array(values, dtype=np.float64, copy=True)
+    out = np.zeros(arr.shape, dtype=np.float64)
+    if arr.size == 0:
+        return out
+    mask = np.isfinite(arr)
+    if not np.any(mask):
+        return out
+    finite = arr[mask]
+    peak = float(np.nanmax(np.abs(finite)))
+    if not np.isfinite(peak) or peak <= 0.0:
+        out[mask] = 0.0
+        out[~mask] = np.nan
+        return out
+    out = np.array(arr, dtype=np.float64, copy=True)
+    out[mask] = np.clip(finite / peak, FLOW_VELOCITY_BOUNDS[0], FLOW_VELOCITY_BOUNDS[1])
+    out[~mask] = np.nan
+    return out
+
+
+def _flow_metrics_from_frame(frame: pd.DataFrame) -> dict[str, Any]:
+    """Gross/Net notional, OFI, deployed capital from one chain snapshot (``.copy()``)."""
+    if frame is None or not isinstance(frame, pd.DataFrame) or frame.empty:
+        return {
+            "gross_flow": 0.0,
+            "net_flow": 0.0,
+            "buy_notional": 0.0,
+            "sell_notional": 0.0,
+            "avg_deployed_capital": 0.0,
+            "flow_velocity": 0.0,
+            "ofi": 0.0,
+            "ofi_series": np.array([], dtype=np.float64),
+            "net_flow_series": np.array([], dtype=np.float64),
+            "proxy_used": True,
+            "ok": False,
+        }
+    working = frame.copy()
+    mid = _flow_mid_prices(working)
+    sizes = _flow_contract_sizes(working)
+    volume = _flow_trade_volumes(working)
+    oi = _flow_num_column(working, "openInterest", "open_interest", "OI", "oi", default=0.0)
+    oi = np.where(np.isfinite(oi) & (oi >= 0), oi, 0.0)
+    valid = np.isfinite(mid) & (mid >= 0) & np.isfinite(volume) & np.isfinite(sizes) & (sizes > 0)
+    notionals = np.where(valid, volume * mid * sizes, 0.0)
+    buy_mask, sell_mask = _flow_buy_sell_masks(working, mid)
+    buy_n = float(np.nansum(np.where(valid & buy_mask, notionals, 0.0)))
+    sell_n = float(np.nansum(np.where(valid & sell_mask, notionals, 0.0)))
+    both = valid & ~(buy_mask | sell_mask)
+    if np.any(both):
+        split = 0.5 * notionals
+        buy_n += float(np.nansum(np.where(both, split, 0.0)))
+        sell_n += float(np.nansum(np.where(both, split, 0.0)))
+    gross = float(buy_n + sell_n)
+    net = float(buy_n - sell_n)
+    deployed = np.where(np.isfinite(mid) & (mid >= 0), oi * mid * sizes, 0.0)
+    avg_cap = float(np.nanmean(deployed[deployed > 0])) if np.any(deployed > 0) else float(np.nansum(deployed))
+    if not np.isfinite(avg_cap) or avg_cap <= 0.0:
+        avg_cap = gross if gross > 0 else 1.0
+    velocity = float(gross / avg_cap) if avg_cap > 0 else 0.0
+    if not np.isfinite(velocity):
+        velocity = 0.0
+    ofi_rows = _flow_ofi_vector(working, mid)
+    weights = np.where(valid, notionals, 0.0)
+    w_sum = float(np.nansum(weights))
+    if w_sum > 0:
+        ofi = float(np.nansum(ofi_rows * weights) / w_sum)
+    else:
+        ofi = float(np.nanmean(ofi_rows)) if ofi_rows.size else 0.0
+    if not np.isfinite(ofi):
+        ofi = 0.0
+    ofi = float(np.clip(ofi, FLOW_OFI_BOUNDS[0], FLOW_OFI_BOUNDS[1]))
+    # Strike-ordered net contribution series (spatial wave proxy when history thin).
+    strikes = _flow_num_column(working, "strike", "K", "Strike", "Price")
+    signed = np.where(valid & buy_mask, notionals, 0.0) - np.where(valid & sell_mask, notionals, 0.0)
+    order_ok = np.isfinite(strikes) & valid
+    if np.any(order_ok):
+        order = np.argsort(strikes[order_ok])
+        net_series = np.array(signed[order_ok][order], dtype=np.float64, copy=True)
+    else:
+        net_series = np.array(signed[valid], dtype=np.float64, copy=True)
+    proxy = not (
+        _sentiment_column(working, "bid", "Bid") is not None
+        and _sentiment_column(working, "ask", "Ask") is not None
+        and _sentiment_column(working, "volume", "Volume") is not None
+    )
+    return {
+        "gross_flow": gross,
+        "net_flow": net,
+        "buy_notional": buy_n,
+        "sell_notional": sell_n,
+        "avg_deployed_capital": float(avg_cap),
+        "flow_velocity": velocity,
+        "ofi": ofi,
+        "ofi_series": np.array(ofi_rows, dtype=np.float64, copy=True),
+        "net_flow_series": net_series,
+        "proxy_used": bool(proxy),
+        "ok": bool(gross > 0 and np.isfinite(gross)),
+    }
+
+
+def _flow_rolling_roc(net_flow_series: Any, window: int = FLOW_VELOCITY_ROLL) -> np.ndarray:
+    """Rolling rate of change of net flow (numpy; leading pads with 0)."""
+    arr = np.asarray(net_flow_series, dtype=np.float64).reshape(-1).copy()
+    if arr.size == 0:
+        return np.array([], dtype=np.float64)
+    w = max(int(window), 1)
+    # Cumulative net, then diff over ``w`` steps → ROC of flow.
+    cum = np.nancumsum(np.where(np.isfinite(arr), arr, 0.0))
+    roc = np.zeros(cum.shape, dtype=np.float64)
+    if cum.size > w:
+        roc[w:] = cum[w:] - cum[:-w]
+        # Scale by prior window magnitude for relative velocity.
+        prior = np.abs(cum[:-w]) + 1e-12
+        roc[w:] = roc[w:] / prior
+    elif cum.size > 1:
+        roc[1:] = np.diff(cum)
+    return np.array(roc, dtype=np.float64, copy=True)
+
+
+def _flow_history_net_series(
+    ticker: str,
+    *,
+    repo: DataRepository | None = None,
+    frame: pd.DataFrame | None = None,
+) -> tuple[np.ndarray, list[str], bool]:
+    """Net-flow path from historical snapshots; else spatial series from ``frame``."""
+    repository = repo if repo is not None else DataRepository()
+    symbol = str(ticker or "").strip().upper()
+    stamps = repository.get_available_snapshots(symbol)
+    nets: list[float] = []
+    labels: list[str] = []
+    for stamp in stamps[-16:]:
+        payload = repository.load_from_cache(symbol, stamp) or {}
+        snap = repository._records_to_frame(payload.get("data")).copy()
+        if snap.empty:
+            continue
+        metrics = _flow_metrics_from_frame(snap)
+        if metrics.get("ok"):
+            nets.append(float(metrics["net_flow"]))
+            labels.append(str(stamp))
+    if len(nets) >= 2:
+        return np.array(nets, dtype=np.float64, copy=True), labels, False
+    # Synthetic spatial proxy from current chain (documented degrade path).
+    base = frame.copy() if isinstance(frame, pd.DataFrame) else pd.DataFrame()
+    if base.empty:
+        chain, _spot = _snapshot_chain_frame(symbol, repo=repository)
+        base = chain.copy()
+    metrics = _flow_metrics_from_frame(base)
+    series = np.asarray(metrics.get("net_flow_series"), dtype=np.float64).reshape(-1).copy()
+    return series, [f"k{i}" for i in range(int(series.size))], True
+
+
+def audit_market_velocity(
+    velocity: Any,
+    *,
+    gross_flow: float | None = None,
+    stale: bool = False,
+) -> dict[str, Any]:
+    """Auditor: velocity must be finite + normalized; stale/zero flow → halt Wave.
+
+    Message on halt: ``FLOW_DATA_STALE_MSG``.
+    """
+    arr = np.asarray(velocity, dtype=np.float64).reshape(-1).copy()
+    try:
+        gross = float(gross_flow) if gross_flow is not None else float("nan")
+    except (TypeError, ValueError):
+        gross = float("nan")
+    zero_or_stale = bool(stale) or (not np.isfinite(gross)) or gross <= 0.0
+    if arr.size == 0 or zero_or_stale:
+        return {
+            "ok": False,
+            "message": FLOW_DATA_STALE_MSG,
+            "velocity_normalized": np.array(arr, dtype=np.float64, copy=True),
+            "halt_render": True,
+        }
+    if not np.any(np.isfinite(arr)) or float(np.nanmax(np.abs(arr[np.isfinite(arr)]))) <= 0.0:
+        return {
+            "ok": False,
+            "message": FLOW_DATA_STALE_MSG,
+            "velocity_normalized": np.array(arr, dtype=np.float64, copy=True),
+            "halt_render": True,
+        }
+    normalized = _flow_normalize_signed(arr)
+    finite = normalized[np.isfinite(normalized)]
+    if finite.size == 0 or not np.all(np.isfinite(finite)):
+        return {
+            "ok": False,
+            "message": FLOW_DATA_STALE_MSG,
+            "velocity_normalized": np.array(normalized, dtype=np.float64, copy=True),
+            "halt_render": True,
+        }
+    if float(np.nanmax(np.abs(finite))) <= 0.0:
+        return {
+            "ok": False,
+            "message": FLOW_DATA_STALE_MSG,
+            "velocity_normalized": np.array(normalized, dtype=np.float64, copy=True),
+            "halt_render": True,
+        }
+    lo, hi = FLOW_VELOCITY_BOUNDS
+    if float(np.nanmin(finite)) < lo - 1e-9 or float(np.nanmax(finite)) > hi + 1e-9:
+        return {
+            "ok": False,
+            "message": FLOW_DATA_STALE_MSG,
+            "velocity_normalized": np.array(normalized, dtype=np.float64, copy=True),
+            "halt_render": True,
+        }
+    return {
+        "ok": True,
+        "message": "ok",
+        "velocity_normalized": np.array(normalized, dtype=np.float64, copy=True),
+        "halt_render": False,
+    }
+
+
+def _market_velocity_empty(ticker: str, message: str) -> dict[str, Any]:
+    return {
+        "ticker": str(ticker or "").strip().upper(),
+        "ok": False,
+        "message": message,
+        "gross_flow": 0.0,
+        "net_flow": 0.0,
+        "buy_notional": 0.0,
+        "sell_notional": 0.0,
+        "avg_deployed_capital": 0.0,
+        "flow_velocity": 0.0,
+        "ofi": 0.0,
+        "velocity_wave": np.array([], dtype=np.float64),
+        "velocity_wave_normalized": np.array([], dtype=np.float64),
+        "wave_labels": [],
+        "proxy_used": True,
+        "gamma_flip": None,
+        "spot": None,
+        "flip_distance_pct": float("nan"),
+        "toward_gamma_flip": False,
+        "audit": {
+            "ok": False,
+            "message": message,
+            "velocity_normalized": np.array([], dtype=np.float64),
+            "halt_render": True,
+        },
+    }
+
+
+def calculate_market_velocity(
+    ticker: str,
+    *,
+    repo: DataRepository | None = None,
+    frame: pd.DataFrame | None = None,
+    spot: float | None = None,
+    gamma_flip: float | None = None,
+) -> dict[str, Any]:
+    """Gross/Net Flow, Flow Velocity, OFI, and Velocity Wave for ``ticker``.
+
+    - Gross Flow: total traded notional (buy + sell)
+    - Net Flow: Buy − Sell notional
+    - Flow Velocity: Gross Flow / Avg Deployed Capital (OI × mid × multiplier)
+    - OFI: bid/ask pressure in ``[-1, 1]`` (quote-size → spread location → call/put proxy)
+
+    Sparse bid/ask/volume fields degrade to documented chain proxies (OI-scaled
+    volume, call/put signed pressure). DataFrames are always ``.copy()``'d.
+    Velocity Wave is the rolling ROC of net flow (history when available; else
+    strike-ordered spatial proxy), then max-abs normalized to ``[-1, 1]``.
+
+    Args:
+        ticker: Underlying symbol.
+        repo: Optional DataRepository override.
+        frame: Optional chain DataFrame (caller untouched).
+        spot: Optional spot override for gamma-flip distance.
+        gamma_flip: Optional Gamma Flip level; else from Liquidation Waterfall helpers.
+
+    Returns:
+        Dict with flow metrics, wave series, gamma-flip overlay fields, and audit.
+    """
+    symbol = str(ticker or "").strip().upper()
+    repository = repo if repo is not None else DataRepository()
+    if frame is None:
+        chain, snap_spot = _snapshot_chain_frame(symbol, repo=repository)
+        use_spot = spot if spot is not None else snap_spot
+    else:
+        chain = frame.copy() if isinstance(frame, pd.DataFrame) else pd.DataFrame()
+        use_spot = spot
+        if use_spot is None and not chain.empty:
+            use_spot = DataRepository()._spot_from_frame(chain)
+
+    if chain is None or not isinstance(chain, pd.DataFrame) or chain.empty:
+        empty = _market_velocity_empty(symbol, FLOW_DATA_STALE_MSG)
+        empty["audit"] = audit_market_velocity([], gross_flow=0.0, stale=True)
+        return empty
+
+    working = chain.copy()
+    metrics = _flow_metrics_from_frame(working)
+    hist_net, labels, spatial_proxy = _flow_history_net_series(
+        symbol, repo=repository, frame=working
+    )
+    wave_raw = _flow_rolling_roc(hist_net, window=FLOW_VELOCITY_ROLL)
+    audit = audit_market_velocity(
+        wave_raw,
+        gross_flow=float(metrics.get("gross_flow") or 0.0),
+        stale=not bool(metrics.get("ok")),
+    )
+    wave_norm = np.array(audit.get("velocity_normalized"), dtype=np.float64, copy=True)
+
+    flip = gamma_flip
+    if flip is None:
+        try:
+            lw = test_calculate_liquidation_waterfall(
+                symbol, repo=repository, frame=working, spot=use_spot
+            )
+            flip = lw.get("next_gamma_flip")
+            if use_spot is None:
+                use_spot = lw.get("spot")
+        except Exception:
+            flip = None
+    try:
+        flip_f = float(flip) if flip is not None else float("nan")
+    except (TypeError, ValueError):
+        flip_f = float("nan")
+    try:
+        spot_f = float(use_spot) if use_spot is not None else float("nan")
+    except (TypeError, ValueError):
+        spot_f = float("nan")
+    if np.isfinite(spot_f) and spot_f > 0 and np.isfinite(flip_f) and flip_f > 0:
+        dist_pct = float((flip_f - spot_f) / spot_f)
+        # Buying velocity (wave > 0) toward an above-spot flip, or selling toward below.
+        last_v = float(wave_norm[np.isfinite(wave_norm)][-1]) if np.any(np.isfinite(wave_norm)) else 0.0
+        toward = (dist_pct > 0 and last_v > 0) or (dist_pct < 0 and last_v < 0)
+    else:
+        dist_pct = float("nan")
+        toward = False
+
+    return {
+        "ticker": symbol,
+        "ok": bool(metrics.get("ok")) and bool(audit.get("ok")),
+        "message": str(audit.get("message") if audit.get("halt_render") else "ok"),
+        "gross_flow": float(metrics["gross_flow"]),
+        "net_flow": float(metrics["net_flow"]),
+        "buy_notional": float(metrics["buy_notional"]),
+        "sell_notional": float(metrics["sell_notional"]),
+        "avg_deployed_capital": float(metrics["avg_deployed_capital"]),
+        "flow_velocity": float(metrics["flow_velocity"]),
+        "ofi": float(metrics["ofi"]),
+        "velocity_wave": np.array(wave_raw, dtype=np.float64, copy=True),
+        "velocity_wave_normalized": wave_norm,
+        "wave_labels": list(labels[: int(wave_raw.size)]),
+        "proxy_used": bool(metrics.get("proxy_used") or spatial_proxy),
+        "gamma_flip": float(flip_f) if np.isfinite(flip_f) else None,
+        "spot": float(spot_f) if np.isfinite(spot_f) else None,
+        "flip_distance_pct": dist_pct,
+        "toward_gamma_flip": bool(toward),
+        "audit": audit,
+    }
 from quant_engine_regime import (  # noqa: E402
     HMM_MIN_OBSERVATIONS,
     HMM_REGIME_CRASH_CASCADE,
