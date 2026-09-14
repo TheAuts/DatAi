@@ -4485,3 +4485,53 @@ def calculate_portfolio_risk(positions_df: pd.DataFrame | None) -> dict[str, Any
         "DeltaByTicker": delta_by_ticker.to_dict(orient="records"),
         "Positions": filled,
     }
+
+
+def test_simulated_pnl(
+    delta: float,
+    gamma: float,
+    theta: float,
+    vega: float,
+    quantity: float,
+    side: str,
+    *,
+    spot_shock: float = 1.0,
+    day_shock: float = 1.0 / DAYS_PER_YEAR,
+    vol_shock: float = 0.01,
+    multiplier: float = float(OPTIONS_CONTRACT_SIZE),
+) -> float:
+    """Mock trade-ticket P&L from first-/second-order Greeks (Test Dashboard only).
+
+    Formula (documented for the institutional mock ticket)::
+
+        side_sign ∈ {+1 buy/long/call, -1 sell/short/put-as-sell}
+        dV ≈ Δ·dS + ½·Γ·(dS)² + Θ·dT + ν·dσ
+        P&L = side_sign · |quantity| · multiplier · dV
+
+    Defaults: dS=1.0 spot point, dT=1/365 year, dσ=0.01 (1 vol point).
+    Not a production pricing engine — sandbox simulation only.
+    """
+    try:
+        dlt = float(delta)
+        gam = float(gamma)
+        tht = float(theta)
+        veg = float(vega)
+        qty = float(quantity)
+        d_s = float(spot_shock)
+        d_t = float(day_shock)
+        d_v = float(vol_shock)
+        mult = float(multiplier)
+    except (TypeError, ValueError):
+        return float("nan")
+    if not all(np.isfinite(x) for x in (dlt, gam, tht, veg, qty, d_s, d_t, d_v, mult)):
+        return float("nan")
+    label = str(side or "").strip().lower()
+    if label in {"sell", "short", "s"}:
+        side_sign = -1.0
+    else:
+        side_sign = 1.0
+    d_value = dlt * d_s + 0.5 * gam * (d_s ** 2) + tht * d_t + veg * d_v
+    return float(side_sign * abs(qty) * mult * d_value)
+
+
+test_simulated_pnl.__test__ = False  # not a pytest case; Test Dashboard helper only

@@ -1034,3 +1034,19 @@ def test_compute_total_risk_score_weights_and_alert_band() -> None:
     # High equal values near refs → near 1.0
     hot = pd.DataFrame({"Delta": [1.0, 1.0], "Gamma": [0.05, 0.05], "Vega": [0.25, 0.25]})
     assert compute_total_risk_score(hot) == pytest.approx(1.0, abs=1e-9)
+
+
+def test_test_dashboard_simulated_pnl_buy_sell_signs_and_formula() -> None:
+    """Mock ticket P&L: side flips sign; matches Δ·dS + ½Γ(dS)² + Θ·dT + ν·dσ."""
+    from quant_engine import test_simulated_pnl as simulated_pnl
+
+    delta, gamma, theta, vega = 0.5, 0.02, -0.05, 0.10
+    qty = 2.0
+    spot_shock, day_shock, vol_shock = 1.0, 1.0 / 365.0, 0.01
+    d_value = delta * spot_shock + 0.5 * gamma * spot_shock**2 + theta * day_shock + vega * vol_shock
+    expected_buy = qty * 100.0 * d_value
+    buy = simulated_pnl(delta, gamma, theta, vega, qty, "Buy")
+    sell = simulated_pnl(delta, gamma, theta, vega, qty, "Sell")
+    assert buy == pytest.approx(expected_buy, rel=1e-9)
+    assert sell == pytest.approx(-expected_buy, rel=1e-9)
+    assert math.isnan(simulated_pnl(float("nan"), gamma, theta, vega, qty, "Buy"))
