@@ -1,6 +1,6 @@
 ---
 description: Quant Strategist (Godlike Tier) — HMM regime, Vanna/Volga, MC PoP/PoT
-globs: "{quant_engine.py,quant_engine_regime.py,quant_engine_montecarlo.py,test_engine.py}"
+globs: "{quant_engine.py,quant_engine_regime.py,quant_engine_montecarlo.py,quant_engine_debate.py,test_engine.py}"
 alwaysApply: false
 ---
 

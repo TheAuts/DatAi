@@ -79,6 +79,10 @@ from quant_engine import (
     TIMELAPSE_SURFACE_KEY,
     event_impact_calculate_shock,
     event_impact_load_data,
+    run_council_debate,
+    STANCE_BUY,
+    STANCE_SELL,
+    STANCE_NEUTRAL,
 )
 
 DATA_REPO = DataRepository()
@@ -3430,6 +3434,61 @@ def render_stress_pnl_heatmap(matrix: Mapping[str, Any]) -> None:
     )
 
 
+@st.cache_data(ttl=120, show_spinner="Convening Council of Experts…")
+def cached_council_debate(ticker: str) -> dict[str, Any]:
+    """Cached Council debate summary for Risk Terminal."""
+    return run_council_debate(str(ticker), repo=DATA_REPO)
+
+
+def _council_stance_color(stance: str) -> str:
+    label = str(stance or "").strip()
+    if label == STANCE_BUY:
+        return "#3fb950"
+    if label == STANCE_SELL:
+        return "#f85149"
+    return TEXT
+
+
+def render_council_expert_card(prediction: Mapping[str, Any]) -> None:
+    """Single expert column: name, stance, confidence, justification."""
+    name = str(prediction.get("name") or prediction.get("expert_id") or "Expert")
+    stance = str(prediction.get("stance") or STANCE_NEUTRAL)
+    confidence = float(prediction.get("confidence") or 0.0)
+    justification = str(prediction.get("justification") or "")
+    st.markdown(f"**Expert {prediction.get('expert_id', '')} — {name}**")
+    st.markdown(
+        f"<div style='font-size:1.35rem;font-weight:600;color:{_council_stance_color(stance)}'>"
+        f"{stance}</div>",
+        unsafe_allow_html=True,
+    )
+    st.metric("Confidence", f"{confidence:.0f} / 100", border=True)
+    st.caption(justification)
+
+
+def render_council_view(summary: Mapping[str, Any]) -> None:
+    """Three expert predictions side-by-side plus optional Disagreement Report."""
+    st.subheader("Council View")
+    st.caption(
+        "Council of Experts — Momentum (GEX/velocity/reflexivity), "
+        "Mean Reversion (IV Rank/percentile), Volatility Arb (Vanna/Volga/MC)."
+    )
+    preds = list(summary.get("predictions") or [])
+    if not preds:
+        experts = summary.get("experts") or {}
+        preds = [experts.get("A"), experts.get("B"), experts.get("C")]
+        preds = [p for p in preds if isinstance(p, Mapping)]
+    if not preds:
+        st.info("Council debate unavailable for this ticker.")
+        return
+    cols = st.columns(min(3, len(preds)))
+    for col, pred in zip(cols, preds):
+        with col:
+            render_council_expert_card(pred if isinstance(pred, Mapping) else {})
+    if bool(summary.get("disagreement")) and summary.get("disagreement_report"):
+        with st.expander("Disagreement Report", expanded=True):
+            st.warning(str(summary.get("disagreement_report")))
+
+
 def add_risk_terminal_tab(tab: Any, ticker: str) -> None:
     """Institutional Risk Terminal: stress matrix, P&L heatmap, dealer gamma overlay."""
     with tab:
@@ -3546,6 +3605,12 @@ def add_risk_terminal_tab(tab: Any, ticker: str) -> None:
                 "CRITICAL WARNING: stress pushes into the Negative Gamma zone — "
                 "dealer hedging may amplify moves."
             )
+
+        try:
+            council = cached_council_debate(str(ticker))
+            render_council_view(council)
+        except Exception:
+            st.error("Could not render Council View.")
 
 
 @st.cache_data(show_spinner=False)
