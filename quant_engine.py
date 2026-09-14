@@ -6349,3 +6349,32 @@ def test_calculate_liquidation_waterfall(
 
 # Public alias (no collision with other tabs); isolation entry remains test_*.
 calculate_liquidation_waterfall = test_calculate_liquidation_waterfall
+
+
+# ---------------------------------------------------------------------------
+# Godlike Quant Strategist — re-exports (HMM regime + Monte Carlo PoP/PoT)
+# ---------------------------------------------------------------------------
+from quant_engine_regime import (  # noqa: E402
+    HMM_MIN_OBSERVATIONS,
+    HMM_REGIME_CRASH_CASCADE,
+    HMM_REGIME_STABLE,
+    HMM_REGIME_STATES,
+    HMM_REGIME_TREND,
+    build_regime_features,
+    classify_market_regime,
+    require_regime_before_trade,
+)
+from quant_engine_montecarlo import (  # noqa: E402
+    HIGH_VANNA_WARNING,
+    MATHEMATICIANS_RULE_MSG,
+    MC_MIN_PATHS,
+    audit_monte_carlo_path_count,
+    build_vanna_volga_report,
+    evaluate_position_montecarlo,
+    mathematicians_rule_gate,
+    probability_of_profit,
+    probability_of_touching,
+    simulate_gbm_paths,
+    strategist_evaluate_position,
+    test_audit_monte_carlo_paths,
+)

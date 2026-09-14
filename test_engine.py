@@ -77,6 +77,23 @@ from quant_engine import (
     TEST_LIQUIDATION_UNSTABLE_MSG,
     TEST_LIQUIDATION_ZONE,
     calculate_liquidation_waterfall,
+    # Godlike Quant Strategist
+    HMM_REGIME_CRASH_CASCADE,
+    HMM_REGIME_STABLE,
+    HMM_REGIME_STATES,
+    HMM_REGIME_TREND,
+    HIGH_VANNA_WARNING,
+    MC_MIN_PATHS,
+    classify_market_regime,
+    require_regime_before_trade,
+    audit_monte_carlo_path_count,
+    evaluate_position_montecarlo,
+    mathematicians_rule_gate,
+    probability_of_profit,
+    probability_of_touching,
+    simulate_gbm_paths,
+    strategist_evaluate_position,
+    build_vanna_volga_report,
 )
 
 STANDARD = {"S": 100.0, "K": 100.0, "T": 1.0, "r": 0.05, "sigma": 0.2, "option_type": "call"}
@@ -1629,3 +1646,165 @@ def test_calculate_liquidation_waterfall_empty_frame() -> None:
     out = lw_calculate_liquidation_waterfall("EMPTY", frame=pd.DataFrame())
     assert out["ok"] is False
     assert out["gex_audit"]["halt_render"] is True
+
+
+# ---------------------------------------------------------------------------
+# Godlike Quant Strategist — HMM regime, Monte Carlo PoP/PoT, auditor gates
+# ---------------------------------------------------------------------------
+
+
+def _synthetic_price_path(
+    *,
+    n: int = 120,
+    regime: str = "stable",
+    spot: float = 100.0,
+    seed: int = 7,
+) -> np.ndarray:
+    """Generate a price path biased toward Stable / Trend / Crash-Cascade."""
+    rng = np.random.default_rng(seed)
+    rets = rng.normal(0.0, 0.004, size=n)
+    if regime == "trend":
+        rets = rets + 0.003
+    elif regime == "crash":
+        rets = rng.normal(-0.012, 0.025, size=n)
+        rets[-20:] = rng.normal(-0.03, 0.04, size=20)
+    else:
+        rets = rng.normal(0.0, 0.003, size=n)
+    log_p = np.log(spot) + np.cumsum(rets)
+    return np.exp(log_p).astype(np.float64)
+
+
+def test_hmm_classify_market_regime_outputs_valid_label() -> None:
+    prices = _synthetic_price_path(regime="stable", seed=11)
+    out = classify_market_regime(prices, min_observations=30, n_iter=15)
+    assert out["ok"] is True
+    assert out["regime"] in HMM_REGIME_STATES
+    assert out["regime"] in (HMM_REGIME_STABLE, HMM_REGIME_TREND, HMM_REGIME_CRASH_CASCADE)
+    assert out["regime_path"].size == out["n_observations"]
+    assert set(out["regime_path"]).issubset(set(HMM_REGIME_STATES))
+
+
+def test_hmm_classify_copies_input_frame() -> None:
+    prices = _synthetic_price_path(regime="trend", seed=21)
+    frame = pd.DataFrame({"close": prices, "extra": np.arange(prices.size)})
+    original = frame.copy()
+    out = classify_market_regime(None, frame=frame, price_col="close", min_observations=30, n_iter=12)
+    pd.testing.assert_frame_equal(frame, original)
+    assert out["ok"] is True
+    assert out["regime"] in HMM_REGIME_STATES
+
+
+def test_hmm_require_regime_before_trade_gate() -> None:
+    blocked = require_regime_before_trade({"ok": False, "regime": HMM_REGIME_STABLE})
+    assert blocked["approved"] is False
+    ok = require_regime_before_trade({"ok": True, "regime": HMM_REGIME_TREND})
+    assert ok["approved"] is True
+    assert ok["regime"] == HMM_REGIME_TREND
+    bad_label = require_regime_before_trade({"ok": True, "regime": "Unknown"})
+    assert bad_label["approved"] is False
+
+
+def test_montecarlo_pop_pot_bounds_unit_interval() -> None:
+    paths = simulate_gbm_paths(100.0, 0.25, 10.0 / 252.0, n_paths=MC_MIN_PATHS, n_steps=32, seed=42)
+    assert paths.shape == (MC_MIN_PATHS, 33)
+    pop = probability_of_profit(paths, entry=100.0, direction="long")
+    pot = probability_of_touching(paths, 95.0, direction="long")
+    assert 0.0 <= pop <= 1.0
+    assert 0.0 <= pot <= 1.0
+    result = evaluate_position_montecarlo(
+        100.0,
+        95.0,
+        sigma=0.25,
+        time_years=10.0 / 252.0,
+        n_paths=MC_MIN_PATHS,
+        seed=42,
+        vanna=0.12,
+        volga=0.01,
+    )
+    assert 0.0 <= float(result["pop"]) <= 1.0
+    assert 0.0 <= float(result["pot"]) <= 1.0
+    assert int(result["n_paths"]) >= MC_MIN_PATHS
+    assert result["vanna_warning"] == HIGH_VANNA_WARNING
+    assert result["warning"] == HIGH_VANNA_WARNING
+
+
+def test_audit_monte_carlo_path_count_threshold() -> None:
+    ok = audit_monte_carlo_path_count(MC_MIN_PATHS)
+    assert ok["ok"] is True
+    assert ok["halt"] is False
+    # Isolation entry mirrors liquidation-engine test_audit_* naming.
+    from quant_engine import test_audit_monte_carlo_paths as mc_path_audit
+
+    alias = mc_path_audit(25_000)
+    assert alias["ok"] is True
+    bad = audit_monte_carlo_path_count(9999)
+    assert bad["ok"] is False
+    assert bad["halt"] is True
+    assert "10,000" in bad["message"]
+    # evaluate_position_montecarlo always lifts to ≥ MC_MIN_PATHS
+    lifted = evaluate_position_montecarlo(
+        100.0, 90.0, sigma=0.2, time_years=0.05, n_paths=500, seed=1
+    )
+    assert int(lifted["n_paths"]) >= MC_MIN_PATHS
+    assert lifted["path_audit"]["ok"] is True
+
+
+def test_mathematicians_rule_gate_forbids_pot_gt_pop() -> None:
+    forbidden = mathematicians_rule_gate(0.30, 0.55, delta_hedged=False)
+    assert forbidden["approved"] is False
+    assert forbidden["forbidden"] is True
+    assert "FORBIDDEN" in forbidden["message"]
+    allowed_hedged = mathematicians_rule_gate(0.30, 0.55, delta_hedged=True)
+    assert allowed_hedged["approved"] is True
+    assert allowed_hedged["forbidden"] is False
+    allowed_edge = mathematicians_rule_gate(0.60, 0.40, delta_hedged=False)
+    assert allowed_edge["approved"] is True
+
+
+def test_vanna_volga_report_exact_warning_string() -> None:
+    quiet = build_vanna_volga_report(0.001, 0.02)
+    assert quiet["high_vanna_exposure"] is False
+    assert quiet["vanna_warning"] is None
+    hot = build_vanna_volga_report(0.20, -0.01)
+    assert hot["vanna_warning"] == "High Vanna exposure: Delta will accelerate during IV spikes."
+
+
+def test_strategist_evaluate_position_integrates_regime_and_mc() -> None:
+    prices = _synthetic_price_path(regime="stable", seed=99)
+    # Wide stop → lower PoT; should often clear Mathematician's Rule.
+    out = strategist_evaluate_position(
+        prices,
+        stop_loss=float(prices[-1]) * 0.70,
+        sigma=0.15,
+        time_years=5.0 / 252.0,
+        direction="long",
+        vanna=0.0,
+        volga=0.0,
+        delta_hedged=False,
+        n_paths=MC_MIN_PATHS,
+        seed=3,
+    )
+    assert out["regime"] in HMM_REGIME_STATES
+    assert out["regime_gate"]["approved"] is True
+    assert 0.0 <= float(out["pop"]) <= 1.0
+    assert 0.0 <= float(out["pot"]) <= 1.0
+    assert int(out["n_paths"]) >= MC_MIN_PATHS
+    assert out["path_audit"]["ok"] is True
+    # Explicitly delta-hedged path must be approvable even if PoT > PoP.
+    harsh = strategist_evaluate_position(
+        prices,
+        stop_loss=float(prices[-1]) * 0.995,
+        sigma=0.50,
+        time_years=20.0 / 252.0,
+        direction="long",
+        vanna=0.2,
+        volga=0.05,
+        delta_hedged=True,
+        n_paths=MC_MIN_PATHS,
+        seed=5,
+    )
+    assert harsh["mathematicians_rule"]["approved"] is True
+    assert harsh["vanna_warning"] == HIGH_VANNA_WARNING
+    # Without hedge, Mathematician's Rule must block when PoT > PoP.
+    rule = mathematicians_rule_gate(0.2, 0.8, delta_hedged=False)
+    assert rule["approved"] is False
