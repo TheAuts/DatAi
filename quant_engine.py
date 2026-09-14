@@ -250,7 +250,77 @@ def _pivot_risk_field(
     return z2d, x_axis, y_axis
 
 
-def generate_integrated_risk_surface(df: pd.DataFrame) -> Any:
+# Equal-weight Total Risk Score defaults (tunable). Each greek’s grid mean of
+# |value| is mapped to [0, 1] via clip(mean / REF, 0, 1), then weighted.
+# Score ∈ [0, 1]; alert when score exceeds RISK_SCORE_ALERT_THRESHOLD.
+RISK_WEIGHT_DELTA: float = 1.0 / 3.0
+RISK_WEIGHT_GAMMA: float = 1.0 / 3.0
+RISK_WEIGHT_VEGA: float = 1.0 / 3.0
+RISK_REF_DELTA: float = 1.0  # |Δ| already on ~[0, 1]
+RISK_REF_GAMMA: float = 0.05  # typical ATM equity gamma per $1 move
+RISK_REF_VEGA: float = 0.25  # typical vega-per-vol-point magnitude on the grid
+RISK_SCORE_ALERT_THRESHOLD: float = 0.75
+
+
+def compute_total_risk_score(
+    df: pd.DataFrame,
+    *,
+    weight_delta: float = RISK_WEIGHT_DELTA,
+    weight_gamma: float = RISK_WEIGHT_GAMMA,
+    weight_vega: float = RISK_WEIGHT_VEGA,
+    ref_delta: float = RISK_REF_DELTA,
+    ref_gamma: float = RISK_REF_GAMMA,
+    ref_vega: float = RISK_REF_VEGA,
+) -> float:
+    """Weighted sum of mean |Delta|, |Gamma|, |Vega| after ref-scale mapping to [0, 1].
+
+    Weights default to equal thirds (``RISK_WEIGHT_*``). Each component is
+    ``clip(mean(|greek|) / RISK_REF_*, 0, 1)``. Missing columns are skipped and
+    remaining weights are renormalized. Always ``.copy()``s. Returns ``0.0`` on
+    empty/invalid input.
+    """
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        return 0.0
+    frame = df.copy()
+    col_map = {str(c).strip().lower(): c for c in frame.columns}
+
+    def _col(*names: str) -> str | None:
+        for name in names:
+            key = str(name).strip().lower()
+            if key in col_map:
+                return str(col_map[key])
+        return None
+
+    parts: list[tuple[str | None, float, float]] = [
+        (_col("Delta", "delta"), float(weight_delta), float(ref_delta)),
+        (_col("Gamma", "gamma", "GEX", "gex"), float(weight_gamma), float(ref_gamma)),
+        (_col("Vega", "vega"), float(weight_vega), float(ref_vega)),
+    ]
+    score = 0.0
+    weight_sum = 0.0
+    for col, weight, ref in parts:
+        if col is None or not np.isfinite(weight) or weight == 0.0:
+            continue
+        vals = np.abs(pd.to_numeric(frame[col], errors="coerce").to_numpy(dtype=np.float64))
+        finite = vals[np.isfinite(vals)]
+        mean_abs = float(np.mean(finite)) if finite.size else 0.0
+        scale = ref if np.isfinite(ref) and ref > 0.0 else 1.0
+        component = float(np.clip(mean_abs / scale, 0.0, 1.0))
+        score += abs(weight) * component
+        weight_sum += abs(weight)
+    if weight_sum <= 0.0:
+        return 0.0
+    # Redistribute when a greek column is missing so the result stays in [0, 1].
+    return float(np.clip(score / weight_sum, 0.0, 1.0))
+
+
+def generate_integrated_risk_surface(
+    df: pd.DataFrame,
+    *,
+    include_gamma: bool = True,
+    include_delta: bool = True,
+    include_vol: bool = True,
+) -> Any:
     """Build a single Plotly ``go.Surface`` for the Total Risk Profile.
 
     Layering (Price/Strike × DaysToExpiry grid from ``df``):
@@ -258,6 +328,11 @@ def generate_integrated_risk_surface(df: pd.DataFrame) -> Any:
     - ``surfacecolor``: GEX / Gamma normalized, packed with Delta for opacity
     - Alpha: normalized ``|Delta|`` drives per-vertex transparency (ghost effect)
       via an rgba colorscale (Plotly Surface has no independent opacity channel)
+
+    Overlay flags (additive; default all on):
+    - ``include_gamma=False`` → flat/neutral surfacecolor (mid GEX)
+    - ``include_delta=False`` → full opacity (Delta layer off)
+    - ``include_vol=False`` → Z flattened (hide vol contribution)
 
     Always ``.copy()``s the input frame and copies arrays before mutation.
     Returns an empty ``go.Surface`` when required columns or finite data are missing.
@@ -306,6 +381,17 @@ def generate_integrated_risk_surface(df: pd.DataFrame) -> Any:
     # |Delta| so puts and calls both drive opacity toward high-risk extremes.
     delta_abs = np.abs(np.array(z_delta, dtype=np.float64, copy=True))
     delta_n = minmax_normalize_01(delta_abs)
+    if not include_vol:
+        # Hide vol contribution: flat Z plane at mid height.
+        vol_finite = np.isfinite(vol_n)
+        vol_n = np.full_like(vol_n, 0.5, dtype=np.float64)
+        vol_n[~vol_finite] = np.nan
+    if not include_gamma:
+        # Neutral / flat GEX color (mid viridis).
+        gamma_n = np.full_like(gamma_n, 0.5, dtype=np.float64)
+    if not include_delta:
+        # Full opacity when Delta layer is off.
+        delta_n = np.ones_like(delta_n, dtype=np.float64)
     if not np.any(np.isfinite(vol_n)):
         return empty
 
@@ -313,9 +399,20 @@ def generate_integrated_risk_surface(df: pd.DataFrame) -> Any:
     encoded = _encode_gex_delta_color(gamma_n, delta_n, n_gamma=n_gamma, n_delta=n_delta)
     colorscale = _gex_delta_rgba_colorscale(n_gamma=n_gamma, n_delta=n_delta)
     # Reinforce ghosting: opacityscale tracks the packed color (GEX×Δ).
-    opacityscale: list[list[Any]] = [[0.0, 0.08], [0.35, 0.35], [0.7, 0.7], [1.0, 1.0]]
+    # When Delta is off, keep opacity fully opaque.
+    if include_delta:
+        opacityscale: list[list[Any]] = [[0.0, 0.08], [0.35, 0.35], [0.7, 0.7], [1.0, 1.0]]
+    else:
+        opacityscale = [[0.0, 1.0], [1.0, 1.0]]
 
     z2d, x_ok, y_ok, _warning = prepare_plotly_surface_xyz(vol_n, x_axis, y_axis)
+    color_title = "GEX (Δ-opacity)"
+    if not include_gamma and not include_delta:
+        color_title = "Neutral"
+    elif not include_gamma:
+        color_title = "Δ-opacity"
+    elif not include_delta:
+        color_title = "GEX"
     payload: dict[str, Any] = {
         "z": np.array(z2d, dtype=np.float64, copy=True),
         "surfacecolor": np.array(encoded, dtype=np.float64, copy=True),
@@ -324,7 +421,7 @@ def generate_integrated_risk_surface(df: pd.DataFrame) -> Any:
         "colorscale": colorscale,
         "opacityscale": opacityscale,
         "showscale": True,
-        "colorbar": {"title": "GEX (Δ-opacity)"},
+        "colorbar": {"title": color_title},
         "name": "Total Risk Profile",
         "hovertemplate": (
             "X=%{x:.2f}<br>Y=%{y:.2f}<br>"
