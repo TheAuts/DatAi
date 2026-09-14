@@ -43,6 +43,10 @@ from quant_engine import (
     calculate_portfolio_risk,
     calculate_stress_scenario,
     build_stress_pnl_matrix,
+    calculate_market_reflexivity,
+    REGIME_CRASH_CASCADE,
+    REGIME_FRAGILE_BEAR,
+    REGIME_HEDGE_PUT_SPREADS,
     calculate_speed,
     calculate_ultima,
     calculate_vanna,
@@ -3618,6 +3622,183 @@ def event_impact_render_shock_surface(result: Mapping[str, Any]) -> None:
     st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
 
 
+@st.cache_data(show_spinner=False)
+def regime_lab_cached_reflexivity(ticker: str) -> dict[str, Any]:
+    """Cached Market Regime & Reflexivity payload for ``ticker``."""
+    return calculate_market_reflexivity(str(ticker or "").strip().upper())
+
+
+def regime_lab_build_map_figure(map_frame: pd.DataFrame, regime: str) -> go.Figure:
+    """3D Regime Map scatter: X=GEX, Y=Vanna, Z=Market Momentum."""
+    frame = map_frame.copy() if isinstance(map_frame, pd.DataFrame) else pd.DataFrame()
+    if frame.empty or not {"GEX", "Vanna", "Momentum"}.issubset(frame.columns):
+        return go.Figure()
+    color = frame["Regime"] if "Regime" in frame.columns else regime
+    fig = go.Figure(
+        data=[
+            go.Scatter3d(
+                x=pd.to_numeric(frame["GEX"], errors="coerce"),
+                y=pd.to_numeric(frame["Vanna"], errors="coerce"),
+                z=pd.to_numeric(frame["Momentum"], errors="coerce"),
+                mode="markers",
+                marker={
+                    "size": 4,
+                    "opacity": 0.85,
+                    "color": pd.Categorical(color).codes if hasattr(color, "__len__") else 0,
+                    "colorscale": "Viridis",
+                    "colorbar": {"title": "Regime"},
+                },
+                text=color.astype(str) if hasattr(color, "astype") else [str(regime)] * len(frame),
+                hovertemplate=(
+                    "GEX=%{x:.4g}<br>Vanna=%{y:.4g}<br>Momentum=%{z:.4g}"
+                    "<br>%{text}<extra></extra>"
+                ),
+            )
+        ]
+    )
+    fig.update_layout(
+        template="plotly_dark",
+        paper_bgcolor=DARK_BG,
+        font={"color": TEXT},
+        height=560,
+        title={"text": f"Regime Map — {regime}", "x": 0.0, "xanchor": "left"},
+        scene={
+            "xaxis_title": "GEX",
+            "yaxis_title": "Vanna",
+            "zaxis_title": "Market Momentum",
+            "bgcolor": PANEL_BG,
+            "dragmode": "orbit",
+        },
+        margin={"l": 8, "r": 8, "t": 48, "b": 8},
+        uirevision="regime-lab-map",
+    )
+    return fig
+
+
+def regime_lab_build_cascade_gauge(
+    probability: float,
+    regime: str,
+    *,
+    hedge_suggestion: str | None = None,
+) -> go.Figure:
+    """Cascade Probability gauge; red under Fragile-Bear / Crash-Cascade."""
+    p = float(np.clip(float(probability), 0.0, 1.0))
+    fragile = str(regime) in (REGIME_FRAGILE_BEAR, REGIME_CRASH_CASCADE)
+    bar_color = "#e74c3c" if fragile else "#2ecc71"
+    fig = go.Figure(
+        go.Indicator(
+            mode="gauge+number",
+            value=p * 100.0,
+            number={"suffix": "%", "valueformat": ".1f"},
+            title={"text": "Cascade Probability"},
+            gauge={
+                "axis": {"range": [0, 100]},
+                "bar": {"color": bar_color},
+                "bgcolor": PANEL_BG,
+                "borderwidth": 1,
+                "bordercolor": TEXT,
+                "steps": [
+                    {"range": [0, 40], "color": "#1e3a2f"},
+                    {"range": [40, 70], "color": "#3a341e"},
+                    {"range": [70, 100], "color": "#3a1e1e"},
+                ],
+                "threshold": {
+                    "line": {"color": "#e74c3c", "width": 3},
+                    "thickness": 0.75,
+                    "value": 70,
+                },
+            },
+        )
+    )
+    fig.update_layout(
+        template="plotly_dark",
+        paper_bgcolor=DARK_BG,
+        font={"color": TEXT},
+        height=280,
+        margin={"l": 24, "r": 24, "t": 48, "b": 24},
+        uirevision="regime-lab-gauge",
+    )
+    if fragile and hedge_suggestion:
+        fig.add_annotation(
+            text=str(hedge_suggestion),
+            x=0.5,
+            y=-0.12,
+            xref="paper",
+            yref="paper",
+            showarrow=False,
+            font={"color": "#e74c3c", "size": 13},
+        )
+    return fig
+
+
+def add_regime_lab_tab(tab: Any, ticker: str) -> None:
+    """Regime Lab: 3D Regime Map + Cascade Probability gauge (additive only)."""
+    with tab:
+        st.caption(
+            "Market Regime & Reflexivity — correlates dealer GEX, Vanna, and price momentum "
+            "(`calculate_market_reflexivity`)."
+        )
+        try:
+            result = regime_lab_cached_reflexivity(str(ticker))
+        except Exception:
+            st.error("Could not calculate market reflexivity.")
+            return
+        if not result or not result.get("ok"):
+            st.info(str((result or {}).get("message") or "No chain data for regime analysis."))
+            return
+
+        regime = str(result.get("regime") or "Stable-Bull")
+        cascade_p = float(result.get("cascade_probability") or 0.0)
+        hedge = result.get("hedge_suggestion")
+        reflexive = bool(result.get("reflexive_cascade"))
+
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Regime", regime, border=True)
+        m2.metric("Net GEX", f"{float(result.get('gex') or 0.0):.4g}", border=True)
+        m3.metric("|Vanna|", f"{float(result.get('vanna') or 0.0):.4g}", border=True)
+        m4.metric("Momentum", f"{float(result.get('momentum') or 0.0):+.2%}", border=True)
+
+        if reflexive:
+            st.error("Reflexive Cascade risk: negative GEX with elevated Vanna.")
+        if regime in (REGIME_FRAGILE_BEAR, REGIME_CRASH_CASCADE):
+            st.warning(f"Hedge suggestion: {hedge or REGIME_HEDGE_PUT_SPREADS}")
+
+        left, right = st.columns([1.35, 1.0], gap="large")
+        with left:
+            st.subheader("Regime Map")
+            map_frame = result.get("map_frame")
+            try:
+                fig_map = regime_lab_build_map_figure(
+                    map_frame if isinstance(map_frame, pd.DataFrame) else pd.DataFrame(),
+                    regime,
+                )
+                st.plotly_chart(
+                    fig_map,
+                    use_container_width=True,
+                    config={"displayModeBar": True, "scrollZoom": True},
+                    key="regime-lab-map",
+                )
+            except Exception:
+                st.error("Could not render the Regime Map.")
+        with right:
+            st.subheader("Cascade Predictor")
+            try:
+                fig_gauge = regime_lab_build_cascade_gauge(
+                    cascade_p,
+                    regime,
+                    hedge_suggestion=str(hedge) if hedge else None,
+                )
+                st.plotly_chart(
+                    fig_gauge,
+                    use_container_width=True,
+                    config={"displayModeBar": False},
+                    key="regime-lab-gauge",
+                )
+            except Exception:
+                st.error("Could not render the Cascade Probability gauge.")
+            st.caption(f"Cascade Probability = {cascade_p:.3f} (bounded [0, 1]).")
+
+
 def add_event_impact_lab_tab(tab: Any, ticker: str) -> None:
     """Event Impact Lab: event dropdown, shock summary, RdBu shock surface."""
     with tab:
@@ -3962,6 +4143,7 @@ def main() -> None:
         "Market Timelapse",
         "Risk Terminal",
         "Event Impact Lab",
+        "Regime Lab",
     ]
     (
         greeks_tab,
@@ -3976,6 +4158,7 @@ def main() -> None:
         timelapse_tab,
         risk_terminal_tab,
         event_impact_tab,
+        regime_lab_tab,
     ) = st.tabs(
         tab_labels,
         on_change="rerun",
@@ -4186,6 +4369,9 @@ def main() -> None:
 
     if event_impact_tab.open:
         add_event_impact_lab_tab(event_impact_tab, ticker)
+
+    if regime_lab_tab.open:
+        add_regime_lab_tab(regime_lab_tab, ticker)
 
 
 if __name__ == "__main__":
