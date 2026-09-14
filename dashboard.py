@@ -51,6 +51,7 @@ from quant_engine import (
     generate_3d_greek_surface,
     generate_delta_term_structure,
     generate_greek_curve,
+    generate_integrated_risk_surface,
     generate_pro_surface_data,
     generate_vol_surface_data,
     prefill_drift_data,
@@ -1819,6 +1820,156 @@ def render_delta_term_structure(frame: pd.DataFrame) -> None:
     st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": True}, key="delta-term-structure-chart")
 
 
+def render_integrated_risk_surface(surface: go.Surface) -> None:
+    """Plot a single Total Risk Profile ``go.Surface`` (Integrated Risk View)."""
+    z = getattr(surface, "z", None)
+    arr = np.asarray(z if z is not None else [], dtype=float)
+    if arr.size == 0 or not np.any(np.isfinite(arr)):
+        st.info("No integrated risk surface data to plot.")
+        return
+    fig = go.Figure(data=[surface])
+    fig.update_layout(
+        template="plotly_dark",
+        paper_bgcolor=DARK_BG,
+        font={"color": TEXT},
+        height=560,
+        title={"text": "Total Risk Profile", "x": 0.0, "xanchor": "left"},
+        scene={
+            "xaxis_title": "Price",
+            "yaxis_title": "Days to Expiry",
+            "zaxis_title": "Volatility (norm)",
+            "bgcolor": PANEL_BG,
+            "dragmode": "orbit",
+        },
+        margin={"l": 8, "r": 8, "t": 48, "b": 8},
+        uirevision="integrated-risk-surface",
+    )
+    st.caption(
+        "Z = normalized Volatility · color = GEX (normalized Gamma) · "
+        "opacity = normalized |Delta| (ghost at low delta)."
+    )
+    st.plotly_chart(
+        fig,
+        use_container_width=True,
+        config={"displayModeBar": True, "scrollZoom": True},
+        key="integrated-risk-surface-chart",
+    )
+
+
+def _build_integrated_risk_frame(
+    ticker: str,
+    strike: float,
+    expiry_range: tuple[float, ...],
+    prices: tuple[float, ...],
+    sigma: float,
+    option_type: str,
+    model: str,
+    v0: float,
+    kappa: float,
+    theta: float,
+    heston_sigma: float,
+    rho: float,
+) -> pd.DataFrame:
+    """Merge Delta / Gamma grids and broadcast Volatility for the risk surface."""
+    delta = generate_3d_greek_surface(
+        ticker,
+        strike,
+        expiry_range,
+        greek="Delta",
+        price_range=prices if prices else None,
+        r=DEFAULT_RATE,
+        sigma=sigma,
+        option_type=option_type,
+        model=model,
+        v0=v0,
+        kappa=kappa,
+        theta=theta,
+        heston_sigma=heston_sigma,
+        rho=rho,
+    ).copy()
+    gamma = generate_3d_greek_surface(
+        ticker,
+        strike,
+        expiry_range,
+        greek="Gamma",
+        price_range=prices if prices else None,
+        r=DEFAULT_RATE,
+        sigma=sigma,
+        option_type=option_type,
+        model=model,
+        v0=v0,
+        kappa=kappa,
+        theta=theta,
+        heston_sigma=heston_sigma,
+        rho=rho,
+    ).copy()
+    if delta.empty or gamma.empty:
+        return pd.DataFrame(columns=["Price", "DaysToExpiry", "Delta", "Gamma", "Volatility"])
+    delta = delta.rename(columns={"Value": "Delta"})
+    gamma = gamma.rename(columns={"Value": "Gamma"})
+    merged = delta.merge(gamma, on=["Price", "DaysToExpiry"], how="inner").copy()
+    # Prefer per-node IV from the live vol surface when strike/DTE align; else sigma.
+    vol = np.full(len(merged.index), float(sigma), dtype=np.float64)
+    try:
+        vol_frame = generate_vol_surface_data(ticker)
+        if isinstance(vol_frame, pd.DataFrame) and not vol_frame.empty:
+            vf = vol_frame.copy()
+            x_name = "Price" if "Price" in vf.columns else ("Strike" if "Strike" in vf.columns else None)
+            if x_name and {"DaysToExpiry", "IV"}.issubset(vf.columns):
+                vf[x_name] = pd.to_numeric(vf[x_name], errors="coerce")
+                vf["DaysToExpiry"] = pd.to_numeric(vf["DaysToExpiry"], errors="coerce")
+                vf["IV"] = pd.to_numeric(vf["IV"], errors="coerce")
+                vf = vf.replace([np.inf, -np.inf], np.nan).dropna()
+                if not vf.empty:
+                    pts = vf.loc[:, [x_name, "DaysToExpiry", "IV"]].to_numpy(dtype=np.float64)
+                    for i, (px, dte) in enumerate(
+                        zip(
+                            merged["Price"].to_numpy(dtype=np.float64),
+                            merged["DaysToExpiry"].to_numpy(dtype=np.float64),
+                        )
+                    ):
+                        dist = (pts[:, 0] - px) ** 2 + (pts[:, 1] - dte) ** 2
+                        j = int(np.argmin(dist))
+                        iv = float(pts[j, 2])
+                        if np.isfinite(iv) and iv > 0:
+                            vol[i] = iv
+    except Exception:
+        pass
+    merged["Volatility"] = np.array(vol, dtype=np.float64, copy=True)
+    return merged
+
+
+@st.cache_data(show_spinner="Building integrated risk surface…")
+def cached_integrated_risk_frame(
+    ticker: str,
+    strike: float,
+    expiry_range: tuple[float, ...],
+    prices: tuple[float, ...],
+    sigma: float,
+    option_type: str,
+    model: str,
+    v0: float,
+    kappa: float,
+    theta: float,
+    heston_sigma: float,
+    rho: float,
+) -> pd.DataFrame:
+    return _build_integrated_risk_frame(
+        ticker,
+        strike,
+        expiry_range,
+        prices,
+        sigma,
+        option_type,
+        model,
+        v0,
+        kappa,
+        theta,
+        heston_sigma,
+        rho,
+    )
+
+
 def render_gamma_surface(frame: pd.DataFrame) -> None:
     required = {"Price", "DaysToExpiry", "Gamma"}
     if frame.empty or not required.issubset(frame.columns):
@@ -3102,6 +3253,7 @@ def main() -> None:
         "Pro Metrics",
         "Market Analyst",
         "Portfolio & Risk",
+        "Integrated Risk View",
     ]
     (
         greeks_tab,
@@ -3113,6 +3265,7 @@ def main() -> None:
         pro_tab,
         analyst_tab,
         portfolio_tab,
+        integrated_tab,
     ) = st.tabs(
         tab_labels,
         on_change="rerun",
@@ -3278,6 +3431,37 @@ def main() -> None:
 
     if portfolio_tab.open:
         add_portfolio_risk_tab(portfolio_tab)
+
+    if integrated_tab.open:
+        with integrated_tab:
+            dte = max((expiry - date.today()).days, 1)
+            expiry_range = tuple(sorted({float(d) for d in range(7, 91, 7)} | {float(dte)}))
+            prices = tuple(
+                float(p)
+                for p in pd.to_numeric(frame["Price"], errors="coerce").dropna().tolist()[::4]
+            )
+            risk_model = MODEL_BLACK_SCHOLES if heston_selected else model
+            if heston_selected:
+                st.caption("Integrated Risk View uses Black–Scholes grids so Heston 2D curves stay snappy.")
+            try:
+                risk_frame = cached_integrated_risk_frame(
+                    ticker,
+                    float(strike),
+                    expiry_range,
+                    prices,
+                    float(sigma),
+                    option_type,
+                    risk_model,
+                    v0,
+                    kappa,
+                    theta,
+                    heston_sigma,
+                    rho,
+                )
+                surface = generate_integrated_risk_surface(risk_frame)
+                render_integrated_risk_surface(surface)
+            except Exception:
+                st.error("Could not render the Integrated Risk View surface.")
 
 
 if __name__ == "__main__":

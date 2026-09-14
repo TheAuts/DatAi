@@ -110,6 +110,234 @@ def prepare_plotly_surface_xyz(
     return z2d.astype(float, copy=False), None, None, warning
 
 
+def minmax_normalize_01(values: Any) -> np.ndarray:
+    """Min-max normalize ``values`` to ``[0, 1]`` independently.
+
+    Always copies. All-NaN or non-finite-only input → zeros. Zero range
+    (constant finite values) → zeros on finite cells (NaN preserved as NaN).
+    """
+    arr = np.array(values, dtype=np.float64, copy=True)
+    out = np.zeros(arr.shape, dtype=np.float64)
+    if arr.size == 0:
+        return out
+    mask = np.isfinite(arr)
+    if not np.any(mask):
+        return out
+    finite = arr[mask]
+    lo = float(np.min(finite))
+    hi = float(np.max(finite))
+    span = hi - lo
+    if not np.isfinite(span) or span <= 0.0:
+        out = np.array(arr, dtype=np.float64, copy=True)
+        out[mask] = 0.0
+        out[~mask] = np.nan
+        return out
+    out = np.array(arr, dtype=np.float64, copy=True)
+    out[mask] = (finite - lo) / span
+    out[~mask] = np.nan
+    return out
+
+
+_VIRIDIS_RGB: tuple[tuple[int, int, int], ...] = (
+    (68, 1, 84),
+    (72, 40, 120),
+    (62, 74, 137),
+    (49, 104, 142),
+    (38, 130, 142),
+    (31, 158, 137),
+    (53, 183, 121),
+    (110, 206, 88),
+    (181, 222, 43),
+    (253, 231, 37),
+)
+
+
+def _viridis_rgba(t: float, alpha: float) -> str:
+    """Sample Viridis at ``t`` ∈ [0, 1] with opacity ``alpha`` ∈ [0, 1]."""
+    if not np.isfinite(t):
+        return "rgba(0,0,0,0)"
+    t_clip = float(np.clip(t, 0.0, 1.0))
+    a = float(np.clip(alpha if np.isfinite(alpha) else 0.0, 0.0, 1.0))
+    # Floor so the mesh stays faintly visible at low Delta (ghost effect).
+    a = 0.06 + 0.94 * a
+    n = len(_VIRIDIS_RGB) - 1
+    x = t_clip * n
+    i = int(np.floor(x))
+    if i >= n:
+        r, g, b = _VIRIDIS_RGB[-1]
+    else:
+        f = x - i
+        c0, c1 = _VIRIDIS_RGB[i], _VIRIDIS_RGB[i + 1]
+        r = int(round(c0[0] + f * (c1[0] - c0[0])))
+        g = int(round(c0[1] + f * (c1[1] - c0[1])))
+        b = int(round(c0[2] + f * (c1[2] - c0[2])))
+    return f"rgba({r},{g},{b},{a:.4f})"
+
+
+def _gex_delta_rgba_colorscale(n_gamma: int = 48, n_delta: int = 24) -> list[list[Any]]:
+    """Discrete colorscale: GEX→RGB (Viridis), Delta→alpha."""
+    n_gamma = max(int(n_gamma), 2)
+    n_delta = max(int(n_delta), 2)
+    n = n_gamma * n_delta
+    scale: list[list[Any]] = []
+    denom = float(n - 1) if n > 1 else 1.0
+    for gi in range(n_gamma):
+        g = gi / float(n_gamma - 1)
+        for di in range(n_delta):
+            d = di / float(n_delta - 1)
+            idx = gi * n_delta + di
+            scale.append([idx / denom, _viridis_rgba(g, d)])
+    return scale
+
+
+def _encode_gex_delta_color(
+    gamma_norm: np.ndarray,
+    delta_norm: np.ndarray,
+    *,
+    n_gamma: int = 48,
+    n_delta: int = 24,
+) -> np.ndarray:
+    """Pack normalized GEX + Delta into a spatially smooth colorscale coordinate."""
+    n_gamma = max(int(n_gamma), 2)
+    n_delta = max(int(n_delta), 2)
+    g = np.array(gamma_norm, dtype=np.float64, copy=True)
+    d = np.array(delta_norm, dtype=np.float64, copy=True)
+    g_ok = np.isfinite(g)
+    d_ok = np.isfinite(d)
+    g = np.clip(g, 0.0, 1.0)
+    d = np.clip(d, 0.0, 1.0)
+    g[~g_ok] = 0.0
+    d[~d_ok] = 0.0
+    g_bin = np.floor(g * (n_gamma - 1) + 1e-12).astype(np.int64)
+    d_bin = np.floor(d * (n_delta - 1) + 1e-12).astype(np.int64)
+    g_bin = np.clip(g_bin, 0, n_gamma - 1)
+    d_bin = np.clip(d_bin, 0, n_delta - 1)
+    encoded = (g_bin * n_delta + d_bin).astype(np.float64)
+    denom = float(n_gamma * n_delta - 1) or 1.0
+    return encoded / denom
+
+
+def _pivot_risk_field(
+    frame: pd.DataFrame,
+    value_col: str,
+    x_col: str,
+    y_col: str | None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Pivot a long frame to ``(z2d, x_axis, y_axis)``; always copies arrays."""
+    plot = frame.copy()
+    plot[x_col] = pd.to_numeric(plot[x_col], errors="coerce")
+    plot[value_col] = pd.to_numeric(plot[value_col], errors="coerce")
+    if y_col is None or y_col not in plot.columns:
+        xs = np.array(plot[x_col].to_numpy(dtype=np.float64), copy=True)
+        zs = np.array(plot[value_col].to_numpy(dtype=np.float64), copy=True)
+        order = np.argsort(xs)
+        x_axis = xs[order]
+        z_row = zs[order]
+        return np.array(z_row.reshape(1, -1), copy=True), x_axis, np.array([0.0], dtype=np.float64)
+    plot[y_col] = pd.to_numeric(plot[y_col], errors="coerce")
+    plot = plot.replace([np.inf, -np.inf], np.nan).dropna(subset=[x_col, y_col])
+    if plot.empty:
+        return (
+            np.zeros((0, 0), dtype=np.float64),
+            np.zeros(0, dtype=np.float64),
+            np.zeros(0, dtype=np.float64),
+        )
+    pivot = plot.pivot_table(index=y_col, columns=x_col, values=value_col, aggfunc="mean")
+    pivot = pivot.sort_index().sort_index(axis=1)
+    z2d = np.array(pivot.to_numpy(dtype=np.float64), copy=True)
+    x_axis = np.array(pivot.columns.to_numpy(dtype=np.float64), copy=True)
+    y_axis = np.array(pivot.index.to_numpy(dtype=np.float64), copy=True)
+    return z2d, x_axis, y_axis
+
+
+def generate_integrated_risk_surface(df: pd.DataFrame) -> Any:
+    """Build a single Plotly ``go.Surface`` for the Total Risk Profile.
+
+    Layering (Price/Strike × DaysToExpiry grid from ``df``):
+    - ``z``: Volatility (IV) min-max normalized to ``[0, 1]``
+    - ``surfacecolor``: GEX / Gamma normalized, packed with Delta for opacity
+    - Alpha: normalized ``|Delta|`` drives per-vertex transparency (ghost effect)
+      via an rgba colorscale (Plotly Surface has no independent opacity channel)
+
+    Always ``.copy()``s the input frame and copies arrays before mutation.
+    Returns an empty ``go.Surface`` when required columns or finite data are missing.
+    """
+    import plotly.graph_objects as go
+
+    empty = go.Surface(
+        z=np.array([[np.nan]], dtype=np.float64),
+        name="Total Risk Profile",
+        showscale=False,
+    )
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        return empty
+    frame = df.copy()
+    col_map = {str(c).strip().lower(): c for c in frame.columns}
+    def _col(*names: str) -> str | None:
+        for name in names:
+            key = str(name).strip().lower()
+            if key in col_map:
+                return str(col_map[key])
+        return None
+
+    delta_c = _col("Delta", "delta")
+    gamma_c = _col("Gamma", "gamma", "GEX", "gex")
+    vol_c = _col("Volatility", "IV", "impliedVolatility", "sigma", "iv", "Vol")
+    x_c = _col("Price", "Strike", "K", "strike")
+    y_c = _col("DaysToExpiry", "DTE", "dte", "days_to_expiry")
+    if delta_c is None or gamma_c is None or vol_c is None or x_c is None:
+        return empty
+
+    z_vol, x_axis, y_axis = _pivot_risk_field(frame, vol_c, x_c, y_c)
+    z_gamma, _, _ = _pivot_risk_field(frame, gamma_c, x_c, y_c)
+    z_delta, _, _ = _pivot_risk_field(frame, delta_c, x_c, y_c)
+    if z_vol.size == 0 or z_gamma.shape != z_vol.shape or z_delta.shape != z_vol.shape:
+        # Align via a joint pivot on a trimmed frame when shapes diverge.
+        keep = [x_c, delta_c, gamma_c, vol_c] + ([y_c] if y_c else [])
+        slim = frame.loc[:, [c for c in keep if c is not None]].copy()
+        z_vol, x_axis, y_axis = _pivot_risk_field(slim, vol_c, x_c, y_c)
+        z_gamma, _, _ = _pivot_risk_field(slim, gamma_c, x_c, y_c)
+        z_delta, _, _ = _pivot_risk_field(slim, delta_c, x_c, y_c)
+    if z_vol.size == 0 or z_vol.shape != z_gamma.shape or z_vol.shape != z_delta.shape:
+        return empty
+
+    vol_n = minmax_normalize_01(z_vol)
+    gamma_n = minmax_normalize_01(z_gamma)
+    # |Delta| so puts and calls both drive opacity toward high-risk extremes.
+    delta_abs = np.abs(np.array(z_delta, dtype=np.float64, copy=True))
+    delta_n = minmax_normalize_01(delta_abs)
+    if not np.any(np.isfinite(vol_n)):
+        return empty
+
+    n_gamma, n_delta = 48, 24
+    encoded = _encode_gex_delta_color(gamma_n, delta_n, n_gamma=n_gamma, n_delta=n_delta)
+    colorscale = _gex_delta_rgba_colorscale(n_gamma=n_gamma, n_delta=n_delta)
+    # Reinforce ghosting: opacityscale tracks the packed color (GEX×Δ).
+    opacityscale: list[list[Any]] = [[0.0, 0.08], [0.35, 0.35], [0.7, 0.7], [1.0, 1.0]]
+
+    z2d, x_ok, y_ok, _warning = prepare_plotly_surface_xyz(vol_n, x_axis, y_axis)
+    payload: dict[str, Any] = {
+        "z": np.array(z2d, dtype=np.float64, copy=True),
+        "surfacecolor": np.array(encoded, dtype=np.float64, copy=True),
+        "cmin": 0.0,
+        "cmax": 1.0,
+        "colorscale": colorscale,
+        "opacityscale": opacityscale,
+        "showscale": True,
+        "colorbar": {"title": "GEX (Δ-opacity)"},
+        "name": "Total Risk Profile",
+        "hovertemplate": (
+            "X=%{x:.2f}<br>Y=%{y:.2f}<br>"
+            "Vol (norm)=%{z:.3f}<br>"
+            "GEX×Δ=%{surfacecolor:.3f}<extra>Total Risk Profile</extra>"
+        ),
+    }
+    if x_ok is not None and y_ok is not None:
+        payload["x"] = np.array(x_ok, dtype=np.float64, copy=True)
+        payload["y"] = np.array(y_ok, dtype=np.float64, copy=True)
+    return go.Surface(**payload)
+
+
 _EMPTY_GREEKS: dict[str, float | None] = {
     "Delta": None,
     "Gamma": None,

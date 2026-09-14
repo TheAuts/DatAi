@@ -35,7 +35,9 @@ from quant_engine import (
     calculate_zomma,
     generate_pro_surface_data,
     generate_greek_curve,
+    generate_integrated_risk_surface,
     generate_synthetic_drift,
+    minmax_normalize_01,
     prefill_drift_data,
     prefill_driftdata,
     drift_prefill_stamp,
@@ -944,3 +946,55 @@ def test_empty_or_mismatched_expiry_does_not_save_unscoped_next_monthly(tmp_path
     assert all(str(row.get("expiration", ""))[:10] == requested for row in rows)
     # Critically: never persisted next-monthly under the future expiry label.
     assert not any(str(row.get("expiration", ""))[:10] == "2026-09-18" for row in rows)
+
+
+def test_minmax_normalize_01_range_and_guards() -> None:
+    scaled = minmax_normalize_01([2.0, 4.0, 6.0])
+    assert scaled.shape == (3,)
+    np.testing.assert_allclose(scaled, [0.0, 0.5, 1.0])
+
+    zero_range = minmax_normalize_01([3.0, 3.0, 3.0])
+    np.testing.assert_allclose(zero_range, [0.0, 0.0, 0.0])
+
+    all_nan = minmax_normalize_01([np.nan, np.nan])
+    np.testing.assert_allclose(all_nan, [0.0, 0.0])
+
+    with_nan = minmax_normalize_01([1.0, np.nan, 3.0])
+    assert with_nan[0] == 0.0 and with_nan[2] == 1.0
+    assert np.isnan(with_nan[1])
+
+    # Copy semantics: mutating output must not alter a writable source array.
+    src = np.array([0.0, 5.0, 10.0], dtype=np.float64)
+    out = minmax_normalize_01(src)
+    out[0] = 99.0
+    assert src[0] == 0.0
+
+
+def test_generate_integrated_risk_surface_nonempty() -> None:
+    import plotly.graph_objects as go
+
+    rows = []
+    for dte in (7.0, 14.0, 30.0):
+        for price in (90.0, 100.0, 110.0):
+            rows.append(
+                {
+                    "Price": price,
+                    "DaysToExpiry": dte,
+                    "Delta": (price - 100.0) / 20.0,
+                    "Gamma": max(0.01, 0.05 - abs(price - 100.0) / 500.0),
+                    "Volatility": 0.15 + 0.01 * (dte / 30.0) + 0.002 * abs(price - 100.0) / 10.0,
+                }
+            )
+    frame = pd.DataFrame(rows)
+    surface = generate_integrated_risk_surface(frame)
+    assert isinstance(surface, go.Surface)
+    z = np.asarray(surface.z, dtype=float)
+    assert z.ndim == 2 and z.size > 0
+    assert np.any(np.isfinite(z))
+    assert surface.surfacecolor is not None
+    sc = np.asarray(surface.surfacecolor, dtype=float)
+    assert sc.shape == z.shape
+    assert surface.name == "Total Risk Profile"
+
+    empty = generate_integrated_risk_surface(pd.DataFrame())
+    assert isinstance(empty, go.Surface)
