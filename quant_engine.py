@@ -920,9 +920,64 @@ class DataRepository:
         return self.cache_dir / f"{self._safe_ticker(ticker)}.json"
 
     def _history_stamp(self, when: datetime | None = None) -> str:
-        """Second-resolution stamp for unique snapshot filenames (``%Y%m%d%H%M%S``)."""
+        """Second-resolution stamp for unique snapshot filenames (``%Y%m%d%H%M%S``).
+
+        This is **capture time**, not option expiry. When expiry is known,
+        ``_stamp_with_expiry`` prefixes ``YYYYmmDDexp_`` so filenames/labels
+        do not look like the wrong contract.
+        """
         moment = when or datetime.now()
         return moment.strftime("%Y%m%d%H%M%S")
+
+    @staticmethod
+    def _expiry_compact(expiry: Any) -> str | None:
+        """Normalize expiry to ``YYYYmmDD`` for filename/stamp tokens."""
+        if expiry is None or expiry == "":
+            return None
+        if isinstance(expiry, datetime):
+            return expiry.date().strftime("%Y%m%d")
+        if isinstance(expiry, date):
+            return expiry.strftime("%Y%m%d")
+        text = str(expiry).strip()
+        if len(text) >= 10 and text[4] == "-" and text[7] == "-":
+            digits = text[:10].replace("-", "")
+            return digits if len(digits) == 8 and digits.isdigit() else None
+        digits = "".join(ch for ch in text if ch.isdigit())
+        return digits[:8] if len(digits) >= 8 else None
+
+    @classmethod
+    def _stamp_with_expiry(cls, capture_stamp: str, expiry: Any) -> str:
+        """``{YYYYmmDDexp}_{captureStamp}`` when expiry known; else capture stamp alone."""
+        base = str(capture_stamp or "").strip()
+        token = cls._expiry_compact(expiry)
+        if not token or not base:
+            return base
+        if "exp_" in base:
+            return base
+        return f"{token}exp_{base}"
+
+    @staticmethod
+    def _expiry_from_records(records: Any) -> str | None:
+        """Single shared ISO expiry from option rows, if unambiguous."""
+        if not isinstance(records, list):
+            return None
+        found: set[str] = set()
+        for row in records:
+            if not isinstance(row, dict):
+                continue
+            for key in ("expiration", "expiry", "Expiry", "Expiration"):
+                value = row.get(key)
+                if value is None or value == "":
+                    continue
+                text = str(value).strip()
+                if len(text) >= 10 and text[4] == "-" and text[7] == "-":
+                    found.add(text[:10])
+                elif len(text) >= 8 and text[:8].isdigit():
+                    found.add(f"{text[:4]}-{text[4:6]}-{text[6:8]}")
+                break
+        if len(found) == 1:
+            return next(iter(found))
+        return None
 
     def _history_path(self, ticker: str, stamp: str | None = None) -> Path:
         label = stamp or self._history_stamp()
@@ -930,7 +985,7 @@ class DataRepository:
         joined = os.path.join("data_history", filename)
         path = Path(self.history_dir) / os.path.basename(joined)
         if path.exists():
-            filename = f"{self._safe_ticker(ticker)}_{self._history_stamp()}_{int(time.time())}.json"
+            filename = f"{self._safe_ticker(ticker)}_{label}_{int(time.time())}.json"
             joined = os.path.join("data_history", filename)
             path = Path(self.history_dir) / os.path.basename(joined)
         return path
@@ -953,6 +1008,13 @@ class DataRepository:
         os.makedirs(self.history_dir, exist_ok=True)
         payload = self._payload_from_data(ticker, data)
         self._embed_contract_fields(payload, metadata)
+        # Prefix capture stamp with option expiry so on-disk names show the contract.
+        expiry = payload.get("expiry")
+        if expiry in (None, "") and isinstance(payload.get("metadata"), dict):
+            expiry = payload["metadata"].get("expiry")
+        if expiry in (None, ""):
+            expiry = self._expiry_from_records(payload.get("data"))
+        payload["stamp"] = self._stamp_with_expiry(str(payload.get("stamp") or self._history_stamp()), expiry)
         # Mandatory: every computed surface must exist (actually computed from the
         # raw chain, not defaulted) before anything is written to disk.
         frame = self._records_to_frame(payload.get("data"))
@@ -1012,18 +1074,31 @@ class DataRepository:
 
     @classmethod
     def format_snapshot_label(cls, payload: Any, stamp: str | None = None) -> str:
-        """Human label like ``SPY 580 Call 2026-10-16 @ 14:30:05``; falls back to stamp."""
+        """Human label with expiry first: ``2026-10-30 · SPY 580 Call @ 14:30:05``.
+
+        Falls back to stamp alone when no contract fields exist. Expiry is taken from
+        top-level / metadata, then from unambiguous ``data[].expiration`` rows (legacy
+        snapshots), then from an ``YYYYmmDDexp_`` stamp prefix.
+        """
         if not isinstance(payload, dict):
             return str(stamp or "")
         meta = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
         ticker = payload.get("ticker") or meta.get("ticker")
         strike = payload.get("strike") if payload.get("strike") is not None else meta.get("strike")
         expiry = payload.get("expiry") or meta.get("expiry")
+        if expiry in (None, ""):
+            expiry = cls._expiry_from_records(payload.get("data"))
         ctype = payload.get("contract_type") or meta.get("contract_type")
         ctype = cls._normalize_contract_type(ctype) or ctype
         stamp_text = str(stamp or payload.get("stamp") or "").strip()
+        if expiry in (None, "") and "exp_" in stamp_text:
+            token = stamp_text.split("exp_", 1)[0]
+            if len(token) == 8 and token.isdigit():
+                expiry = f"{token[:4]}-{token[4:6]}-{token[6:8]}"
         time_part = cls._format_stamp_clock(stamp_text)
         parts: list[str] = []
+        if expiry:
+            parts.append(str(expiry).strip()[:10])
         if ticker:
             parts.append(str(ticker).strip().upper())
         if strike is not None and strike != "":
@@ -1033,11 +1108,13 @@ class DataRepository:
                 parts.append(str(strike))
         if ctype:
             parts.append(str(ctype))
-        if expiry:
-            parts.append(str(expiry).strip()[:10])
         if not parts:
             return stamp_text or "?"
-        label = " ".join(parts)
+        # Expiry-first when present: "2026-10-30 · SPY 580 Call"
+        if expiry and len(parts) > 1:
+            label = f"{parts[0]} · {' '.join(parts[1:])}"
+        else:
+            label = " ".join(parts)
         if time_part:
             label = f"{label} @ {time_part}"
         return label
@@ -1048,6 +1125,9 @@ class DataRepository:
         text = str(stamp or "").strip()
         if not text:
             return ""
+        # Expiry-prefixed: YYYYmmDDexp_YYYYMMDDHHMMSS (optional _<epoch> suffix)
+        if "exp_" in text:
+            text = text.split("exp_", 1)[-1]
         # New high-res: YYYYMMDDHHMMSS (optionally with _<epoch> collision suffix)
         head = text.split("_", 1)[0]
         if len(head) >= 14 and head[:14].isdigit():

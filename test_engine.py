@@ -660,13 +660,14 @@ def test_snapshot_vol_surface_from_history(tmp_path) -> None:
 
 
 def test_snapshot_stamp_second_resolution_and_top_level_keys(tmp_path) -> None:
-    """Saves use %Y%m%d%H%M%S stamps and embed ticker/strike/expiry/contract_type top-level."""
+    """Saves use expiry-prefixed capture stamps and embed contract fields top-level."""
     repo = DataRepository(cache_dir=tmp_path, history_dir=tmp_path / "data_history", status_probe=lambda: {"ok": True})
     frame = pd.DataFrame(
         {
             "Strike": [580.0, 580.0],
             "DaysToExpiry": [7.0, 30.0],
             "Delta": [0.55, 0.52],
+            "expiration": ["2026-10-16", "2026-10-16"],
         }
     )
     repo.save_to_cache(
@@ -680,11 +681,13 @@ def test_snapshot_stamp_second_resolution_and_top_level_keys(tmp_path) -> None:
         },
     )
     stamp = repo.get_available_snapshots("SPY")[-1]
-    assert len(stamp) >= 14
-    assert stamp[:14].isdigit()
-    assert datetime.strptime(stamp[:14], "%Y%m%d%H%M%S")
+    assert "exp_" in stamp
+    assert stamp.startswith("20261016exp_")
+    capture = stamp.split("exp_", 1)[-1].split("_", 1)[0]
+    assert len(capture) >= 14 and capture[:14].isdigit()
+    assert datetime.strptime(capture[:14], "%Y%m%d%H%M%S")
     path = Path(repo.get_historical_snapshots("SPY")[-1])
-    assert path.name.startswith("SPY_")
+    assert path.name.startswith("SPY_20261016exp_")
     assert path.name.endswith(".json")
     payload = json.loads(path.read_text(encoding="utf-8"))
     assert payload["ticker"] == "SPY"
@@ -695,7 +698,16 @@ def test_snapshot_stamp_second_resolution_and_top_level_keys(tmp_path) -> None:
     assert payload["metadata"]["strike"] == 580.0
     assert payload["metadata"]["contract_type"] == "Call"
     label = DataRepository.format_snapshot_label(payload, stamp)
-    assert label.startswith("SPY 580 Call 2026-10-16 @ ")
+    assert label.startswith("2026-10-16 · SPY 580 Call @ ")
+    # Legacy chain rows (no metadata) still surface expiry in the Time Machine label.
+    legacy = {
+        "ticker": "SPY",
+        "stamp": "2026-09-13_1346",
+        "data": [{"expiration": "2026-10-30", "strike": 580.0}],
+    }
+    assert DataRepository.format_snapshot_label(legacy, "2026-09-13_1346").startswith(
+        "2026-10-30 · SPY @ "
+    )
     # Legacy / sparse payload still yields a usable fallback label.
     assert DataRepository.format_snapshot_label({}, "20260101123045") == "20260101123045"
     assert DataRepository.format_snapshot_label({"ticker": "QQQ"}, "2026-01-01_1230").startswith("QQQ @ ")
