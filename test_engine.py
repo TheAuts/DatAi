@@ -35,6 +35,7 @@ from quant_engine import (
     calculate_zomma,
     generate_pro_surface_data,
     generate_greek_curve,
+    compute_total_risk_score,
     generate_integrated_risk_surface,
     generate_synthetic_drift,
     minmax_normalize_01,
@@ -982,6 +983,7 @@ def test_generate_integrated_risk_surface_nonempty() -> None:
                     "DaysToExpiry": dte,
                     "Delta": (price - 100.0) / 20.0,
                     "Gamma": max(0.01, 0.05 - abs(price - 100.0) / 500.0),
+                    "Vega": 0.1 + 0.01 * (dte / 30.0),
                     "Volatility": 0.15 + 0.01 * (dte / 30.0) + 0.002 * abs(price - 100.0) / 10.0,
                 }
             )
@@ -996,5 +998,39 @@ def test_generate_integrated_risk_surface_nonempty() -> None:
     assert sc.shape == z.shape
     assert surface.name == "Total Risk Profile"
 
+    flat_vol = generate_integrated_risk_surface(frame, include_vol=False)
+    z_flat = np.asarray(flat_vol.z, dtype=float)
+    finite = z_flat[np.isfinite(z_flat)]
+    assert finite.size > 0
+    assert np.allclose(finite, 0.5, atol=1e-9)
+
+    no_gamma = generate_integrated_risk_surface(frame, include_gamma=False)
+    sc_ng = np.asarray(no_gamma.surfacecolor, dtype=float)
+    # Neutral mid-GEX with varying delta still packs; color span shrinks vs full gamma.
+    full_sc = np.asarray(surface.surfacecolor, dtype=float)
+    assert np.nanstd(sc_ng) <= np.nanstd(full_sc) + 1e-12
+
+    no_delta = generate_integrated_risk_surface(frame, include_delta=False)
+    assert list(no_delta.opacityscale) == [[0.0, 1.0], [1.0, 1.0]] or list(
+        map(list, no_delta.opacityscale)
+    ) == [[0.0, 1.0], [1.0, 1.0]]
+
     empty = generate_integrated_risk_surface(pd.DataFrame())
     assert isinstance(empty, go.Surface)
+
+
+def test_compute_total_risk_score_weights_and_alert_band() -> None:
+    frame = pd.DataFrame(
+        {
+            "Delta": [0.9, 0.8, 0.85],
+            "Gamma": [0.06, 0.05, 0.055],
+            "Vega": [0.3, 0.28, 0.32],
+        }
+    )
+    score = compute_total_risk_score(frame.copy())
+    assert 0.0 <= score <= 1.0
+    assert score > 0.5
+    assert compute_total_risk_score(pd.DataFrame()) == 0.0
+    # High equal values near refs → near 1.0
+    hot = pd.DataFrame({"Delta": [1.0, 1.0], "Gamma": [0.05, 0.05], "Vega": [0.25, 0.25]})
+    assert compute_total_risk_score(hot) == pytest.approx(1.0, abs=1e-9)

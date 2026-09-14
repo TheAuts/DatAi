@@ -51,6 +51,11 @@ from quant_engine import (
     generate_3d_greek_surface,
     generate_delta_term_structure,
     generate_greek_curve,
+    RISK_SCORE_ALERT_THRESHOLD,
+    RISK_WEIGHT_DELTA,
+    RISK_WEIGHT_GAMMA,
+    RISK_WEIGHT_VEGA,
+    compute_total_risk_score,
     generate_integrated_risk_surface,
     generate_pro_surface_data,
     generate_vol_surface_data,
@@ -1870,44 +1875,40 @@ def _build_integrated_risk_frame(
     heston_sigma: float,
     rho: float,
 ) -> pd.DataFrame:
-    """Merge Delta / Gamma grids and broadcast Volatility for the risk surface."""
-    delta = generate_3d_greek_surface(
-        ticker,
-        strike,
-        expiry_range,
-        greek="Delta",
-        price_range=prices if prices else None,
-        r=DEFAULT_RATE,
-        sigma=sigma,
-        option_type=option_type,
-        model=model,
-        v0=v0,
-        kappa=kappa,
-        theta=theta,
-        heston_sigma=heston_sigma,
-        rho=rho,
-    ).copy()
-    gamma = generate_3d_greek_surface(
-        ticker,
-        strike,
-        expiry_range,
-        greek="Gamma",
-        price_range=prices if prices else None,
-        r=DEFAULT_RATE,
-        sigma=sigma,
-        option_type=option_type,
-        model=model,
-        v0=v0,
-        kappa=kappa,
-        theta=theta,
-        heston_sigma=heston_sigma,
-        rho=rho,
-    ).copy()
-    if delta.empty or gamma.empty:
-        return pd.DataFrame(columns=["Price", "DaysToExpiry", "Delta", "Gamma", "Volatility"])
+    """Merge Delta / Gamma / Vega grids and broadcast Volatility for the risk surface."""
+    empty_cols = ["Price", "DaysToExpiry", "Delta", "Gamma", "Vega", "Volatility"]
+
+    def _greek_grid(greek: str) -> pd.DataFrame:
+        return generate_3d_greek_surface(
+            ticker,
+            strike,
+            expiry_range,
+            greek=greek,
+            price_range=prices if prices else None,
+            r=DEFAULT_RATE,
+            sigma=sigma,
+            option_type=option_type,
+            model=model,
+            v0=v0,
+            kappa=kappa,
+            theta=theta,
+            heston_sigma=heston_sigma,
+            rho=rho,
+        ).copy()
+
+    delta = _greek_grid("Delta")
+    gamma = _greek_grid("Gamma")
+    vega = _greek_grid("Vega")
+    if delta.empty or gamma.empty or vega.empty:
+        return pd.DataFrame(columns=empty_cols)
     delta = delta.rename(columns={"Value": "Delta"})
     gamma = gamma.rename(columns={"Value": "Gamma"})
-    merged = delta.merge(gamma, on=["Price", "DaysToExpiry"], how="inner").copy()
+    vega = vega.rename(columns={"Value": "Vega"})
+    merged = (
+        delta.merge(gamma, on=["Price", "DaysToExpiry"], how="inner")
+        .merge(vega, on=["Price", "DaysToExpiry"], how="inner")
+        .copy()
+    )
     # Prefer per-node IV from the live vol surface when strike/DTE align; else sigma.
     vol = np.full(len(merged.index), float(sigma), dtype=np.float64)
     try:
@@ -1936,7 +1937,7 @@ def _build_integrated_risk_frame(
     except Exception:
         pass
     merged["Volatility"] = np.array(vol, dtype=np.float64, copy=True)
-    return merged
+    return merged.copy()
 
 
 @st.cache_data(show_spinner="Building integrated risk surface…")
@@ -3243,13 +3244,13 @@ def main() -> None:
         except Exception:
             st.error("Could not render the Vanna/Volga chart.")
 
+    # Unified surface viewport: former "3D Surface" / "Volatility Surface" tabs
+    # consolidate into Integrated Risk View. Time Machine + Portfolio unchanged.
     tab_labels = [
         "Greeks",
         "Advanced Metrics",
-        "3D Surface",
         "Time-Sensitivity",
         "Time Machine",
-        "Volatility Surface",
         "Pro Metrics",
         "Market Analyst",
         "Portfolio & Risk",
@@ -3258,10 +3259,8 @@ def main() -> None:
     (
         greeks_tab,
         advanced_tab,
-        surface_tab,
         time_tab,
         machine_tab,
-        vol_tab,
         pro_tab,
         analyst_tab,
         portfolio_tab,
@@ -3332,40 +3331,6 @@ def main() -> None:
                 except Exception:
                     st.error("Could not render the Gamma Decay chart.")
 
-    if surface_tab.open:
-        with surface_tab:
-            dte = max((expiry - date.today()).days, 1)
-            expiry_range = tuple(sorted({float(d) for d in range(7, 91, 7)} | {float(dte)}))
-            prices = tuple(
-                float(p)
-                for p in pd.to_numeric(frame["Price"], errors="coerce").dropna().tolist()
-            )
-            surface_model = model
-            if heston_selected:
-                st.caption("Heston 3D is opt-in so the 2D Heston curves on Greeks can render first.")
-                if st.button("Build Heston gamma surface", key="build_heston_gamma_surface"):
-                    st.session_state["run_heston_gamma_surface"] = True
-                if not st.session_state.get("run_heston_gamma_surface"):
-                    surface_model = MODEL_BLACK_SCHOLES
-            try:
-                surface = _load_gamma_surface(
-                    ticker,
-                    float(strike),
-                    expiry_range,
-                    prices,
-                    float(sigma),
-                    option_type,
-                    surface_model,
-                    v0,
-                    kappa,
-                    theta,
-                    heston_sigma,
-                    rho,
-                )
-                render_gamma_surface(surface)
-            except Exception:
-                st.error("Could not render the 3D Gamma surface.")
-
     if time_tab.open:
         with time_tab:
             dte = max((expiry - date.today()).days, 1)
@@ -3401,14 +3366,6 @@ def main() -> None:
     if machine_tab.open:
         add_time_machine_tab(machine_tab, ticker, strike=float(strike), expiry=expiry)
 
-    if vol_tab.open:
-        with vol_tab:
-            try:
-                vol_surface = _load_vol_surface(ticker)
-                render_vol_surface(vol_surface)
-            except Exception as error:
-                st.exception(error)
-
     if pro_tab.open:
         add_pro_metrics_tab(
             pro_tab,
@@ -3434,6 +3391,17 @@ def main() -> None:
 
     if integrated_tab.open:
         with integrated_tab:
+            st.caption(
+                "Unified risk surface (replaces standalone 3D Gamma / Vol Surface tabs). "
+                "Z = Vol · color = GEX · opacity = |Delta|."
+            )
+            layer_cols = st.columns(3)
+            with layer_cols[0]:
+                toggle_gamma = st.toggle("Toggle Gamma Layer", value=True, key="risk_toggle_gamma")
+            with layer_cols[1]:
+                toggle_delta = st.toggle("Toggle Delta Layer", value=True, key="risk_toggle_delta")
+            with layer_cols[2]:
+                toggle_vol = st.toggle("Toggle Volatility Layer", value=True, key="risk_toggle_vol")
             dte = max((expiry - date.today()).days, 1)
             expiry_range = tuple(sorted({float(d) for d in range(7, 91, 7)} | {float(dte)}))
             prices = tuple(
@@ -3458,8 +3426,36 @@ def main() -> None:
                     heston_sigma,
                     rho,
                 )
-                surface = generate_integrated_risk_surface(risk_frame)
+                surface = generate_integrated_risk_surface(
+                    risk_frame.copy(),
+                    include_gamma=bool(toggle_gamma),
+                    include_delta=bool(toggle_delta),
+                    include_vol=bool(toggle_vol),
+                )
                 render_integrated_risk_surface(surface)
+                # Risk Dashboard — weights documented in quant_engine (equal thirds by default).
+                total_score = compute_total_risk_score(
+                    risk_frame.copy(),
+                    weight_delta=RISK_WEIGHT_DELTA,
+                    weight_gamma=RISK_WEIGHT_GAMMA,
+                    weight_vega=RISK_WEIGHT_VEGA,
+                )
+                st.metric("Total Risk Score", f"{total_score:.3f}", border=True)
+                st.caption(
+                    f"Score = {RISK_WEIGHT_DELTA:.2f}·|Δ| + {RISK_WEIGHT_GAMMA:.2f}·|Γ| + "
+                    f"{RISK_WEIGHT_VEGA:.2f}·|Vega| (equal weights; mean |greek| / ref → [0,1]). "
+                    f"Alert threshold = {RISK_SCORE_ALERT_THRESHOLD:.2f}."
+                )
+                if total_score > RISK_SCORE_ALERT_THRESHOLD:
+                    st.error(
+                        f"Risk Alert: Total Risk Score {total_score:.3f} exceeds "
+                        f"threshold {RISK_SCORE_ALERT_THRESHOLD:.2f}."
+                    )
+                elif total_score > RISK_SCORE_ALERT_THRESHOLD * 0.8:
+                    st.warning(
+                        f"Elevated risk: Total Risk Score {total_score:.3f} is near "
+                        f"threshold {RISK_SCORE_ALERT_THRESHOLD:.2f}."
+                    )
             except Exception:
                 st.error("Could not render the Integrated Risk View surface.")
 
