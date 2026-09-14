@@ -653,10 +653,64 @@ def test_snapshot_vol_surface_from_history(tmp_path) -> None:
             rows.append({"Strike": strike, "DaysToExpiry": dte, "impliedVolatility": 0.20 + (strike - 100.0) * 0.002 + dte * 0.001})
     repo.save_to_cache("DIA", pd.DataFrame(rows))
     stamp = repo.get_available_snapshots("DIA")[-1]
+    path = Path(repo.get_historical_snapshots("DIA")[-1])
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert "vol_surface" in payload
+    assert isinstance(payload["vol_surface"], dict)
+    assert payload["vol_surface"].get("IV")
     surface = repo.snapshot_vol_surface("DIA", stamp)
     assert isinstance(surface, pd.DataFrame)
     assert {"Strike", "DaysToExpiry", "IV"}.issubset(surface.columns)
     assert len(surface.index) >= 10
+
+
+def test_snapshot_vol_surface_alias_and_2d_reshape(tmp_path) -> None:
+    """Alias keys are readable; preferred save key remains vol_surface."""
+    repo = DataRepository(cache_dir=tmp_path, history_dir=tmp_path / "data_history")
+    strike_axis = np.array([90.0, 100.0, 110.0], dtype=float)
+    dte_axis = np.array([7.0, 14.0], dtype=float)
+    grid_x, grid_y = np.meshgrid(strike_axis, dte_axis)
+    iv = np.array([[0.20, 0.22, 0.24], [0.21, 0.23, 0.25]], dtype=float)
+    alias_block = {
+        "Strike": grid_x.ravel().tolist(),
+        "DaysToExpiry": grid_y.ravel().tolist(),
+        "IV": iv.ravel().tolist(),
+    }
+    payload = {
+        "version": DataRepository.VERSION,
+        "ticker": "QQQ",
+        "saved_at": time.time(),
+        "stamp": "20260101120000",
+        "data": [
+            {"Strike": 100.0, "DaysToExpiry": 7.0, "impliedVolatility": 0.22},
+            {"Strike": 110.0, "DaysToExpiry": 14.0, "impliedVolatility": 0.25},
+        ],
+        "volatility_surface": alias_block,
+    }
+    history = tmp_path / "data_history"
+    history.mkdir(parents=True, exist_ok=True)
+    path = history / "QQQ_20260101120000.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    resolved = DataRepository.resolve_vol_surface_block(payload)
+    assert resolved is alias_block
+    frame = repo.snapshot_vol_surface("QQQ", "20260101120000")
+    assert isinstance(frame, pd.DataFrame)
+    assert len(frame.index) == 6
+    # Save path still writes preferred key only.
+    rows = []
+    for dte in (7.0, 14.0, 21.0, 30.0, 45.0):
+        for strike in (90.0, 95.0, 100.0, 105.0, 110.0):
+            rows.append({"Strike": strike, "DaysToExpiry": dte, "impliedVolatility": 0.2})
+    repo.save_to_cache("IWM", pd.DataFrame(rows))
+    saved = json.loads(Path(repo.get_historical_snapshots("IWM")[-1]).read_text(encoding="utf-8"))
+    assert "vol_surface" in saved
+    assert "volatility_surface" not in saved
+    z2d, x_ok, y_ok, warning = prepare_plotly_surface_xyz(
+        iv.ravel(), strike_axis, dte_axis, rows=2, cols=3
+    )
+    assert z2d.shape == (2, 3)
+    assert x_ok is not None and y_ok is not None
+    assert warning is None
 
 
 def test_snapshot_stamp_second_resolution_and_top_level_keys(tmp_path) -> None:

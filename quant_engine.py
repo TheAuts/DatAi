@@ -38,6 +38,8 @@ VOL_SURFACE_IV_MAX = 3.00
 VOL_SURFACE_STRIKE_POINTS = 80
 VOL_SURFACE_DTE_POINTS = 60
 VOL_SURFACE_GAUSS_SIGMA = 1.0
+# Preferred snapshot key first; aliases are read-only (saves always use vol_surface).
+VOL_SURFACE_PAYLOAD_KEYS: tuple[str, ...] = ("vol_surface", "volatility_surface", "iv_surface")
 SKEW_BEARISH_THRESHOLD = 0.10
 TERM_SHORT_DTE = 21.0
 TERM_LONG_DTE = 45.0
@@ -1473,6 +1475,45 @@ class DataRepository:
             return True
         return not any(v is not None and np.isfinite(float(v)) for v in values if isinstance(v, (int, float)))
 
+    @classmethod
+    def resolve_vol_surface_block(cls, payload: Mapping[str, Any] | None) -> dict[str, Any] | None:
+        """Return the first usable vol-surface dict from ``vol_surface`` or read aliases.
+
+        Saves always persist under ``vol_surface``; aliases are accepted on load only
+        so older / alternate payloads still render without changing the write path.
+        """
+        if not isinstance(payload, Mapping):
+            return None
+        for key in VOL_SURFACE_PAYLOAD_KEYS:
+            block = payload.get(key)
+            if isinstance(block, dict) and not cls._surface_is_empty(block, "IV"):
+                return block
+        # Empty but present preferred key — still return it so callers can warn.
+        preferred = payload.get("vol_surface")
+        return preferred if isinstance(preferred, dict) else None
+
+    @staticmethod
+    def vol_surface_block_to_frame(surface: Mapping[str, Any] | None) -> pd.DataFrame:
+        """Flattened Strike/DaysToExpiry/IV payload → DataFrame for Plotly pivoting."""
+        empty = pd.DataFrame(columns=["Strike", "DaysToExpiry", "IV"])
+        if not isinstance(surface, Mapping):
+            return empty
+        strikes = surface.get("Strike") or surface.get("strike") or []
+        dtes = surface.get("DaysToExpiry") or surface.get("dte") or []
+        ivs = surface.get("IV") or surface.get("iv") or []
+        if not isinstance(strikes, list) or not isinstance(dtes, list) or not isinstance(ivs, list):
+            return empty
+        n = min(len(strikes), len(dtes), len(ivs))
+        if n <= 0:
+            return empty
+        return pd.DataFrame(
+            {
+                "Strike": [np.nan if v is None else float(v) for v in strikes[:n]],
+                "DaysToExpiry": [np.nan if v is None else float(v) for v in dtes[:n]],
+                "IV": [np.nan if v is None else float(v) for v in ivs[:n]],
+            }
+        )
+
     def _compute_surfaces(self, frame: pd.DataFrame) -> dict[str, dict[str, Any]]:
         """Mandatory pre-save step: build every computed surface from the raw chain."""
         return {
@@ -1766,6 +1807,17 @@ class DataRepository:
         return frame
 
     def snapshot_vol_surface(self, ticker: str, timestamp: Any) -> pd.DataFrame | str:
+        """Load implied-vol surface for a history stamp.
+
+        Prefers the persisted ``vol_surface`` block (or read aliases); falls back to
+        rebuilding from the raw chain when the stored block is empty/missing.
+        """
+        payload = self._snapshot_payload(ticker, timestamp) or {}
+        block = self.resolve_vol_surface_block(payload)
+        if block is not None and not self._surface_is_empty(block, "IV"):
+            frame = self.vol_surface_block_to_frame(block)
+            if not frame.empty and frame["IV"].notna().any():
+                return frame
         return build_vol_surface_grid(self._snapshot_frame(ticker, timestamp))
 
     def get_data(self, ticker: str, expiry: Any = None, date: str | None = None) -> pd.DataFrame:

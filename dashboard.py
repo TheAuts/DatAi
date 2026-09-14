@@ -2506,11 +2506,12 @@ def render_delta_drift_surface(
 
 def render_time_machine_vol_surface(frame: pd.DataFrame | str, timestamp: str) -> None:
     if isinstance(frame, str):
+        st.warning("No data available for the Volatility Surface.")
         st.info(frame)
         return
     required = {"Strike", "DaysToExpiry", "IV"}
     if frame is None or frame.empty or not required.issubset(frame.columns):
-        st.info("Insufficient Data")
+        st.warning("No data available for the Volatility Surface.")
         return
     plot = frame.loc[:, ["Strike", "DaysToExpiry", "IV"]].copy()
     plot["Strike"] = pd.to_numeric(plot["Strike"], errors="coerce")
@@ -2518,29 +2519,39 @@ def render_time_machine_vol_surface(frame: pd.DataFrame | str, timestamp: str) -
     plot["IV"] = pd.to_numeric(plot["IV"], errors="coerce")
     plot = plot.replace([np.inf, -np.inf], np.nan).dropna(subset=["Strike", "DaysToExpiry"])
     if plot.empty or not plot["IV"].notna().any():
-        st.info("Insufficient Data")
+        st.warning("No data available for the Volatility Surface.")
         return
     pivot = plot.pivot_table(index="DaysToExpiry", columns="Strike", values="IV", aggfunc="mean")
     pivot = pivot.sort_index().sort_index(axis=1)
+    x_axis = pivot.columns.to_numpy(dtype=float)
+    y_axis = pivot.index.to_numpy(dtype=float)
+    # Axes → meshgrid so Z rows/cols match Plotly Surface (len(y), len(x)).
+    _mesh_x, _mesh_y = np.meshgrid(x_axis, y_axis)
     z = np.array(pivot.to_numpy(dtype=float), copy=True)
     z[~np.isfinite(z)] = np.nan
-    if z.ndim != 2 or not np.isfinite(z).any():
-        st.write(f"IV Z-matrix shape: {z.shape}")
-        st.error("Snapshot volatility surface has no finite values.")
-        return
-    st.write(f"IV Z-matrix shape: {z.shape}, Min: {np.nanmin(z)}, Max: {np.nanmax(z)}")
-    fig = go.Figure(
-        data=[
-            _plotly_surface(
-                z,
-                pivot.columns.to_numpy(dtype=float),
-                pivot.index.to_numpy(dtype=float),
-                colorscale="Viridis",
-                colorbar={"title": "IV"},
-                hovertemplate="Strike=%{x:.2f}<br>DTE=%{y:.1f}<br>IV=%{z:.4f}<extra></extra>",
-            )
-        ]
+    z2d, x_ok, y_ok, axis_warning = prepare_plotly_surface_xyz(
+        z, x_axis, y_axis, rows=_mesh_y.shape[0], cols=_mesh_x.shape[1]
     )
+    if z2d.ndim != 2:
+        st.error("Volatility surface data is not in the expected 2D format.")
+        return
+    if z2d.size == 0 or not np.isfinite(z2d).any():
+        st.warning("No data available for the Volatility Surface.")
+        return
+    if axis_warning:
+        st.warning(axis_warning)
+    st.write(f"IV Z-matrix shape: {z2d.shape}, Min: {np.nanmin(z2d)}, Max: {np.nanmax(z2d)}")
+    surface_kwargs: dict[str, Any] = {
+        "colorscale": "Viridis",
+        "colorbar": {"title": "IV"},
+        "hovertemplate": "Strike=%{x:.2f}<br>DTE=%{y:.1f}<br>IV=%{z:.4f}<extra></extra>",
+    }
+    # Pass 1D axes only when they match z shape; otherwise omit (Plotly index fallback).
+    if x_ok is not None and y_ok is not None and len(y_ok) == z2d.shape[0] and len(x_ok) == z2d.shape[1]:
+        surface_trace = go.Surface(z=z2d, x=x_ok, y=y_ok, **surface_kwargs)
+    else:
+        surface_trace = go.Surface(z=z2d, **surface_kwargs)
+    fig = go.Figure(data=[surface_trace])
     fig.update_layout(
         template="plotly_dark",
         paper_bgcolor=DARK_BG,
@@ -2714,17 +2725,26 @@ def add_time_machine_tab(
         )
         snapshot_file = stamp_to_file.get(str(stamp), str(stamp))
         scrub_payload = repo._snapshot_payload(ticker, snapshot_file) or repo._snapshot_payload(ticker, stamp) or {}
+        snapshot = scrub_payload if isinstance(scrub_payload, dict) else {}
+        st.write(f"Volatility Surface Keys: {list(snapshot.keys())}")
         with st.expander("Selected Snapshot Details", expanded=False):
             st.write(_snapshot_ui_metadata(scrub_payload, str(stamp)))
         st.caption(f"Snapshot file: {snapshot_file}")
         try:
-            surface = cached_snapshot_vol_surface(str(ticker), snapshot_file)
+            vol_block = DataRepository.resolve_vol_surface_block(snapshot)
+            if vol_block is not None and not DataRepository._surface_is_empty(vol_block, "IV"):
+                surface = DataRepository.vol_surface_block_to_frame(vol_block)
+            else:
+                surface = cached_snapshot_vol_surface(str(ticker), snapshot_file)
             if isinstance(surface, pd.DataFrame) and "IV" in surface.columns and not surface.empty:
                 iv_vals = pd.to_numeric(surface["IV"], errors="coerce").to_numpy(dtype=float)
                 if np.isfinite(iv_vals).any():
                     st.write(f"IV points: {iv_vals.size}, Min: {np.nanmin(iv_vals)}, Max: {np.nanmax(iv_vals)}")
                 else:
                     st.write(f"IV points: {iv_vals.size}, no finite values")
+                    st.warning("No data available for the Volatility Surface.")
+            elif not isinstance(surface, pd.DataFrame) or (isinstance(surface, pd.DataFrame) and surface.empty):
+                st.warning("No data available for the Volatility Surface.")
             render_time_machine_vol_surface(surface, str(stamp))
         except Exception as error:
             st.error("Could not render the snapshot volatility surface.")
