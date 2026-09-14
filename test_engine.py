@@ -802,3 +802,79 @@ def test_fetch_option_chain_wrong_expiry_raises(monkeypatch) -> None:
 
     monkeypatch.setattr(ingest, "_marketdata_get", _matching)
     assert ingest.fetch_option_chain("SPY", expiration="2026-10-16").empty
+
+
+def test_empty_or_mismatched_expiry_does_not_save_unscoped_next_monthly(tmp_path) -> None:
+    """Capture guard: empty/mismatched chain must not be saved as the requested future expiry.
+
+    Simulates the bug path: API returns empty for a future expiration, an unscoped
+    next-monthly frame is available, and metadata would claim the future date —
+    refuse save so next-monthly rows are never written under that expiry.
+    """
+    import data_ingestion as ingest
+
+    requested = "2026-12-18"
+    next_monthly = pd.DataFrame(
+        {
+            "strike": [450.0, 450.0],
+            "expiration": ["2026-09-18", "2026-09-18"],
+            "bid": [1.0, 1.1],
+            "ask": [1.2, 1.3],
+            "underlyingPrice": [450.0, 450.0],
+            "option_type": ["call", "put"],
+            "impliedVolatility": [0.20, 0.21],
+            "S": [450.0, 450.0],
+            "K": [450.0, 450.0],
+            "T": [0.01, 0.01],
+            "sigma": [0.20, 0.21],
+        }
+    )
+
+    # Empty scoped fetch → refuse (do not treat as savable under requested expiry).
+    empty_reason = ingest.chain_expiry_mismatch_reason(pd.DataFrame(), requested)
+    assert empty_reason is not None
+    assert "2026-12-18" in empty_reason
+
+    # Unscoped next-monthly under future metadata → refuse.
+    mismatch_reason = ingest.chain_expiry_mismatch_reason(next_monthly, requested)
+    assert mismatch_reason is not None
+    assert "2026-09-18" in mismatch_reason
+    assert "2026-12-18" in mismatch_reason
+
+    # Mock fallback → refuse.
+    mock = ingest.mock_option_chain("SPY", error_code="no_data", message="empty")
+    assert ingest.chain_expiry_mismatch_reason(mock, requested) is not None
+
+    # Matching rows → allow.
+    matching = next_monthly.copy()
+    matching["expiration"] = requested
+    assert ingest.chain_expiry_mismatch_reason(matching, requested) is None
+
+    # No expiry requested → allow even next-monthly (unscoped fetch is intentional).
+    assert ingest.chain_expiry_mismatch_reason(next_monthly, None) is None
+
+    # Capture-path save simulation: only write when the guard returns None.
+    repo = DataRepository(cache_dir=tmp_path, status_probe=lambda: {"ok": True})
+    before = len(repo.get_historical_snapshots("SPY"))
+    for candidate in (pd.DataFrame(), next_monthly, mock):
+        reason = ingest.chain_expiry_mismatch_reason(candidate, requested)
+        assert reason is not None
+        # Deliberately skip save_to_cache when mismatched — mirrors _capture_snapshot.
+    assert len(repo.get_historical_snapshots("SPY")) == before
+
+    # Matching chain may be saved with matching metadata.
+    repo.save_to_cache(
+        "SPY",
+        matching,
+        metadata={"ticker": "SPY", "expiry": requested, "as_of_date": "2026-09-14"},
+    )
+    snaps = repo.get_historical_snapshots("SPY")
+    assert len(snaps) == before + 1
+    payload = json.loads(Path(snaps[-1]).read_text(encoding="utf-8"))
+    meta = payload.get("metadata") or {}
+    assert (payload.get("expiry") or meta.get("expiry")) == requested
+    rows = payload.get("data") or []
+    assert rows
+    assert all(str(row.get("expiration", ""))[:10] == requested for row in rows)
+    # Critically: never persisted next-monthly under the future expiry label.
+    assert not any(str(row.get("expiration", ""))[:10] == "2026-09-18" for row in rows)

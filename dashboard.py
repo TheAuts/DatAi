@@ -13,6 +13,7 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from data_ingestion import (
+    chain_expiry_mismatch_reason,
     get_available_expirations,
 )
 from quant_engine import (
@@ -227,6 +228,8 @@ def _init_state() -> None:
         "pro_surface_smoothing": False,
         "portfolio_csv_sig": None,
         "snapshot_saved": False,
+        "snapshot_skipped": False,
+        "snapshot_error": None,
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -437,7 +440,7 @@ def _repo_chain(ticker: str, expiry: Any = None) -> pd.DataFrame:
         else:
             # Live/future: pass expiration through so MarketData gets ``?expiration=``.
             frame = repo.get_data(symbol, expiration)
-            # Empty future expiry → warn and show next available monthly (no expiration filter).
+            # Empty scoped fetch: do NOT fall back to unscoped next-monthly.
             from data_ingestion import is_mock_frame
 
             if (
@@ -446,10 +449,12 @@ def _repo_chain(ticker: str, expiry: Any = None) -> pd.DataFrame:
                 and frame.empty
                 and not is_mock_frame(frame)
             ):
-                st.warning(
-                    "No contracts found for this expiry. Trying next available monthly expiry..."
+                msg = (
+                    f"No contracts found for expiration {expiration}. "
+                    "Not falling back to an unscoped (next monthly) chain."
                 )
-                frame = repo.get_data(symbol)
+                st.warning(msg)
+                st.session_state["ingest_alert"] = msg
     except Exception as exc:
         from data_ingestion import mock_option_chain
 
@@ -478,7 +483,14 @@ def _reset_time_machine_keys(ticker: str) -> None:
 
 def _fresh_chain_for_snapshot(symbol: str, expiry: Any = None) -> pd.DataFrame:
     """Bypass every cache layer (st.cache_data and the repo TTL cache) so a snapshot
-    captures live data. Falls back to the cached chain if the live fetch is empty."""
+    captures live data.
+
+    When a specific expiration was requested and the live fetch is empty/mock, do
+    **not** fall back to an unscoped chain (MarketData next monthly) — that would
+    save the wrong expiry under the UI's future metadata.
+    """
+    from data_ingestion import is_mock_frame
+
     repo = _get_repo()
     live_spot: float | None = None
     try:
@@ -504,7 +516,16 @@ def _fresh_chain_for_snapshot(symbol: str, expiry: Any = None) -> pd.DataFrame:
             frame = repo._fetch(symbol, expiration)
     except Exception:
         frame = pd.DataFrame()
-    if not isinstance(frame, pd.DataFrame) or frame.empty:
+    if not isinstance(frame, pd.DataFrame):
+        frame = pd.DataFrame()
+    # Scoped expiry + empty/mock → refuse unscoped fallback (capture will not save).
+    if expiration and (frame.empty or is_mock_frame(frame)):
+        reason = chain_expiry_mismatch_reason(frame, expiration)
+        if reason:
+            st.session_state["ingest_alert"] = reason
+        return frame if isinstance(frame, pd.DataFrame) else pd.DataFrame()
+    if frame.empty:
+        # No expiry requested: cached/live unscoped chain is acceptable.
         frame = _repo_chain(symbol, expiry)
     # Never stamp today's live spot onto a historical EOD chain.
     if as_of is None and live_spot is not None and isinstance(frame, pd.DataFrame) and not frame.empty:
@@ -562,12 +583,21 @@ def _capture_snapshot(
 ) -> None:
     symbol = str(ticker or "").strip().upper() or DEFAULT_TICKER
     repo = _get_repo()
+    requested = _expiry_to_iso(expiry)
     data = _fresh_chain_for_snapshot(symbol, expiry)
+    # Refuse to persist empty/mock/wrong-expiry chains under the UI's requested expiry.
+    mismatch = chain_expiry_mismatch_reason(data, requested)
+    if mismatch:
+        st.session_state.snapshot_error = mismatch
+        st.session_state["ingest_alert"] = mismatch
+        return
     as_of = _historical_date_iso() or date.today().isoformat()
     metadata = {
         "ticker": symbol,
         "strike": strike,
-        "expiry": expiry.isoformat() if isinstance(expiry, date) else (str(expiry)[:10] if expiry else None),
+        "expiry": requested
+        if requested
+        else (expiry.isoformat() if isinstance(expiry, date) else (str(expiry)[:10] if expiry else None)),
         "contract_type": contract_type,
         "as_of_date": as_of,
     }
@@ -1119,6 +1149,9 @@ def _sidebar_inputs() -> tuple[str, float, date, float, str, bool, Any]:
             st.success("Snapshot saved!")
         if st.session_state.pop("snapshot_skipped", False):
             st.warning("Snapshot identical to previous—not saving.")
+        snap_err = st.session_state.pop("snapshot_error", None)
+        if snap_err:
+            st.error(str(snap_err))
 
         download_slot = st.empty()
 
