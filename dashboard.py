@@ -89,6 +89,18 @@ from quant_engine import (
     calculate_market_velocity,
     audit_market_velocity,
     FLOW_DATA_STALE_MSG,
+    calculate_vpin,
+    calculate_order_book_imbalance,
+    calculate_microstructure_lab,
+    audit_vpin,
+    audit_obi_heatmap,
+    detect_liquidity_trap,
+    TOXICITY_ALERT_MSG,
+    LIQUIDITY_TRAP_MSG,
+    HIGH_ADVERSE_SELECTION_MSG,
+    OBI_HEATMAP_UNSTABLE_MSG,
+    VPIN_HIGH_THRESHOLD,
+    OBI_EXTREME_THRESHOLD,
 )
 
 DATA_REPO = DataRepository()
@@ -4648,6 +4660,212 @@ def add_sentiment_lab_tab(tab: Any, ticker: str) -> None:
                 st.error("Could not render the Sentiment vs Realized Volatility chart.")
 
 
+@st.cache_data(ttl=120, show_spinner="Computing microstructure…")
+def microstructure_lab_cached(ticker: str) -> dict[str, Any]:
+    """Cached Microstructure Lab payload (VPIN + OBI)."""
+    return calculate_microstructure_lab(str(ticker or "").strip().upper(), repo=DATA_REPO)
+
+
+def microstructure_lab_build_vpin_gauge(vpin: float) -> go.Figure:
+    """VPIN Gauge — Toxicity Risk in [0, 1]."""
+    s = float(np.clip(float(vpin), 0.0, 1.0))
+    if s > VPIN_HIGH_THRESHOLD:
+        bar = "#e74c3c"
+    elif s > 0.4:
+        bar = "#f1c40f"
+    else:
+        bar = "#2ecc71"
+    fig = go.Figure(
+        go.Indicator(
+            mode="gauge+number",
+            value=s,
+            number={"valueformat": ".3f"},
+            title={"text": "VPIN — Toxicity Risk"},
+            gauge={
+                "axis": {
+                    "range": [0, 1],
+                    "tickvals": [0, 0.3, VPIN_HIGH_THRESHOLD, 1],
+                    "ticktext": ["Calm", "Elevated", "Toxic", "Max"],
+                },
+                "bar": {"color": bar},
+                "bgcolor": PANEL_BG,
+                "borderwidth": 1,
+                "bordercolor": TEXT,
+                "steps": [
+                    {"range": [0.0, 0.4], "color": "#1e3a2f"},
+                    {"range": [0.4, VPIN_HIGH_THRESHOLD], "color": "#3a341e"},
+                    {"range": [VPIN_HIGH_THRESHOLD, 1.0], "color": "#3a1e1e"},
+                ],
+                "threshold": {
+                    "line": {"color": "#e74c3c", "width": 2},
+                    "thickness": 0.75,
+                    "value": VPIN_HIGH_THRESHOLD,
+                },
+            },
+        )
+    )
+    fig.update_layout(
+        template="plotly_dark",
+        paper_bgcolor=DARK_BG,
+        font={"color": TEXT},
+        height=300,
+        margin={"l": 24, "r": 24, "t": 48, "b": 24},
+        uirevision="microstructure-vpin-gauge",
+    )
+    return fig
+
+
+def microstructure_lab_build_obi_heatmap(heatmap: Mapping[str, Any]) -> go.Figure:
+    """Order Book Imbalance Heatmap — top 5 levels; Blue=Buy, Red=Sell."""
+    z = np.asarray(heatmap.get("z"), dtype=float)
+    x = list(heatmap.get("x") or [f"L{i + 1}" for i in range(5)])
+    y = list(heatmap.get("y") or ["Bid (Buy)", "Ask (Sell)"])
+    peak = float(np.nanmax(np.abs(z))) if z.size and np.any(np.isfinite(z)) else 1.0
+    if not np.isfinite(peak) or peak <= 0:
+        peak = 1.0
+    fig = go.Figure(
+        data=[
+            go.Heatmap(
+                z=z,
+                x=x,
+                y=y,
+                colorscale="RdBu",
+                zmid=0.0,
+                zmin=-peak,
+                zmax=peak,
+                colorbar={"title": "Size (+Bid / −Ask)"},
+                hovertemplate="Level=%{x}<br>Side=%{y}<br>Value=%{z:.2f}<extra></extra>",
+            )
+        ]
+    )
+    fig.update_layout(
+        template="plotly_dark",
+        paper_bgcolor=DARK_BG,
+        plot_bgcolor=PANEL_BG,
+        font={"color": TEXT},
+        height=320,
+        title={"text": "Order Book Imbalance — Top 5 Levels", "x": 0.0, "xanchor": "left"},
+        xaxis_title="Book Level",
+        yaxis_title="Side",
+        margin={"l": 80, "r": 24, "t": 48, "b": 48},
+        uirevision="microstructure-obi-heatmap",
+    )
+    return fig
+
+
+def add_microstructure_lab_tab(tab: Any, ticker: str) -> None:
+    """Microstructure Lab: VPIN gauge, OBI heatmap, Flow Toxicity Alert (additive only)."""
+    with tab:
+        st.caption(
+            "Microstructure Lab — VPIN (equal-volume buckets) + Order Book Imbalance "
+            "(`calculate_vpin` / `calculate_order_book_imbalance`). "
+            "Sparse L2/tick → chain volume and size-decay proxies."
+        )
+        try:
+            result = microstructure_lab_cached(str(ticker))
+        except Exception:
+            st.error("Could not calculate microstructure metrics.")
+            return
+        if not result:
+            st.info("No microstructure data.")
+            return
+
+        vpin_block = result.get("vpin") or {}
+        obi_block = result.get("obi") or {}
+        trap = result.get("liquidity_trap") or {}
+        vpin_audit = vpin_block.get("audit") or audit_vpin(vpin_block.get("vpin"))
+        obi_audit = obi_block.get("audit") or audit_obi_heatmap(obi_block.get("heatmap"))
+
+        vpin = vpin_block.get("vpin")
+        try:
+            vpin_f = float(vpin) if vpin is not None else float("nan")
+        except (TypeError, ValueError):
+            vpin_f = float("nan")
+        imb = float(obi_block.get("imbalance") or 0.0)
+
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric(
+            "VPIN",
+            f"{vpin_f:.3f}" if np.isfinite(vpin_f) else "—",
+            border=True,
+        )
+        m2.metric("OBI (agg)", f"{imb:+.3f}", border=True)
+        m3.metric(
+            "One-side share",
+            f"{float(trap.get('one_side_share') or 0.0):.1%}",
+            border=True,
+        )
+        m4.metric(
+            "Buckets",
+            int(vpin_block.get("n_buckets") or 0),
+            border=True,
+        )
+
+        # Flow Toxicity Alert — Liquidity Trap when OBI extreme + VPIN high.
+        if bool(trap.get("liquidity_trap")) or (
+            detect_liquidity_trap(vpin_f, imb).get("liquidity_trap")
+        ):
+            st.error(LIQUIDITY_TRAP_MSG)
+        if bool(vpin_audit.get("toxicity_alert")) or bool(result.get("toxicity_alert")):
+            st.error(TOXICITY_ALERT_MSG)
+        if bool(result.get("high_adverse_selection")) or (
+            np.isfinite(vpin_f) and vpin_f > VPIN_HIGH_THRESHOLD
+        ):
+            st.warning(HIGH_ADVERSE_SELECTION_MSG)
+
+        if bool(vpin_block.get("proxy_used")) or bool(obi_block.get("proxy_used")):
+            st.caption(
+                "Proxy path active: L2/tick sparse — using chain volume, "
+                "Lee–Ready / call-put classification, and size-decay book levels."
+            )
+
+        left, right = st.columns(2, gap="large")
+        with left:
+            st.subheader("VPIN Gauge — Toxicity Risk")
+            if bool(vpin_audit.get("halt_render")) or not vpin_audit.get("ok"):
+                st.error(str(vpin_audit.get("message") or TOXICITY_ALERT_MSG))
+            elif not np.isfinite(vpin_f):
+                st.info("VPIN unavailable.")
+            else:
+                try:
+                    fig_g = microstructure_lab_build_vpin_gauge(vpin_f)
+                    st.plotly_chart(
+                        fig_g,
+                        use_container_width=True,
+                        config={"displayModeBar": False},
+                        key="microstructure-vpin-gauge",
+                    )
+                    st.caption(
+                        f"Equal-volume buckets = {int(vpin_block.get('n_buckets') or 0)} · "
+                        f"V = {float(vpin_block.get('bucket_volume') or 0.0):.1f} · "
+                        f"alert > {VPIN_HIGH_THRESHOLD:.1f}"
+                    )
+                except Exception:
+                    st.error("Could not render the VPIN Gauge.")
+        with right:
+            st.subheader("Order Book Imbalance Heatmap")
+            if bool(obi_audit.get("halt_render")) or not obi_audit.get("ok"):
+                st.error(str(obi_audit.get("message") or OBI_HEATMAP_UNSTABLE_MSG))
+            else:
+                try:
+                    heat = obi_block.get("heatmap") or {}
+                    fig_h = microstructure_lab_build_obi_heatmap(heat)
+                    st.plotly_chart(
+                        fig_h,
+                        use_container_width=True,
+                        config={"displayModeBar": True},
+                        key="microstructure-obi-heatmap",
+                    )
+                    st.caption(
+                        f"Top {int(heat.get('n_levels') or 5)} levels · "
+                        f"Σbid={float(obi_block.get('bid_total') or 0.0):.0f} · "
+                        f"Σask={float(obi_block.get('ask_total') or 0.0):.0f} · "
+                        f"extreme one-side > {OBI_EXTREME_THRESHOLD:.0%}"
+                    )
+                except Exception:
+                    st.error("Could not render the Order Book Imbalance Heatmap.")
+
+
 def add_event_impact_lab_tab(tab: Any, ticker: str) -> None:
     """Event Impact Lab: event dropdown, shock summary, RdBu shock surface."""
     with tab:
@@ -4999,6 +5217,7 @@ def main() -> None:
         "Regime Lab",
         "Liquidation Waterfall",
         "Sentiment Lab",
+        "Microstructure Lab",
     ]
     (
         greeks_tab,
@@ -5016,6 +5235,7 @@ def main() -> None:
         regime_lab_tab,
         liquidation_waterfall_tab,
         sentiment_lab_tab,
+        microstructure_lab_tab,
     ) = st.tabs(
         tab_labels,
         on_change="rerun",
@@ -5235,6 +5455,9 @@ def main() -> None:
 
     if sentiment_lab_tab.open:
         add_sentiment_lab_tab(sentiment_lab_tab, ticker)
+
+    if microstructure_lab_tab.open:
+        add_microstructure_lab_tab(microstructure_lab_tab, ticker)
 
 
 if __name__ == "__main__":

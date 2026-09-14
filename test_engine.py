@@ -113,6 +113,20 @@ from quant_engine import (
     FLOW_DATA_STALE_MSG,
     FLOW_OFI_BOUNDS,
     FLOW_VELOCITY_BOUNDS,
+    calculate_vpin,
+    calculate_order_book_imbalance,
+    calculate_microstructure_lab,
+    audit_vpin,
+    audit_obi_heatmap,
+    detect_liquidity_trap,
+    shape_obi_heatmap,
+    TOXICITY_ALERT_MSG,
+    LIQUIDITY_TRAP_MSG,
+    HIGH_ADVERSE_SELECTION_MSG,
+    OBI_HEATMAP_UNSTABLE_MSG,
+    VPIN_HIGH_THRESHOLD,
+    OBI_EXTREME_THRESHOLD,
+    OBI_TOP_LEVELS,
 )
 
 STANDARD = {"S": 100.0, "K": 100.0, "T": 1.0, "r": 0.05, "sigma": 0.2, "option_type": "call"}
@@ -2317,3 +2331,189 @@ def test_audit_market_velocity_stale_and_zero_gate() -> None:
     assert empty["ok"] is False
     assert empty["audit"]["halt_render"] is True
     assert empty["audit"]["message"] == FLOW_DATA_STALE_MSG
+
+
+# ---------------------------------------------------------------------------
+# Microstructure Lab — VPIN & Order Book Imbalance
+# ---------------------------------------------------------------------------
+
+
+def _micro_chain_frame(*, buy_heavy: bool = True, with_l2: bool = False) -> pd.DataFrame:
+    """Minimal chain for VPIN / OBI unit tests."""
+    spot = 100.0
+    rows: list[dict[str, Any]] = []
+    specs = [
+        (95.0, "call", 4.8, 5.2, 5.15 if buy_heavy else 4.85, 120.0, 400.0, 80.0, 5.0),
+        (100.0, "call", 2.4, 2.6, 2.55 if buy_heavy else 2.42, 200.0, 800.0, 90.0, 8.0),
+        (105.0, "call", 1.0, 1.2, 1.15 if buy_heavy else 1.02, 80.0, 300.0, 70.0, 10.0),
+        (95.0, "put", 0.8, 1.0, 0.82 if buy_heavy else 0.98, 40.0, 200.0, 50.0, 8.0),
+        (100.0, "put", 2.3, 2.5, 2.32 if buy_heavy else 2.48, 60.0 if buy_heavy else 220.0, 500.0, 55.0, 9.0),
+        (105.0, "put", 4.5, 4.9, 4.55 if buy_heavy else 4.85, 50.0, 350.0, 45.0, 7.0),
+    ]
+    for strike, opt, bid, ask, last, vol, oi, bsz, asz in specs:
+        if buy_heavy:
+            bid_sz, ask_sz = float(bsz), float(asz)
+        else:
+            bid_sz, ask_sz = float(asz), float(bsz)
+        row: dict[str, Any] = {
+            "S": spot,
+            "K": strike,
+            "strike": strike,
+            "T": 0.2,
+            "r": 0.05,
+            "sigma": 0.22,
+            "impliedVolatility": 0.22,
+            "option_type": opt,
+            "bid": bid,
+            "ask": ask,
+            "lastPrice": last,
+            "volume": vol,
+            "openInterest": oi,
+            "contractSize": 100.0,
+            "underlyingPrice": spot,
+            "bidSize": bid_sz,
+            "askSize": ask_sz,
+        }
+        if with_l2:
+            for lvl in range(1, OBI_TOP_LEVELS + 1):
+                decay = 0.7 ** (lvl - 1)
+                row[f"bidSize{lvl}"] = bid_sz * decay
+                row[f"askSize{lvl}"] = ask_sz * decay
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def test_calculate_vpin_bounded_01_and_copy() -> None:
+    frame = _micro_chain_frame(buy_heavy=True)
+    original = frame.copy()
+    out = calculate_vpin("VPIN", frame=frame, n_buckets=10)
+    pd.testing.assert_frame_equal(frame, original)
+    assert out["ok"] is True
+    assert 0.0 <= float(out["vpin"]) <= 1.0
+    assert float(out["vpin_raw"]) == pytest.approx(float(out["vpin"]), abs=1e-9)
+    assert int(out["n_buckets"]) >= 1
+    assert out["audit"]["ok"] is True
+    assert out["audit"]["toxicity_alert"] is False
+    buckets = np.asarray(out["bucket_imbalances"], dtype=float)
+    assert buckets.size == int(out["n_buckets"])
+    assert np.all(np.isfinite(buckets))
+
+
+def test_audit_vpin_toxicity_alert_when_exceeds_one() -> None:
+    ok = audit_vpin(0.55)
+    assert ok["ok"] is True
+    assert ok["toxicity_alert"] is False
+    assert ok["message"] == "ok"
+
+    hot = audit_vpin(1.25)
+    assert hot["ok"] is False
+    assert hot["toxicity_alert"] is True
+    assert hot["halt_render"] is True
+    assert hot["message"] == TOXICITY_ALERT_MSG
+
+    neg = audit_vpin(-0.1)
+    assert neg["ok"] is False
+    assert neg["message"] == TOXICITY_ALERT_MSG
+
+    # Force raw mean > 1 by injecting oversized bucket imbalances via monkeypatch path:
+    # audit path only — direct call covers the contract.
+    assert HIGH_ADVERSE_SELECTION_MSG.startswith("High Adverse Selection Risk")
+
+
+def test_calculate_order_book_imbalance_top5_shape() -> None:
+    frame = _micro_chain_frame(buy_heavy=True, with_l2=True)
+    original = frame.copy()
+    out = calculate_order_book_imbalance("OBI", frame=frame)
+    pd.testing.assert_frame_equal(frame, original)
+    assert out["ok"] is True
+    assert -1.0 <= float(out["imbalance"]) <= 1.0
+    assert out["bid_sizes"].shape == (OBI_TOP_LEVELS,)
+    assert out["ask_sizes"].shape == (OBI_TOP_LEVELS,)
+    heat = out["heatmap"]
+    assert heat["z"].shape == (2, OBI_TOP_LEVELS)
+    assert len(heat["x"]) == OBI_TOP_LEVELS
+    assert heat["y"] == ["Bid (Buy)", "Ask (Sell)"]
+    assert out["audit"]["ok"] is True
+    assert out["audit"]["halt_render"] is False
+    # Buy-heavy L2 → positive aggregate OBI.
+    assert float(out["imbalance"]) > 0.0
+
+
+def test_audit_obi_heatmap_gate_unstable() -> None:
+    good = shape_obi_heatmap([10.0, 8.0, 6.0, 4.0, 2.0], [5.0, 4.0, 3.0, 2.0, 1.0])
+    ok = audit_obi_heatmap(good)
+    assert ok["ok"] is True
+    assert ok["halt_render"] is False
+
+    bad_shape = dict(good)
+    bad_shape["z"] = np.ones((3, 5))
+    bad_shape["n_levels"] = 5
+    halted = audit_obi_heatmap(bad_shape)
+    assert halted["ok"] is False
+    assert halted["halt_render"] is True
+    assert halted["message"] == OBI_HEATMAP_UNSTABLE_MSG
+
+    nan_z = dict(good)
+    z = np.array(good["z"], dtype=float, copy=True)
+    z[0, 0] = float("nan")
+    nan_z["z"] = z
+    assert audit_obi_heatmap(nan_z)["halt_render"] is True
+
+    wrong_sign = dict(good)
+    z2 = np.array(good["z"], dtype=float, copy=True)
+    z2[1, 0] = 5.0  # ask row must be ≤ 0
+    wrong_sign["z"] = z2
+    assert audit_obi_heatmap(wrong_sign)["message"] == OBI_HEATMAP_UNSTABLE_MSG
+
+
+def test_liquidity_trap_condition() -> None:
+    calm = detect_liquidity_trap(0.2, 0.1)
+    assert calm["liquidity_trap"] is False
+    assert calm["message"] is None
+
+    # |OBI|=0.7 → one_side = 0.5 + 0.35 = 0.85 > 0.80; VPIN high.
+    trap = detect_liquidity_trap(0.75, 0.70)
+    assert trap["vpin_high"] is True
+    assert trap["obi_extreme"] is True
+    assert trap["liquidity_trap"] is True
+    assert trap["message"] == LIQUIDITY_TRAP_MSG
+    assert float(trap["one_side_share"]) > OBI_EXTREME_THRESHOLD
+
+    # High VPIN alone is not a trap.
+    only_vpin = detect_liquidity_trap(0.9, 0.1)
+    assert only_vpin["liquidity_trap"] is False
+
+    # Extreme OBI alone is not a trap.
+    only_obi = detect_liquidity_trap(0.2, 0.95)
+    assert only_obi["liquidity_trap"] is False
+
+    lab = calculate_microstructure_lab(
+        "TRAP",
+        frame=_micro_chain_frame(buy_heavy=True, with_l2=True),
+        n_buckets=8,
+    )
+    assert "vpin" in lab and "obi" in lab and "liquidity_trap" in lab
+    assert 0.0 <= float(lab["vpin"]["vpin"]) <= 1.0 or not lab["vpin"]["ok"]
+    assert lab["obi"]["heatmap"]["z"].shape == (2, OBI_TOP_LEVELS)
+
+
+def test_vpin_sparse_proxy_and_high_adverse_flag() -> None:
+    frame = _micro_chain_frame(buy_heavy=True).drop(
+        columns=["bid", "ask", "volume", "bidSize", "askSize", "lastPrice"]
+    )
+    out = calculate_vpin("PROXY", frame=frame, n_buckets=5)
+    assert bool(out.get("proxy_used")) is True
+    if out["ok"]:
+        assert 0.0 <= float(out["vpin"]) <= 1.0
+        assert out["audit"]["toxicity_alert"] is False
+    assert VPIN_HIGH_THRESHOLD == pytest.approx(0.6)
+    assert HIGH_ADVERSE_SELECTION_MSG == (
+        "High Adverse Selection Risk: Market Makers are widening spreads."
+    )
+    # high_adverse_selection mirrors VPIN > threshold when audit is clean.
+    hot_frame = _micro_chain_frame(buy_heavy=True)
+    hot = calculate_vpin("HOT", frame=hot_frame, n_buckets=10)
+    if hot["ok"] and float(hot["vpin"]) > VPIN_HIGH_THRESHOLD:
+        assert hot["high_adverse_selection"] is True
+    elif hot["ok"]:
+        assert hot["high_adverse_selection"] is False
