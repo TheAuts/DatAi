@@ -52,6 +52,7 @@ from quant_engine import (
     generate_greek_curve,
     generate_pro_surface_data,
     generate_vol_surface_data,
+    prefill_drift_data,
 )
 
 DATA_REPO = DataRepository()
@@ -2441,7 +2442,12 @@ def render_time_machine_vol_surface(frame: pd.DataFrame | str, timestamp: str) -
     )
 
 
-def add_time_machine_tab(tab: Any, ticker: str) -> None:
+def add_time_machine_tab(
+    tab: Any,
+    ticker: str,
+    strike: float | None = None,
+    expiry: Any = None,
+) -> None:
     with tab:
         _surface_ingest_alerts(_get_repo())
         alert = st.session_state.get("ingest_alert")
@@ -2451,6 +2457,25 @@ def add_time_machine_tab(tab: Any, ticker: str) -> None:
             elif alert.startswith("API Error:"):
                 st.warning(alert)
         repo = _get_repo()
+        if st.button("Pre-fill Delta Drift", key=f"tm_prefill_{ticker}"):
+            try:
+                active_strike = strike if strike is not None else st.session_state.get("listed_strike")
+                active_expiry = expiry if expiry is not None else st.session_state.get("expiry_iso")
+                result = prefill_drift_data(
+                    str(ticker),
+                    active_strike,
+                    active_expiry,
+                    repo=repo,
+                )
+                st.session_state[f"tm_start_{ticker}"] = result["start_label"]
+                st.session_state[f"tm_end_{ticker}"] = result["end_label"]
+                for cache in (cached_delta_drift, cached_delta_drift_grid, cached_snapshot_vol_surface):
+                    clear = getattr(cache, "clear", None)
+                    if callable(clear):
+                        clear()
+                st.rerun()
+            except Exception as error:
+                st.error(f"Pre-fill Delta Drift failed: {error}")
         # Data sync: stamps come from timestamped files under data_history/ via DataRepository.
         snapshots = repo.get_available_snapshots(ticker)
         if not snapshots:
@@ -2458,10 +2483,22 @@ def add_time_machine_tab(tab: Any, ticker: str) -> None:
             return
         st.subheader("Delta drift")
         start_col, end_col = st.columns([1, 1])
+        start_key = f"tm_start_{ticker}"
+        end_key = f"tm_end_{ticker}"
+        if start_key in st.session_state and st.session_state[start_key] not in snapshots:
+            del st.session_state[start_key]
+        if end_key in st.session_state and st.session_state[end_key] not in snapshots:
+            del st.session_state[end_key]
+        preferred_start = st.session_state.get(start_key)
+        preferred_end = st.session_state.get(end_key)
+        start_index = snapshots.index(preferred_start) if preferred_start in snapshots else 0
+        end_index = (
+            snapshots.index(preferred_end) if preferred_end in snapshots else max(0, len(snapshots) - 1)
+        )
         with start_col:
-            start = st.selectbox("Start Snapshot", snapshots, index=0, key=f"tm_start_{ticker}")
+            start = st.selectbox("Start Snapshot", snapshots, index=start_index, key=start_key)
         with end_col:
-            end = st.selectbox("End Snapshot", snapshots, index=len(snapshots) - 1, key=f"tm_end_{ticker}")
+            end = st.selectbox("End Snapshot", snapshots, index=end_index, key=end_key)
         payload_a = repo._snapshot_payload(ticker, start) or {}
         payload_b = repo._snapshot_payload(ticker, end) or {}
         with st.expander("Snapshot Details", expanded=False):
@@ -3040,7 +3077,7 @@ def main() -> None:
                 st.error("Could not render the Time-Sensitivity chart.")
 
     if machine_tab.open:
-        add_time_machine_tab(machine_tab, ticker)
+        add_time_machine_tab(machine_tab, ticker, strike=float(strike), expiry=expiry)
 
     if vol_tab.open:
         with vol_tab:
