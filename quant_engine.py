@@ -4487,6 +4487,196 @@ def calculate_portfolio_risk(positions_df: pd.DataFrame | None) -> dict[str, Any
     }
 
 
+# ---------------------------------------------------------------------------
+# Market Timelapse — historical surface frames from data_history/
+# ---------------------------------------------------------------------------
+# Prefer ``delta_surface`` (value key ``Delta``): same payload key persisted by
+# DataRepository._compute_surfaces / Time Machine. Not vol_surface/gamma_surface.
+TIMELAPSE_SURFACE_KEY = "delta_surface"
+TIMELAPSE_VALUE_KEY = "Delta"
+
+
+def snapshot_time_label_from_name(name: str) -> str:
+    """Extract a slider label ``HH:MM:SS`` from a snapshot filename or stamp.
+
+    Recognizes ``YYYY-MM-DD_HHMM``, optional ``_unix`` suffix (preferred for
+    seconds), and compact ``YYYYmmDDHHMMSS`` capture stamps.
+    """
+    stem = Path(str(name or "")).stem
+    parts = [p for p in stem.split("_") if p]
+    # Unix epoch suffix (e.g. SPY_2026-09-13_0723_1789284208).
+    for part in reversed(parts):
+        if part.isdigit() and len(part) >= 10:
+            try:
+                moment = datetime.fromtimestamp(int(part))
+                return moment.strftime("%H:%M:%S")
+            except (OSError, OverflowError, ValueError):
+                break
+    # Compact capture stamp …HHMMSS (8+ digits ending in time).
+    for part in reversed(parts):
+        digits = "".join(ch for ch in part if ch.isdigit())
+        if len(digits) >= 14:
+            hh, mm, ss = digits[-6:-4], digits[-4:-2], digits[-2:]
+            if hh.isdigit() and mm.isdigit() and ss.isdigit():
+                return f"{int(hh):02d}:{int(mm):02d}:{int(ss):02d}"
+        if len(digits) == 4 and digits.isdigit():
+            return f"{int(digits[:2]):02d}:{int(digits[2:]):02d}:00"
+    # Date-like token then HHMM: 2026-09-13_1434
+    for i, part in enumerate(parts):
+        if len(part) >= 10 and part[4] == "-" and part[7] == "-" and i + 1 < len(parts):
+            tod = "".join(ch for ch in parts[i + 1] if ch.isdigit())
+            if len(tod) >= 6:
+                return f"{int(tod[0:2]):02d}:{int(tod[2:4]):02d}:{int(tod[4:6]):02d}"
+            if len(tod) >= 4:
+                return f"{int(tod[0:2]):02d}:{int(tod[2:4]):02d}:00"
+    return stem or "00:00:00"
+
+
+def delta_surface_to_grid(surface: Mapping[str, Any] | None) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Flattened ``delta_surface`` dict → ``(z2d, strike_axis, dte_axis)``.
+
+    Empty / unusable surfaces yield empty arrays. Layout matches Plotly Surface:
+    ``z.shape == (len(dte_axis), len(strike_axis))``.
+    """
+    empty = (
+        np.empty((0, 0), dtype=np.float64),
+        np.empty(0, dtype=np.float64),
+        np.empty(0, dtype=np.float64),
+    )
+    if not isinstance(surface, Mapping):
+        return empty
+    strikes = surface.get("Strike") or surface.get("strike") or []
+    dtes = surface.get("DaysToExpiry") or surface.get("dte") or []
+    values = surface.get(TIMELAPSE_VALUE_KEY) or surface.get("delta") or []
+    if not isinstance(strikes, list) or not isinstance(dtes, list) or not isinstance(values, list):
+        return empty
+    if not strikes or not dtes or not values or not (len(strikes) == len(dtes) == len(values)):
+        return empty
+    frame = pd.DataFrame(
+        {
+            "Strike": pd.to_numeric(pd.Series(strikes), errors="coerce"),
+            "DaysToExpiry": pd.to_numeric(pd.Series(dtes), errors="coerce"),
+            "Delta": pd.to_numeric(pd.Series([np.nan if v is None else v for v in values]), errors="coerce"),
+        }
+    )
+    frame = frame.replace([np.inf, -np.inf], np.nan).dropna(subset=["Strike", "DaysToExpiry"])
+    if frame.empty or not frame["Delta"].notna().any():
+        return empty
+    pivot = frame.pivot_table(index="DaysToExpiry", columns="Strike", values="Delta", aggfunc="mean")
+    pivot = pivot.sort_index().sort_index(axis=1)
+    z2d = np.array(pivot.to_numpy(dtype=np.float64), copy=True)
+    x_axis = np.array(pivot.columns.to_numpy(dtype=np.float64), copy=True)
+    y_axis = np.array(pivot.index.to_numpy(dtype=np.float64), copy=True)
+    return z2d, x_axis, y_axis
+
+
+def timelapse_shared_z_range(grids: Iterable[Any]) -> tuple[float, float]:
+    """Shared finite Z min/max across all timelapse frames (locks color / z-axis)."""
+    lo = float("inf")
+    hi = float("-inf")
+    for grid in grids:
+        arr = np.asarray(grid, dtype=np.float64)
+        if arr.size == 0:
+            continue
+        finite = arr[np.isfinite(arr)]
+        if finite.size == 0:
+            continue
+        lo = min(lo, float(np.min(finite)))
+        hi = max(hi, float(np.max(finite)))
+    if not np.isfinite(lo) or not np.isfinite(hi):
+        return 0.0, 1.0
+    if lo == hi:
+        pad = 1e-6 if lo == 0.0 else abs(lo) * 1e-6
+        return lo - pad, hi + pad
+    return lo, hi
+
+
+def load_all_snapshots(
+    ticker: str,
+    *,
+    history_dir: str | Path | None = None,
+) -> list[dict[str, Any]]:
+    """Fetch every ``data_history/{TICKER}_*.json`` snapshot, sorted by timestamp.
+
+    **Surface key:** ``delta_surface`` (``TIMELAPSE_SURFACE_KEY``), value ``Delta``.
+    Each returned dict::
+
+        path, stamp, label (HH:MM:SS), timestamp (sort key),
+        z (2D ndarray), x (strikes), y (DTEs), surface_key
+
+    Snapshots without a usable delta surface after in-memory backfill are skipped.
+    Does not rewrite history files.
+    """
+    root = Path(history_dir) if history_dir is not None else Path(__file__).resolve().parent / "data_history"
+    safe = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in str(ticker or "").strip().upper()) or "_"
+    prefix = f"{safe}_"
+    paths = [p for p in root.glob(f"{prefix}*.json") if p.is_file()]
+    if not paths and root.name != "data_history":
+        # Also scan repo-level data_history when a custom dir is empty.
+        fallback = Path(__file__).resolve().parent / "data_history"
+        if fallback.is_dir() and fallback.resolve() != root.resolve():
+            paths = [p for p in fallback.glob(f"{prefix}*.json") if p.is_file()]
+
+    repo = DataRepository(history_dir=root)
+    frames: list[dict[str, Any]] = []
+    for path in paths:
+        payload = repo._read_json(path)
+        if not payload:
+            continue
+        # In-memory backfill only — never rewrite history files.
+        if repo._surface_is_empty(payload.get(TIMELAPSE_SURFACE_KEY), TIMELAPSE_VALUE_KEY):
+            payload = dict(payload)
+            frame = repo._records_to_frame(payload.get("data"))
+            if not frame.empty:
+                payload.update(repo._compute_surfaces(frame))
+        surface = payload.get(TIMELAPSE_SURFACE_KEY)
+        z2d, x_axis, y_axis = delta_surface_to_grid(surface if isinstance(surface, Mapping) else None)
+        if z2d.size == 0 or not np.isfinite(z2d).any():
+            continue
+        stamp = path.stem[len(prefix):] if path.stem.startswith(prefix) else path.stem
+        label = snapshot_time_label_from_name(path.name)
+        try:
+            ts = float(payload.get("saved_at"))
+        except (TypeError, ValueError):
+            ts = float("nan")
+        if not np.isfinite(ts):
+            # Fall back to parsed stamp / mtime for ordering.
+            ts = 0.0
+            for part in reversed(stamp.split("_")):
+                if part.isdigit() and len(part) >= 10:
+                    ts = float(part)
+                    break
+            if ts <= 0.0:
+                try:
+                    ts = float(path.stat().st_mtime)
+                except OSError:
+                    ts = 0.0
+        frames.append(
+            {
+                "path": str(path),
+                "stamp": stamp,
+                "label": label,
+                "timestamp": float(ts),
+                "z": z2d,
+                "x": x_axis,
+                "y": y_axis,
+                "surface_key": TIMELAPSE_SURFACE_KEY,
+            }
+        )
+
+    frames.sort(key=lambda item: (float(item["timestamp"]), str(item["stamp"]), str(item["path"])))
+    # Disambiguate duplicate HH:MM:SS labels for Plotly frame names / slider steps.
+    seen: dict[str, int] = {}
+    for item in frames:
+        base = str(item["label"])
+        count = seen.get(base, 0)
+        seen[base] = count + 1
+        if count:
+            item["label"] = f"{base}·{count + 1}"
+        item["frame_name"] = str(item["label"])
+    return frames
+
+
 def test_simulated_pnl(
     delta: float,
     gamma: float,

@@ -38,10 +38,14 @@ from quant_engine import (
     compute_total_risk_score,
     generate_integrated_risk_surface,
     generate_synthetic_drift,
+    load_all_snapshots,
     minmax_normalize_01,
     prefill_drift_data,
     prefill_driftdata,
     drift_prefill_stamp,
+    snapshot_time_label_from_name,
+    timelapse_shared_z_range,
+    TIMELAPSE_SURFACE_KEY,
     EVENT_INSUFFICIENT_COVERAGE,
     analyze_event_outlook,
     analyze_gex_outlook,
@@ -1050,3 +1054,58 @@ def test_test_dashboard_simulated_pnl_buy_sell_signs_and_formula() -> None:
     assert buy == pytest.approx(expected_buy, rel=1e-9)
     assert sell == pytest.approx(-expected_buy, rel=1e-9)
     assert math.isnan(simulated_pnl(float("nan"), gamma, theta, vega, qty, "Buy"))
+
+
+def test_snapshot_time_label_from_name_hhmm_and_unix() -> None:
+    assert snapshot_time_label_from_name("SPY_2026-09-13_1434.json") == "14:34:00"
+    assert snapshot_time_label_from_name("SPY_2026-09-13_0723_1789284208.json") == "07:23:28"
+    assert snapshot_time_label_from_name("20260913143005") == "14:30:05"
+
+
+def test_timelapse_shared_z_range_locks_minmax() -> None:
+    a = np.array([[0.1, 0.2], [0.3, np.nan]], dtype=float)
+    b = np.array([[-0.5, 0.0], [0.4, 0.9]], dtype=float)
+    lo, hi = timelapse_shared_z_range([a, b])
+    assert lo == pytest.approx(-0.5)
+    assert hi == pytest.approx(0.9)
+    # Constant grid still returns a usable span.
+    c_lo, c_hi = timelapse_shared_z_range([np.ones((2, 2))])
+    assert c_lo < c_hi
+
+
+def test_load_all_snapshots_sorted_and_delta_surface(tmp_path: Path) -> None:
+    history = tmp_path / "data_history"
+    history.mkdir()
+    strikes = [100.0, 110.0, 100.0, 110.0]
+    dtes = [7.0, 7.0, 14.0, 14.0]
+
+    def _write(stamp: str, saved_at: float, deltas: list[float]) -> None:
+        payload = {
+            "version": "1.0",
+            "ticker": "AAA",
+            "saved_at": saved_at,
+            "stamp": stamp,
+            "data": [],
+            "delta_surface": {"Strike": strikes, "DaysToExpiry": dtes, "Delta": deltas},
+        }
+        (history / f"AAA_{stamp}.json").write_text(json.dumps(payload), encoding="utf-8")
+
+    _write("2026-09-13_1000", 100.0, [0.1, 0.2, 0.3, 0.4])
+    _write("2026-09-13_0900", 50.0, [0.0, 0.5, 0.25, 0.75])
+    _write("2026-09-13_1100", 150.0, [-0.2, 0.1, 0.2, 1.0])
+
+    frames = load_all_snapshots("AAA", history_dir=history)
+    assert len(frames) == 3
+    assert [f["stamp"] for f in frames] == [
+        "2026-09-13_0900",
+        "2026-09-13_1000",
+        "2026-09-13_1100",
+    ]
+    assert frames[0]["label"] == "09:00:00"
+    assert frames[1]["label"] == "10:00:00"
+    assert frames[2]["label"] == "11:00:00"
+    assert all(f["surface_key"] == TIMELAPSE_SURFACE_KEY for f in frames)
+    assert all(isinstance(f["z"], np.ndarray) and f["z"].ndim == 2 for f in frames)
+    lo, hi = timelapse_shared_z_range(f["z"] for f in frames)
+    assert lo == pytest.approx(-0.2)
+    assert hi == pytest.approx(1.0)

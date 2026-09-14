@@ -60,8 +60,11 @@ from quant_engine import (
     generate_integrated_risk_surface,
     generate_pro_surface_data,
     generate_vol_surface_data,
+    load_all_snapshots,
     prefill_drift_data,
     test_simulated_pnl,
+    timelapse_shared_z_range,
+    TIMELAPSE_SURFACE_KEY,
 )
 
 DATA_REPO = DataRepository()
@@ -3347,6 +3350,170 @@ def test_add_dashboard_tab(
         test_render_layout(ticker, spot=spot, sigma=sigma)
 
 
+@st.cache_data(show_spinner=False)
+def _cached_timelapse_frames(ticker: str) -> list[dict[str, Any]]:
+    """Cached Market Timelapse frames (delta_surface grids + labels)."""
+    return load_all_snapshots(str(ticker or "").strip().upper())
+
+
+def build_market_timelapse_figure(frames: list[dict[str, Any]]) -> go.Figure:
+    """Plotly Surface with ``frames``, Play/Pause, and timestamp-labeled slider.
+
+    Z color/axis locked via shared min/max across all frames (no flicker).
+    """
+    if not frames:
+        return go.Figure()
+    z_min, z_max = timelapse_shared_z_range(item["z"] for item in frames)
+    first = frames[0]
+
+    def _surface(item: dict[str, Any]) -> go.Surface:
+        return go.Surface(
+            z=item["z"],
+            x=item["x"],
+            y=item["y"],
+            cmin=z_min,
+            cmax=z_max,
+            colorscale="Viridis",
+            colorbar={"title": "Delta"},
+            hovertemplate="Strike=%{x:.2f}<br>DTE=%{y:.1f}<br>Delta=%{z:.4f}<extra></extra>",
+        )
+
+    fig = go.Figure(data=[_surface(first)])
+    fig.frames = [
+        go.Frame(
+            data=[_surface(item)],
+            name=str(item.get("frame_name") or item["label"]),
+        )
+        for item in frames
+    ]
+    slider_steps = [
+        {
+            "args": [
+                [str(item.get("frame_name") or item["label"])],
+                {
+                    "frame": {"duration": 0, "redraw": True},
+                    "mode": "immediate",
+                    "transition": {"duration": 0},
+                },
+            ],
+            "label": str(item["label"]),
+            "method": "animate",
+        }
+        for item in frames
+    ]
+    fig.update_layout(
+        template="plotly_dark",
+        paper_bgcolor=DARK_BG,
+        font={"color": TEXT},
+        height=600,
+        title={"text": "Market Timelapse (Delta surface)", "x": 0.0, "xanchor": "left"},
+        scene={
+            "xaxis_title": "Strike",
+            "yaxis_title": "Days to Expiry",
+            "zaxis_title": "Delta",
+            "zaxis": {"range": [z_min, z_max]},
+            "bgcolor": PANEL_BG,
+            "dragmode": "orbit",
+        },
+        margin={"l": 8, "r": 8, "t": 48, "b": 8},
+        uirevision="market-timelapse",
+        updatemenus=[
+            {
+                "type": "buttons",
+                "direction": "left",
+                "showactive": False,
+                "x": 0.0,
+                "xanchor": "left",
+                "y": 1.12,
+                "yanchor": "top",
+                "buttons": [
+                    {
+                        "label": "Play",
+                        "method": "animate",
+                        "args": [
+                            None,
+                            {
+                                "frame": {"duration": 400, "redraw": True},
+                                "fromcurrent": True,
+                                "transition": {"duration": 200, "easing": "linear"},
+                            },
+                        ],
+                    },
+                    {
+                        "label": "Pause",
+                        "method": "animate",
+                        "args": [
+                            [None],
+                            {
+                                "frame": {"duration": 0, "redraw": False},
+                                "mode": "immediate",
+                                "transition": {"duration": 0},
+                            },
+                        ],
+                    },
+                ],
+            }
+        ],
+        sliders=[
+            {
+                "active": 0,
+                "yanchor": "top",
+                "xanchor": "left",
+                "currentvalue": {
+                    "prefix": "Snapshot ",
+                    "visible": True,
+                    "xanchor": "right",
+                },
+                "pad": {"b": 10, "t": 36},
+                "len": 0.9,
+                "x": 0.05,
+                "y": 0,
+                "steps": slider_steps,
+            }
+        ],
+    )
+    return fig
+
+
+def add_market_timelapse_tab(tab: Any, ticker: str) -> None:
+    """Market Timelapse tab: animate historical delta_surface grids."""
+    with tab:
+        st.caption(
+            f"Historical morph of `{TIMELAPSE_SURFACE_KEY}` from `data_history/` "
+            "(shared Z min/max across frames)."
+        )
+        try:
+            frames = _cached_timelapse_frames(str(ticker or "").strip().upper())
+        except Exception:
+            st.error("Could not load Market Timelapse snapshots.")
+            return
+        if not frames:
+            st.info("No historical delta surfaces found for this ticker in data_history/.")
+            return
+        z_min, z_max = timelapse_shared_z_range(item["z"] for item in frames)
+        st.write(
+            {
+                "frames": len(frames),
+                "surface_key": TIMELAPSE_SURFACE_KEY,
+                "z_min": z_min,
+                "z_max": z_max,
+                "labels": [item["label"] for item in frames],
+            }
+        )
+        try:
+            fig = build_market_timelapse_figure(frames)
+            st.plotly_chart(
+                fig,
+                width="stretch",
+                height=600,
+                theme=None,
+                config={"displayModeBar": True, "scrollZoom": True},
+                key="market-timelapse",
+            )
+        except Exception:
+            st.error("Could not render the Market Timelapse animation.")
+
+
 def main() -> None:
     st.set_page_config(
         page_title=PAGE_TITLE,
@@ -3492,6 +3659,7 @@ def main() -> None:
         "Portfolio & Risk",
         "Integrated Risk View",
         "Test Dashboard",
+        "Market Timelapse",
     ]
     (
         greeks_tab,
@@ -3503,6 +3671,7 @@ def main() -> None:
         portfolio_tab,
         integrated_tab,
         test_dashboard_tab,
+        timelapse_tab,
     ) = st.tabs(
         tab_labels,
         on_change="rerun",
@@ -3704,6 +3873,9 @@ def main() -> None:
             spot=float(current_price or 0.0),
             sigma=float(sigma) if sigma is not None else float(DEFAULT_SIGMA),
         )
+
+    if timelapse_tab.open:
+        add_market_timelapse_tab(timelapse_tab, ticker)
 
 
 if __name__ == "__main__":
