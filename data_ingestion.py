@@ -165,6 +165,51 @@ def is_mock_frame(frame: Any) -> bool:
         return False
 
 
+def chain_expiry_mismatch_reason(frame: Any, requested_expiry: Any) -> str | None:
+    """Return a refusal reason when ``frame`` must not be saved under ``requested_expiry``.
+
+    When a specific ISO expiration was requested, empty / mock / wrong-expiry chains
+    must not be persisted (avoids stamping MarketData's unscoped next-monthly under
+    future metadata). Returns ``None`` when save is allowed.
+    """
+    want = _expiry_iso(requested_expiry)
+    if not want:
+        return None
+    if not isinstance(frame, pd.DataFrame) or frame.empty:
+        return (
+            f"No option contracts for expiration {want}; "
+            "refusing unscoped fallback — snapshot not saved."
+        )
+    if is_mock_frame(frame):
+        return (
+            f"Mock/failed chain for expiration {want}; "
+            "refusing unscoped fallback — snapshot not saved."
+        )
+    exp_col = next(
+        (c for c in ("expiration", "expiry", "Expiry", "Expiration") if c in frame.columns),
+        None,
+    )
+    if exp_col is None:
+        return (
+            f"Chain missing expiration column for requested {want}; snapshot not saved."
+        )
+    got: set[str] = set()
+    for value in frame[exp_col].dropna().tolist():
+        iso = _unix_to_iso(value) or _expiry_iso(value)
+        if iso:
+            got.add(iso)
+    if not got:
+        return (
+            f"Chain has no usable expiration values for requested {want}; snapshot not saved."
+        )
+    if got != {want}:
+        return (
+            f"Chain expiration {sorted(got)} does not match requested {want}; "
+            "snapshot not saved."
+        )
+    return None
+
+
 def mock_option_chain(
     ticker: str = "SPY",
     *,
@@ -464,8 +509,6 @@ def fetch_option_chain(
     # Shape: https://api.marketdata.app/v1/options/chain/{ticker}/?expiration={requested_expiration}
     hist_iso = _expiry_iso(date) if date else None
     path = _with_date_query(CHAIN_PATH.format(symbol=symbol), hist_iso)
-    if requested_expiration:
-        print(f"DEBUG: Fetching {ticker} with expiration {requested_expiration}")
     try:
         payload = _marketdata_get(path, params)
     except Exception as exc:
