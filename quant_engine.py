@@ -4533,4 +4533,5 @@ def test_simulated_pnl(
     d_value = dlt * d_s + 0.5 * gam * (d_s ** 2) + tht * d_t + veg * d_v
     return float(side_sign * abs(qty) * mult * d_value)
 
+
 test_simulated_pnl.__test__ = False  # not a pytest case; Test Dashboard helper only
