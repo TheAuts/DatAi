@@ -4,3 +4,18 @@ alwaysApply: true
 ---
 
 Always be concise. No conversational filler. Use pytest for math logic. Keep code modular. Prioritize performance.
+
+# Team Protocol
+
+Specialist roles (`.cursor/rules/*.mdc`):
+
+- backend — numerical stability, vectorization, math tests
+- frontend — Streamlit UI, DataFrame inputs, `st.cache_data`, dark-mode layout
+- github — sync, atomic commits, conflict reporting
+- audit — read-only completeness / `product_spec.md` compliance; flag Integration Gaps
+- compliance — API security, `.gitignore` integrity, secrets management
+- perf — vectorization, `st.cache_data` optimization, memory profiling
+- qa — pytest generation, mathematical boundary testing
+- ux — docstrings, tooltips, user-friendly labels
+
+Institutional Tier readiness: compliance, perf, qa, and ux required alongside core roles.
