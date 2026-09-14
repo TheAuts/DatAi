@@ -1748,6 +1748,7 @@ def test_audit_monte_carlo_path_count_threshold() -> None:
     assert int(lifted["n_paths"]) >= MC_MIN_PATHS
     assert lifted["path_audit"]["ok"] is True
 
+
 def test_mathematicians_rule_gate_forbids_pot_gt_pop() -> None:
     forbidden = mathematicians_rule_gate(0.30, 0.55, delta_hedged=False)
     assert forbidden["approved"] is False
