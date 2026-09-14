@@ -51,6 +51,8 @@ from quant_engine import (
     analyze_gex_outlook,
     analyze_market_sentiment,
     analyze_volatility_risk_outlook,
+    calculate_stress_scenario,
+    build_stress_pnl_matrix,
 )
 
 STANDARD = {"S": 100.0, "K": 100.0, "T": 1.0, "r": 0.05, "sigma": 0.2, "option_type": "call"}
@@ -1109,3 +1111,94 @@ def test_load_all_snapshots_sorted_and_delta_surface(tmp_path: Path) -> None:
     lo, hi = timelapse_shared_z_range(f["z"] for f in frames)
     assert lo == pytest.approx(-0.2)
     assert hi == pytest.approx(1.0)
+
+
+def _stress_chain_frame() -> pd.DataFrame:
+    rows = []
+    for strike, opt, oi in ((95.0, "call", 10.0), (100.0, "call", 20.0), (105.0, "put", 15.0)):
+        rows.append(
+            {
+                "S": 100.0,
+                "K": strike,
+                "T": 0.25,
+                "r": 0.05,
+                "sigma": 0.20,
+                "option_type": opt,
+                "openInterest": oi,
+                "contractSize": 100.0,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def test_calculate_stress_scenario_zero_shock_identity() -> None:
+    frame = _stress_chain_frame()
+    impact = calculate_stress_scenario(
+        "TEST",
+        0.0,
+        0.0,
+        frame=frame,
+        spot=100.0,
+    )
+    assert impact["n_contracts"] == 3
+    assert impact["delta_change"] == pytest.approx(0.0, abs=1e-9)
+    assert impact["gamma_change"] == pytest.approx(0.0, abs=1e-9)
+    assert impact["vega_change"] == pytest.approx(0.0, abs=1e-9)
+    assert impact["net_pnl"] == pytest.approx(0.0, abs=1e-6)
+    assert impact["negative_gamma"] is False or isinstance(impact["negative_gamma"], bool)
+
+
+def test_calculate_stress_scenario_spot_up_moves_delta_and_pnl() -> None:
+    frame = _stress_chain_frame()
+    up = calculate_stress_scenario("TEST", 10.0, 0.0, frame=frame, spot=100.0)
+    down = calculate_stress_scenario("TEST", -10.0, 0.0, frame=frame, spot=100.0)
+    assert up["stressed_spot"] == pytest.approx(110.0)
+    assert down["stressed_spot"] == pytest.approx(90.0)
+    assert up["net_pnl"] != pytest.approx(down["net_pnl"])
+    assert "delta_change" in up and "gamma_change" in up and "vega_change" in up
+    assert math.isfinite(float(up["total_gamma"]))
+
+
+def test_calculate_stress_scenario_iv_up_raises_vega_book_pnl() -> None:
+    frame = _stress_chain_frame()
+    base = calculate_stress_scenario("TEST", 0.0, 0.0, frame=frame, spot=100.0)
+    high_iv = calculate_stress_scenario("TEST", 0.0, 20.0, frame=frame, spot=100.0)
+    # Long OI book gains when IV rises (positive vega inventory).
+    assert high_iv["net_pnl"] > base["net_pnl"]
+    assert high_iv["vega_change"] == pytest.approx(0.0, abs=1.0) or math.isfinite(high_iv["vega_change"])
+
+
+def test_calculate_stress_scenario_copies_input_frame() -> None:
+    frame = _stress_chain_frame()
+    original = frame.copy()
+    calculate_stress_scenario("TEST", 5.0, -10.0, frame=frame, spot=100.0)
+    pd.testing.assert_frame_equal(frame, original)
+
+
+def test_build_stress_pnl_matrix_shape_and_center() -> None:
+    frame = _stress_chain_frame()
+    # Inject via temporary repo cache.
+    repo = DataRepository(cache_dir=Path("/tmp/datai_stress_cache"), history_dir=Path("/tmp/datai_stress_hist"))
+    repo.cache_dir.mkdir(parents=True, exist_ok=True)
+    repo.history_dir.mkdir(parents=True, exist_ok=True)
+    repo.save_to_cache("STX", frame)
+    matrix = build_stress_pnl_matrix(
+        "STX",
+        (-10.0, 0.0, 10.0),
+        (-20.0, 0.0, 20.0),
+        repo=repo,
+    )
+    assert matrix["spot_shifts"] == [-10.0, 0.0, 10.0]
+    assert matrix["iv_shifts"] == [-20.0, 0.0, 20.0]
+    z = np.asarray(matrix["net_pnl"], dtype=float)
+    assert z.shape == (3, 3)
+    assert matrix["n_contracts"] >= 1
+    # Center cell (0%, 0%) should be ~0.
+    assert z[1, 1] == pytest.approx(0.0, abs=1e-4)
+
+
+def test_calculate_stress_scenario_empty_frame() -> None:
+    impact = calculate_stress_scenario("EMPTY", 5.0, 5.0, frame=pd.DataFrame(), spot=100.0)
+    assert impact["n_contracts"] == 0
+    assert impact["delta_change"] == 0.0
+    assert impact["net_pnl"] == 0.0
