@@ -4,6 +4,8 @@ cache/
 .venv/
 venv/
 logs/
+*.log
+artifacts/composer-crash-log-samples/
 __pycache__/
 .pytest_cache/
 .mypy_cache/

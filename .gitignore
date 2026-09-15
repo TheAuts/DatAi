@@ -5,5 +5,7 @@ __pycache__/
 *.py[cod]
 data/
 logs/
+*.log
+artifacts/composer-crash-log-samples/
 .pytest_cache/
 .mypy_cache/
