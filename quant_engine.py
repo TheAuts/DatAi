@@ -233,6 +233,17 @@ def _gex_delta_rgba_colorscale(n_gamma: int = 48, n_delta: int = 24) -> list[lis
     return scale
 
 
+def _viridis_rgb_colorscale() -> list[list[Any]]:
+    """Short opaque Viridis stops. Plotly 3D Surface ignores / drops rgba meshes."""
+    n = len(_VIRIDIS_RGB) - 1
+    if n <= 0:
+        return [[0.0, "rgb(68,1,84)"], [1.0, "rgb(253,231,37)"]]
+    return [
+        [i / float(n), f"rgb({r},{g},{b})"]
+        for i, (r, g, b) in enumerate(_VIRIDIS_RGB)
+    ]
+
+
 def _encode_gex_delta_color(
     gamma_norm: np.ndarray,
     delta_norm: np.ndarray,
@@ -424,9 +435,15 @@ def generate_integrated_risk_surface(
     # |Delta| so puts and calls both drive opacity toward high-risk extremes.
     delta_abs = np.abs(np.array(z_delta, dtype=np.float64, copy=True))
     delta_n = minmax_normalize_01(delta_abs)
+    vol_finite = np.isfinite(vol_n)
+    finite_vol = vol_n[vol_finite]
+    # Constant IV min-maxes to 0; Plotly then autoscales z to a zero-height box
+    # and the mesh disappears. Park a constant plane at mid-axis instead.
+    if finite_vol.size and float(np.max(finite_vol) - np.min(finite_vol)) <= 1e-15:
+        vol_n = np.full_like(vol_n, 0.5, dtype=np.float64)
+        vol_n[~vol_finite] = np.nan
     if not include_vol:
         # Hide vol contribution: flat Z plane at mid height.
-        vol_finite = np.isfinite(vol_n)
         vol_n = np.full_like(vol_n, 0.5, dtype=np.float64)
         vol_n[~vol_finite] = np.nan
     if not include_gamma:
@@ -440,11 +457,11 @@ def generate_integrated_risk_surface(
 
     n_gamma, n_delta = 48, 24
     encoded = _encode_gex_delta_color(gamma_n, delta_n, n_gamma=n_gamma, n_delta=n_delta)
-    colorscale = _gex_delta_rgba_colorscale(n_gamma=n_gamma, n_delta=n_delta)
-    # Reinforce ghosting: opacityscale tracks the packed color (GEX×Δ).
-    # When Delta is off, keep opacity fully opaque.
+    colorscale = _viridis_rgb_colorscale()
+    # Opacity floor stays visible on a dark theme. Plotly maps opacityscale to
+    # surfacecolor, so do not start at ~0.08 or the mesh ghosts out.
     if include_delta:
-        opacityscale: list[list[Any]] = [[0.0, 0.08], [0.35, 0.35], [0.7, 0.7], [1.0, 1.0]]
+        opacityscale: list[list[Any]] = [[0.0, 0.45], [0.5, 0.75], [1.0, 1.0]]
     else:
         opacityscale = [[0.0, 1.0], [1.0, 1.0]]
 

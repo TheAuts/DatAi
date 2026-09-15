@@ -981,7 +981,7 @@ def test_audit_go_surface_paths_use_reshape_to_surface() -> None:
 
     # Named 3D render paths must call reshape_to_surface.
     for marker in (
-        "def render_integrated_risk_surface",
+        "def build_integrated_risk_figure",
         "def render_time_machine_vol_surface",
         "def liquidation_waterfall_build_heatmap",
         "def event_impact_render_shock_surface",
@@ -992,6 +992,12 @@ def test_audit_go_surface_paths_use_reshape_to_surface() -> None:
         fn_end = dash.index("\ndef ", fn_start + 1)
         body = dash[fn_start:fn_end]
         assert "reshape_to_surface" in body, f"{marker} missing reshape_to_surface"
+    render_ir = dash[
+        dash.index("def render_integrated_risk_surface") : dash.index(
+            "\ndef ", dash.index("def render_integrated_risk_surface") + 1
+        )
+    ]
+    assert "build_integrated_risk_figure" in render_ir
 
     # Engine integrated-risk builder also reshapes before Surface.
     eng_start = eng.index("def generate_integrated_risk_surface")
@@ -1226,6 +1232,26 @@ def test_generate_integrated_risk_surface_nonempty() -> None:
 
     empty = generate_integrated_risk_surface(pd.DataFrame())
     assert isinstance(empty, go.Surface)
+
+    constant = frame.copy()
+    constant["Volatility"] = 0.2
+    flat = generate_integrated_risk_surface(constant)
+    z_const = np.asarray(flat.z, dtype=float)
+    finite_c = z_const[np.isfinite(z_const)]
+    assert finite_c.size > 0
+    assert np.allclose(finite_c, 0.5, atol=1e-9)
+    cs = list(flat.colorscale)
+    assert len(cs) <= 16
+    assert all("rgba(" not in str(stop[1]).lower() for stop in cs)
+
+    from dashboard import build_integrated_risk_figure
+
+    fig = build_integrated_risk_figure(flat)
+    assert fig is not None
+    z_fig = np.asarray(fig.data[0].z, dtype=float)
+    assert np.any(np.isfinite(z_fig))
+    z_range = fig.layout.scene.zaxis.range
+    assert list(z_range) == [0, 1]
 
 
 def test_compute_total_risk_score_weights_and_alert_band() -> None:

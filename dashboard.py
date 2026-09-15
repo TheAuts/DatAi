@@ -1929,39 +1929,89 @@ def render_delta_term_structure(frame: pd.DataFrame) -> None:
     st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": True}, key="delta-term-structure-chart")
 
 
+def build_integrated_risk_figure(surface: go.Surface) -> go.Figure | None:
+    """Build the Total Risk Profile figure, or ``None`` when z is empty."""
+    raw = getattr(surface, "z", None)
+    z_data = reshape_to_surface(raw if raw is not None else [])
+    if z_data.ndim != 2 or z_data.size == 0 or not np.any(np.isfinite(z_data)):
+        return None
+    x_raw = getattr(surface, "x", None)
+    y_raw = getattr(surface, "y", None)
+    z2d, x_ok, y_ok, _warning = prepare_plotly_surface_xyz(z_data, x_raw, y_raw)
+    if z2d.ndim != 2 or z2d.size == 0 or not np.any(np.isfinite(z2d)):
+        return None
+    sc_raw = getattr(surface, "surfacecolor", None)
+    color_grid = None
+    if sc_raw is not None:
+        color_grid = reshape_to_surface(sc_raw)
+        if color_grid.shape != z2d.shape:
+            color_grid = np.array(sc_raw, dtype=np.float64, copy=True)
+            if color_grid.size == z2d.size:
+                color_grid = color_grid.reshape(z2d.shape)
+            else:
+                color_grid = None
+    colorscale = getattr(surface, "colorscale", None) or "Viridis"
+    opacityscale = getattr(surface, "opacityscale", None)
+    colorbar = getattr(surface, "colorbar", None)
+    payload: dict[str, Any] = {
+        "z": np.array(z2d, dtype=np.float64, copy=True),
+        "colorscale": colorscale,
+        "cmin": 0.0,
+        "cmax": 1.0,
+        "showscale": True,
+        "name": "Total Risk Profile",
+        "hovertemplate": (
+            "X=%{x:.2f}<br>Y=%{y:.2f}<br>"
+            "Vol (norm)=%{z:.3f}<br>"
+            "GEX×Δ=%{surfacecolor:.3f}<extra>Total Risk Profile</extra>"
+        ),
+        "lighting": {"ambient": 0.72, "diffuse": 0.8, "specular": 0.1},
+        "lightposition": {"x": 80, "y": 80, "z": 100},
+    }
+    if color_grid is not None and color_grid.shape == z2d.shape:
+        payload["surfacecolor"] = np.array(color_grid, dtype=np.float64, copy=True)
+    if opacityscale is not None:
+        payload["opacityscale"] = opacityscale
+    if colorbar is not None:
+        payload["colorbar"] = colorbar
+    if x_ok is not None and y_ok is not None:
+        payload["x"] = np.array(x_ok, dtype=np.float64, copy=True)
+        payload["y"] = np.array(y_ok, dtype=np.float64, copy=True)
+    fig = go.Figure(data=[go.Surface(**payload)])
+    fig.update_layout(
+        template="plotly_dark",
+        paper_bgcolor=DARK_BG,
+        font={"color": TEXT},
+        height=560,
+        title={"text": "Total Risk Profile", "x": 0.0, "xanchor": "left"},
+        scene={
+            "xaxis": {"title": "Price"},
+            "yaxis": {"title": "Days to Expiry"},
+            "zaxis": {"title": "Volatility (norm)", "range": [0, 1]},
+            "bgcolor": PANEL_BG,
+            "dragmode": "orbit",
+            "aspectmode": "cube",
+        },
+        margin={"l": 8, "r": 8, "t": 48, "b": 8},
+        uirevision="integrated-risk-surface",
+    )
+    return fig
+
+
 def render_integrated_risk_surface(surface: go.Surface) -> None:
     """Plot a single Total Risk Profile ``go.Surface`` (Integrated Risk View)."""
     try:
-        raw = getattr(surface, "z", None)
-        z_data = reshape_to_surface(raw if raw is not None else [])
-        if z_data.ndim != 2 or z_data.size == 0 or not np.any(np.isfinite(z_data)):
+        fig = build_integrated_risk_figure(surface)
+        if fig is None:
             st.info("No integrated risk surface data to plot.")
             return
-        surface.update(z=z_data)
-        fig = go.Figure(data=[surface])
-        fig.update_layout(
-            template="plotly_dark",
-            paper_bgcolor=DARK_BG,
-            font={"color": TEXT},
-            height=560,
-            title={"text": "Total Risk Profile", "x": 0.0, "xanchor": "left"},
-            scene={
-                "xaxis_title": "Price",
-                "yaxis_title": "Days to Expiry",
-                "zaxis_title": "Volatility (norm)",
-                "bgcolor": PANEL_BG,
-                "dragmode": "orbit",
-            },
-            margin={"l": 8, "r": 8, "t": 48, "b": 8},
-            uirevision="integrated-risk-surface",
-        )
         st.caption(
             "Z = normalized Volatility · color = GEX (normalized Gamma) · "
             "opacity = normalized |Delta| (ghost at low delta)."
         )
         st.plotly_chart(
             fig,
-            use_container_width=True,
+            width="stretch",
             config={"displayModeBar": True, "scrollZoom": True},
             key="integrated-risk-surface-chart",
         )
