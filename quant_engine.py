@@ -4983,10 +4983,15 @@ def snapshot_time_label_from_name(name: str) -> str:
     stem = Path(str(name or "")).stem
     parts = [p for p in stem.split("_") if p]
     # Unix epoch suffix (e.g. SPY_2026-09-13_0723_1789284208).
+    # 10 digits = seconds, 12–13 = milliseconds. 14+ is a compact YYYYMMDDHHMMSS
+    # stamp and must not be passed to fromtimestamp (garbage / overflow).
     for part in reversed(parts):
-        if part.isdigit() and len(part) >= 10:
+        if part.isdigit() and 10 <= len(part) <= 13:
             try:
-                moment = datetime.fromtimestamp(int(part))
+                ts = float(int(part))
+                if len(part) >= 12:
+                    ts /= 1000.0
+                moment = datetime.fromtimestamp(ts, tz=timezone.utc)
                 return moment.strftime("%H:%M:%S")
             except (OSError, OverflowError, ValueError):
                 break
@@ -5121,8 +5126,10 @@ def load_all_snapshots(
             # Fall back to parsed stamp / mtime for ordering.
             ts = 0.0
             for part in reversed(stamp.split("_")):
-                if part.isdigit() and len(part) >= 10:
-                    ts = float(part)
+                if part.isdigit() and 10 <= len(part) <= 13:
+                    ts = float(int(part))
+                    if len(part) >= 12:
+                        ts /= 1000.0
                     break
             if ts <= 0.0:
                 try:
