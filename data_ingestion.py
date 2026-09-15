@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
+import numpy as np
 import pandas as pd
 import requests
 from dotenv import load_dotenv
@@ -30,6 +31,7 @@ API_BASE = "https://api.marketdata.app/v1"
 CHAIN_PATH = "/options/chain/{symbol}/"
 EXPIRATIONS_PATH = "/options/expirations/{symbol}/"
 QUOTES_PATH = "/stocks/quotes/{symbol}/"
+CANDLES_PATH = "/stocks/candles/{resolution}/{symbol}/"
 REQUEST_TIMEOUT_SEC = 30
 API_RETRY_ATTEMPTS = 3
 API_RETRY_BACKOFF_SEC = 0.5
@@ -55,6 +57,8 @@ CHAIN_COLUMNS = (
     "T",
     "sigma",
 )
+OHLCV_COLUMNS = ("Date", "Open", "High", "Low", "Close", "Volume")
+CANDLE_RESOLUTIONS = ("D", "W", "M", "60", "15", "5")
 
 # Last API call outcome for dashboard / callers (status_code may be int or None).
 _LAST_API_ERROR: dict[str, Any] = {
@@ -593,6 +597,210 @@ def get_current_price(ticker: str) -> float | None:
     if spots.empty:
         return None
     return float(spots.iloc[0])
+
+
+def _empty_ohlcv() -> pd.DataFrame:
+    return pd.DataFrame(columns=list(OHLCV_COLUMNS))
+
+
+def _unix_to_timestamp(value: Any) -> pd.Timestamp:
+    """Convert MarketData candle time (unix or ISO) to a pandas timestamp."""
+    if value is None or value is pd.NaT:
+        return pd.NaT
+    try:
+        if pd.isna(value):
+            return pd.NaT
+    except (TypeError, ValueError):
+        pass
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return pd.NaT
+        parsed = pd.to_datetime(text, errors="coerce")
+        return parsed if parsed is not pd.NaT else pd.NaT
+    try:
+        ts = float(value)
+    except (TypeError, ValueError):
+        parsed = pd.to_datetime(value, errors="coerce")
+        return parsed if parsed is not pd.NaT else pd.NaT
+    if ts > 1e12:
+        ts /= 1000.0
+    try:
+        return pd.Timestamp(ts, unit="s", tz=EASTERN)
+    except (OSError, OverflowError, ValueError):
+        try:
+            return pd.Timestamp(ts, unit="s", tz="UTC")
+        except (OSError, OverflowError, ValueError):
+            return pd.NaT
+
+
+def _normalize_resolution(resolution: Any) -> str:
+    text = str(resolution or "D").strip().upper()
+    aliases = {
+        "DAILY": "D",
+        "1D": "D",
+        "WEEKLY": "W",
+        "1W": "W",
+        "MONTHLY": "M",
+        "1M": "M",
+        "HOUR": "60",
+        "HOURLY": "60",
+        "1H": "60",
+        "60M": "60",
+        "15M": "15",
+        "5M": "5",
+    }
+    mapped = aliases.get(text, text)
+    if mapped not in CANDLE_RESOLUTIONS:
+        return "D"
+    return mapped
+
+
+def normalize_ohlcv_frame(frame: Any) -> pd.DataFrame:
+    """Return a Date/OHLCV DataFrame from caller input; drop unusable rows.
+
+    Accepts MarketData column names (``o``/``h``/``l``/``c``/``v``/``t``) or
+    standard ``Open``/``High``/``Low``/``Close``/``Volume``/``Date``. Never
+    invents prices — empty or invalid input yields an empty frame.
+    """
+    if frame is None or not isinstance(frame, pd.DataFrame) or frame.empty:
+        return _empty_ohlcv()
+    out = frame.copy()
+    lookup = {str(col).strip().lower(): col for col in out.columns}
+    aliases = {
+        "date": "Date",
+        "time": "Date",
+        "timestamp": "Date",
+        "t": "Date",
+        "datetime": "Date",
+        "open": "Open",
+        "o": "Open",
+        "high": "High",
+        "h": "High",
+        "low": "Low",
+        "l": "Low",
+        "close": "Close",
+        "c": "Close",
+        "volume": "Volume",
+        "v": "Volume",
+        "vol": "Volume",
+    }
+    rename: dict[str, str] = {}
+    for key, dest in aliases.items():
+        if dest not in out.columns and key in lookup:
+            rename[lookup[key]] = dest
+    if rename:
+        out = out.rename(columns=rename)
+    for column in OHLCV_COLUMNS:
+        if column not in out.columns:
+            out[column] = pd.NA
+    out = out.loc[:, list(OHLCV_COLUMNS)].copy()
+    out["Date"] = [_unix_to_timestamp(value) for value in out["Date"].tolist()]
+    for column in ("Open", "High", "Low", "Close", "Volume"):
+        out[column] = pd.to_numeric(out[column], errors="coerce")
+    opens = out["Open"].to_numpy(dtype="float64", na_value=np.nan)
+    highs = out["High"].to_numpy(dtype="float64", na_value=np.nan)
+    lows = out["Low"].to_numpy(dtype="float64", na_value=np.nan)
+    closes = out["Close"].to_numpy(dtype="float64", na_value=np.nan)
+    valid = (
+        np.isfinite(opens)
+        & np.isfinite(highs)
+        & np.isfinite(lows)
+        & np.isfinite(closes)
+        & (opens > 0)
+        & (highs > 0)
+        & (lows > 0)
+        & (closes > 0)
+        & pd.notna(out["Date"]).to_numpy()
+    )
+    out = out.loc[valid].copy()
+    if out.empty:
+        return _empty_ohlcv()
+    stacked = np.vstack(
+        [
+            out["Open"].to_numpy(dtype="float64"),
+            out["High"].to_numpy(dtype="float64"),
+            out["Low"].to_numpy(dtype="float64"),
+            out["Close"].to_numpy(dtype="float64"),
+        ]
+    )
+    out["High"] = np.max(stacked, axis=0)
+    out["Low"] = np.min(stacked, axis=0)
+    volumes = out["Volume"].to_numpy(dtype="float64", na_value=np.nan)
+    out["Volume"] = np.where(np.isfinite(volumes) & (volumes >= 0.0), volumes, 0.0)
+    out = out.sort_values("Date", kind="mergesort").reset_index(drop=True)
+    return out.loc[:, list(OHLCV_COLUMNS)]
+
+
+def _candles_payload_to_frame(payload: dict[str, Any]) -> pd.DataFrame:
+    opens = _series(payload, "o", "open")
+    highs = _series(payload, "h", "high")
+    lows = _series(payload, "l", "low")
+    closes = _series(payload, "c", "close")
+    volumes = _series(payload, "v", "volume")
+    times = _series(payload, "t", "time", "timestamp")
+    n = min(len(opens), len(highs), len(lows), len(closes))
+    if n <= 0:
+        return _empty_ohlcv()
+    rows: list[dict[str, Any]] = []
+    for i in range(n):
+        rows.append(
+            {
+                "Date": times[i] if i < len(times) else None,
+                "Open": opens[i],
+                "High": highs[i],
+                "Low": lows[i],
+                "Close": closes[i],
+                "Volume": volumes[i] if i < len(volumes) else 0,
+            }
+        )
+    return normalize_ohlcv_frame(pd.DataFrame(rows))
+
+
+def fetch_ohlcv(
+    ticker: str,
+    *,
+    resolution: str = "D",
+    countback: int = 180,
+    to: str | None = None,
+) -> pd.DataFrame:
+    """Fetch underlying OHLCV candles from MarketData.
+
+    Uses ``GET /v1/stocks/candles/{resolution}/{symbol}/``. Returns an empty
+    Date/OHLCV DataFrame when the symbol is blank, the API errors, or there is
+    no data — callers must degrade cleanly and must not treat empty as live.
+    """
+    symbol = _normalize_ticker(ticker)
+    if not symbol:
+        return _empty_ohlcv()
+    res = _normalize_resolution(resolution)
+    bars = int(countback)
+    if bars < 1:
+        bars = 1
+    if bars > 500:
+        bars = 500
+    params: dict[str, Any] = {"countback": bars}
+    to_text = str(to or "").strip()
+    if to_text:
+        params["to"] = to_text
+    path = CANDLES_PATH.format(resolution=res, symbol=symbol)
+    try:
+        payload = _marketdata_get(path, params)
+    except Exception as exc:
+        log.error("fetch_ohlcv failed ticker=%s error=%s", symbol, exc)
+        empty = _empty_ohlcv()
+        empty.attrs["api_error"] = str(exc)
+        return empty
+    if not payload:
+        empty = _empty_ohlcv()
+        last = get_last_api_error()
+        empty.attrs["api_error"] = last.get("status_code") or last.get("message") or "RequestFailed"
+        empty.attrs["token_missing"] = bool(last.get("token_missing"))
+        return empty
+    status = str(payload.get("s") or "").lower()
+    if status == "no_data":
+        return _empty_ohlcv()
+    return _candles_payload_to_frame(payload)
 
 
 def preflight_check(ticker: str, expiry: Any = None) -> PreflightResult:
