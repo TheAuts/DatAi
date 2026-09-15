@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import math
 import time
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -128,6 +128,16 @@ from quant_engine import (
     VPIN_HIGH_THRESHOLD,
     OBI_EXTREME_THRESHOLD,
     OBI_TOP_LEVELS,
+    diagnose_surface_anomaly,
+    surface_gradient_magnitude,
+    surface_model_fit_residual,
+    format_anomaly_detected_message,
+    classify_anomaly_label,
+    build_anomaly_ghost_column_meshes,
+    ANOMALY_LABEL_GAMMA_WALL,
+    ANOMALY_LABEL_REGIME_MISMATCH,
+    ANOMALY_FIT_HIGH,
+    ANOMALY_FIT_LOW,
 )
 
 STANDARD = {"S": 100.0, "K": 100.0, "T": 1.0, "r": 0.05, "sigma": 0.2, "option_type": "call"}
@@ -2617,3 +2627,163 @@ def test_vpin_sparse_proxy_and_high_adverse_flag() -> None:
         assert hot["high_adverse_selection"] is True
     elif hot["ok"]:
         assert hot["high_adverse_selection"] is False
+
+
+def _anomaly_chain_frame(
+    bumps: dict[tuple[float, float], tuple[float, float]],
+    *,
+    base_iv: float = 0.20,
+    base_oi: float = 100.0,
+) -> pd.DataFrame:
+    strikes = [90.0, 95.0, 100.0, 105.0, 110.0, 115.0, 120.0]
+    dtes = [14.0, 21.0, 30.0, 45.0, 60.0, 90.0]
+    rows: list[dict[str, Any]] = []
+    origin = date(2026, 9, 14)
+    for k in strikes:
+        for dte in dtes:
+            iv, oi = bumps.get((k, dte), (base_iv, base_oi))
+            exp = (origin + timedelta(days=int(dte))).isoformat()
+            rows.append(
+                {
+                    "strike": k,
+                    "DaysToExpiry": dte,
+                    "expiration": exp,
+                    "impliedVolatility": iv,
+                    "openInterest": oi,
+                    "option_type": "call",
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def test_surface_gradient_magnitude_plane_is_uniform() -> None:
+    x = np.array([0.0, 1.0, 2.0, 3.0], dtype=np.float64)
+    y = np.array([0.0, 2.0, 4.0], dtype=np.float64)
+    xx, yy = np.meshgrid(x, y)
+    z = xx + 0.5 * yy
+    mag = surface_gradient_magnitude(z, x, y)
+    assert mag.shape == (3, 4)
+    assert mag.dtype == np.float64
+    assert mag is not z
+    expected = float(np.hypot(1.0, 0.5))
+    assert np.allclose(mag, expected, atol=1e-9)
+
+
+def test_surface_gradient_magnitude_spike_exceeds_plane() -> None:
+    x = np.arange(5.0)
+    y = np.arange(5.0)
+    z = np.full((5, 5), 0.20, dtype=np.float64)
+    z[2, 2] = 0.80
+    mag = surface_gradient_magnitude(z, x, y)
+    assert float(mag[2, 1]) > float(mag[0, 0])
+    assert float(mag[1, 2]) > float(mag[0, 0])
+
+
+def test_surface_model_fit_residual_spike() -> None:
+    z = np.full((7, 7), 0.20, dtype=np.float64)
+    z[3, 3] = 0.90
+    residual = surface_model_fit_residual(z, sigma=1.0)
+    assert residual.shape == z.shape
+    assert residual.dtype == np.float64
+    assert float(residual[3, 3]) > float(np.nanmedian(residual))
+    assert float(residual[3, 3]) > float(residual[0, 0])
+
+
+def test_format_anomaly_detected_message_exact() -> None:
+    line = format_anomaly_detected_message(110.0, "2026-10-16", 125000.0, "High")
+    assert line == (
+        "Anomaly detected at Strike 110 / Expiry 2026-10-16. "
+        "Open Interest: 125000. Model Fit Error: High."
+    )
+    low = format_anomaly_detected_message(100.5, 30.0, 12.0, ANOMALY_FIT_LOW)
+    assert low == (
+        "Anomaly detected at Strike 100.5 / Expiry 30. "
+        "Open Interest: 12. Model Fit Error: Low."
+    )
+
+
+def test_classify_anomaly_label_gamma_wall_and_mismatch() -> None:
+    assert classify_anomaly_label(oi_high=True, oi_low=False, fit_high=False) == ANOMALY_LABEL_GAMMA_WALL
+    assert classify_anomaly_label(oi_high=True, oi_low=False, fit_high=True) == ANOMALY_LABEL_GAMMA_WALL
+    assert classify_anomaly_label(oi_high=False, oi_low=True, fit_high=True) == ANOMALY_LABEL_REGIME_MISMATCH
+    assert classify_anomaly_label(oi_high=False, oi_low=True, fit_high=False) is None
+    assert classify_anomaly_label(oi_high=False, oi_low=False, fit_high=True) is None
+
+
+def test_diagnose_surface_anomaly_gamma_wall() -> None:
+    frame = _anomaly_chain_frame({(110.0, 30.0): (0.85, 1_000_000.0)})
+    original = frame.copy()
+    out = diagnose_surface_anomaly(
+        "SPY",
+        (90.0, 120.0),
+        (14.0, 90.0),
+        frame=frame,
+    )
+    pd.testing.assert_frame_equal(frame, original)
+    assert out["ok"] is True
+    walls = [a for a in out["anomalies"] if a.get("label") == ANOMALY_LABEL_GAMMA_WALL]
+    assert walls, out["anomalies"]
+    hit = walls[0]
+    assert hit["strike"] == pytest.approx(110.0)
+    assert hit["expiry_dte"] == pytest.approx(30.0)
+    assert hit["open_interest"] == pytest.approx(1_000_000.0)
+    assert hit["model_fit_error"] == ANOMALY_FIT_HIGH
+    assert hit["message"] == format_anomaly_detected_message(
+        110.0, hit["expiry"], 1_000_000.0, ANOMALY_FIT_HIGH
+    )
+    assert hit["message"].startswith("Anomaly detected at Strike 110 / Expiry ")
+    assert "Open Interest: 1000000. Model Fit Error: High." in hit["message"]
+
+
+def test_diagnose_surface_anomaly_regime_mismatch() -> None:
+    frame = _anomaly_chain_frame({(120.0, 45.0): (0.90, 1.0)})
+    out = diagnose_surface_anomaly(
+        "QQQ",
+        [90.0, 120.0],
+        [14.0, 90.0],
+        frame=frame,
+    )
+    mismatches = [a for a in out["anomalies"] if a.get("label") == ANOMALY_LABEL_REGIME_MISMATCH]
+    assert mismatches, out["anomalies"]
+    hit = mismatches[0]
+    assert hit["strike"] == pytest.approx(120.0)
+    assert hit["expiry_dte"] == pytest.approx(45.0)
+    assert hit["open_interest"] == pytest.approx(1.0)
+    assert hit["model_fit_error"] == ANOMALY_FIT_HIGH
+    assert "Model Fit Error: High." in hit["message"]
+
+
+def test_diagnose_surface_anomaly_uniform_iv_empty() -> None:
+    frame = _anomaly_chain_frame({})
+    out = diagnose_surface_anomaly("DIA", (90.0, 120.0), (14.0, 90.0), frame=frame)
+    assert out["ok"] is True
+    assert out["anomalies"] == []
+    assert out["messages"] == []
+    assert out["ghost_columns"] == []
+
+
+def test_diagnose_surface_anomaly_empty_frame() -> None:
+    out = diagnose_surface_anomaly("ZZZ", (1.0, 2.0), (1.0, 2.0), frame=pd.DataFrame())
+    assert out["ok"] is False
+    assert out["anomalies"] == []
+    assert out["ticker"] == "ZZZ"
+
+
+def test_build_anomaly_ghost_column_meshes_encloses_node() -> None:
+    anomalies = [
+        {
+            "strike": 110.0,
+            "expiry_dte": 30.0,
+            "label": ANOMALY_LABEL_GAMMA_WALL,
+            "message": format_anomaly_detected_message(110.0, 30.0, 10.0, ANOMALY_FIT_HIGH),
+        }
+    ]
+    meshes = build_anomaly_ghost_column_meshes(anomalies, dx=4.0, dy=6.0, z_lo=0.0, z_hi=1.0)
+    assert len(meshes) == 1
+    mesh = meshes[0]
+    assert min(mesh["x"]) < 110.0 < max(mesh["x"])
+    assert min(mesh["y"]) < 30.0 < max(mesh["y"])
+    assert min(mesh["z"]) == pytest.approx(0.0)
+    assert max(mesh["z"]) == pytest.approx(1.0)
+    assert len(mesh["i"]) == 12
+    assert len(mesh["x"]) == 8
