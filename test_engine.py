@@ -40,6 +40,7 @@ from quant_engine import (
     generate_integrated_risk_surface,
     generate_synthetic_drift,
     load_all_snapshots,
+    align_timelapse_frames_to_shared_grid,
     minmax_normalize_01,
     prefill_drift_data,
     prefill_driftdata,
@@ -1296,6 +1297,8 @@ def test_snapshot_time_label_from_name_hhmm_and_unix() -> None:
     assert snapshot_time_label_from_name("SPY_2026-09-13_1434.json") == "14:34:00"
     assert snapshot_time_label_from_name("SPY_2026-09-13_0723_1789284208.json") == "07:23:28"
     assert snapshot_time_label_from_name("20260913143005") == "14:30:05"
+    # 14-digit compact capture stamp must not be treated as a unix timestamp.
+    assert snapshot_time_label_from_name("SPY_20260914exp_20260914224015.json") == "22:40:15"
 
 
 def test_timelapse_shared_z_range_locks_minmax() -> None:
@@ -1345,6 +1348,172 @@ def test_load_all_snapshots_sorted_and_delta_surface(tmp_path: Path) -> None:
     lo, hi = timelapse_shared_z_range(f["z"] for f in frames)
     assert lo == pytest.approx(-0.2)
     assert hi == pytest.approx(1.0)
+
+    _write("2026-09-13_1030", 125.0, [0.1, 0.2, 0.3, 0.4])  # identical z to 10:00
+    frames2 = load_all_snapshots("AAA", history_dir=history)
+    assert [f["stamp"] for f in frames2] == [
+        "2026-09-13_0900",
+        "2026-09-13_1000",
+        "2026-09-13_1100",
+    ]
+
+
+def test_align_timelapse_frames_to_shared_grid_morphs_not_offsets() -> None:
+    """Single-expiry ribbons at different DTE must share one mesh; only z changes."""
+    x_a = np.linspace(300.0, 1000.0, 8)
+    x_b = np.linspace(470.0, 900.0, 8)
+    y_a = np.linspace(5.0, 5.0 + 1e-6, 8)
+    y_b = np.linspace(47.0, 47.0 + 1e-6, 8)
+    z_a = np.broadcast_to(np.linspace(0.9, 0.1, 8), (8, 8)).copy()
+    z_b = np.broadcast_to(np.linspace(0.8, 0.0, 8), (8, 8)).copy()
+    frames = [
+        {"z": z_a, "x": x_a, "y": y_a, "label": "07:14:00"},
+        {"z": z_b, "x": x_b, "y": y_b, "label": "13:46:00"},
+    ]
+    out = align_timelapse_frames_to_shared_grid(frames)
+    x0 = np.asarray(out[0]["x"], dtype=np.float64)
+    y0 = np.asarray(out[0]["y"], dtype=np.float64)
+    np.testing.assert_allclose(np.asarray(out[1]["x"], dtype=np.float64), x0)
+    np.testing.assert_allclose(np.asarray(out[1]["y"], dtype=np.float64), y0)
+    assert out[0]["z"].shape == out[1]["z"].shape
+    assert float(x0.min()) == pytest.approx(300.0)
+    assert float(x0.max()) == pytest.approx(1000.0)
+    assert float(y0.min()) == pytest.approx(5.0)
+    assert float(y0.max()) == pytest.approx(47.0 + 1e-6, abs=1e-8)
+    z0 = np.asarray(out[0]["z"], dtype=np.float64)
+    z1 = np.asarray(out[1]["z"], dtype=np.float64)
+    assert not np.allclose(z0, z1)
+    # Extruded along DTE: the smile does not sit on one y-row.
+    assert np.allclose(z0[0], z0[-1])
+    assert np.allclose(z1[0], z1[-1])
+
+
+def test_load_all_snapshots_aligns_single_dte_ribbons(tmp_path: Path) -> None:
+    history = tmp_path / "data_history"
+    history.mkdir()
+
+    def _write(stamp: str, saved_at: float, dte: float, deltas: list[float], strikes: list[float]) -> None:
+        payload = {
+            "version": "1.0",
+            "ticker": "BBB",
+            "saved_at": saved_at,
+            "stamp": stamp,
+            "data": [],
+            "delta_surface": {
+                "Strike": strikes,
+                "DaysToExpiry": [dte] * len(strikes),
+                "Delta": deltas,
+            },
+        }
+        (history / f"BBB_{stamp}.json").write_text(json.dumps(payload), encoding="utf-8")
+
+    _write("2026-09-13_0900", 50.0, 5.0, [0.8, 0.5, 0.2], [100.0, 110.0, 120.0])
+    _write("2026-09-13_1000", 100.0, 47.0, [0.7, 0.4, 0.1], [90.0, 110.0, 130.0])
+    _write("2026-09-13_1100", 150.0, 68.0, [0.6, 0.3, 0.0], [100.0, 110.0, 120.0])
+
+    frames = load_all_snapshots("BBB", history_dir=history)
+    assert len(frames) == 3
+    x0 = np.asarray(frames[0]["x"], dtype=np.float64)
+    y0 = np.asarray(frames[0]["y"], dtype=np.float64)
+    for item in frames[1:]:
+        np.testing.assert_allclose(np.asarray(item["x"], dtype=np.float64), x0)
+        np.testing.assert_allclose(np.asarray(item["y"], dtype=np.float64), y0)
+        assert np.asarray(item["z"]).shape == np.asarray(frames[0]["z"]).shape
+    assert float(x0.min()) == pytest.approx(90.0)
+    assert float(x0.max()) == pytest.approx(130.0)
+    assert float(y0.min()) == pytest.approx(5.0)
+    assert float(y0.max()) == pytest.approx(68.0)
+    z_vals = [np.asarray(item["z"], dtype=np.float64) for item in frames]
+    assert not np.allclose(z_vals[0], z_vals[1])
+    assert not np.allclose(z_vals[1], z_vals[2])
+    for z in z_vals:
+        assert np.allclose(z[0], z[-1])
+    # Original smile is recovered after resampling onto the shared strike axis.
+    smile = np.interp([100.0, 110.0, 120.0], x0, z_vals[0][0])
+    np.testing.assert_allclose(smile, [0.8, 0.5, 0.2], atol=0.01)
+
+
+def test_build_market_timelapse_figure_json_frames_play_in_order() -> None:
+    """Frames serialize as JSON lists with integer names so Plotly animate can swap z."""
+    import plotly.io as pio
+    from dashboard import build_market_timelapse_figure, build_integrated_risk_figure
+
+    frames = [
+        {
+            "label": "09:00:00",
+            "frame_name": "09:00:00",
+            "z": np.array([[0.1, 0.2], [0.3, 0.4]], dtype=np.float64),
+            "x": np.array([100.0, 110.0], dtype=np.float64),
+            "y": np.array([7.0, 14.0], dtype=np.float64),
+        },
+        {
+            "label": "10:00:00",
+            "frame_name": "10:00:00",
+            "z": np.array([[0.5, 0.6], [0.7, 0.8]], dtype=np.float64),
+            "x": np.array([100.0, 110.0], dtype=np.float64),
+            "y": np.array([7.0, 14.0], dtype=np.float64),
+        },
+        {
+            "label": "11:00:00",
+            "frame_name": "11:00:00",
+            "z": np.array([[0.9, 1.0], [1.1, 1.2]], dtype=np.float64),
+            "x": np.array([100.0, 110.0], dtype=np.float64),
+            "y": np.array([7.0, 14.0], dtype=np.float64),
+        },
+    ]
+    z_before = [np.array(item["z"], copy=True) for item in frames]
+    fig = build_market_timelapse_figure(frames)
+    spec = json.loads(pio.to_json(fig, validate=False))
+
+    assert [fr["name"] for fr in spec["frames"]] == ["0", "1", "2"]
+    slider_names = [step["args"][0][0] for step in spec["layout"]["sliders"][0]["steps"]]
+    assert slider_names == ["0", "1", "2"]
+    assert [step["label"] for step in spec["layout"]["sliders"][0]["steps"]] == [
+        "09:00:00",
+        "10:00:00",
+        "11:00:00",
+    ]
+    play_args = spec["layout"]["updatemenus"][0]["buttons"][0]["args"]
+    assert play_args[0] == ["0", "1", "2"]
+    assert play_args[1]["transition"]["duration"] == 0
+    assert play_args[1]["frame"]["redraw"] is True
+    assert play_args[1]["mode"] == "immediate"
+
+    z_hashes = []
+    for fr in spec["frames"]:
+        z = fr["data"][0]["z"]
+        assert isinstance(z, list), "frame z must be JSON lists, not numpy bdata"
+        assert not isinstance(z, dict)
+        assert "bdata" not in (z if isinstance(z, dict) else {})
+        z_hashes.append(tuple(tuple(row) for row in z))
+        assert fr.get("traces") in ([0], (0,))
+    assert len(set(z_hashes)) == 3
+    assert z_hashes[0] != z_hashes[-1]
+    data_z = spec["data"][0]["z"]
+    assert isinstance(data_z, list)
+    assert tuple(tuple(row) for row in data_z) == z_hashes[0]
+    for original, item in zip(z_before, frames):
+        np.testing.assert_array_equal(original, item["z"])
+
+    # Integrated Risk View still builds a non-empty Viridis surface (no frames).
+    rows = []
+    for dte in (7.0, 14.0, 30.0):
+        for price in (90.0, 100.0, 110.0):
+            rows.append(
+                {
+                    "Price": price,
+                    "DaysToExpiry": dte,
+                    "Delta": (price - 100.0) / 20.0,
+                    "Gamma": max(0.01, 0.05 - abs(price - 100.0) / 500.0),
+                    "Vega": 0.1 + 0.01 * (dte / 30.0),
+                    "Volatility": 0.15 + 0.01 * (dte / 30.0) + 0.002 * abs(price - 100.0) / 10.0,
+                }
+            )
+    risk = generate_integrated_risk_surface(pd.DataFrame(rows))
+    risk_fig = build_integrated_risk_figure(risk)
+    assert risk_fig is not None
+    assert list(getattr(risk_fig, "frames", []) or []) == []
+    assert np.any(np.isfinite(np.asarray(risk_fig.data[0].z, dtype=float)))
 
 
 def _stress_chain_frame() -> pd.DataFrame:

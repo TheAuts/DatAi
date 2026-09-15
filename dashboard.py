@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
 import time
 from datetime import date, timedelta
+from pathlib import Path
 from typing import Any, Mapping
 
 import pandas as pd
@@ -5057,63 +5059,131 @@ def add_event_impact_lab_tab(tab: Any, ticker: str) -> None:
         event_impact_render_shock_surface(result)
 
 
+def _timelapse_history_token(ticker: str) -> str:
+    """Fingerprint ``data_history/{TICKER}_*.json`` so cache invalidates on new snapshots."""
+    root = Path(__file__).resolve().parent / "data_history"
+    safe = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in str(ticker or "").strip().upper()) or "_"
+    parts: list[str] = []
+    try:
+        paths = sorted(p for p in root.glob(f"{safe}_*.json") if p.is_file())
+    except OSError:
+        paths = []
+    for path in paths:
+        try:
+            stat = path.stat()
+            parts.append(f"{path.name}:{stat.st_mtime_ns}:{stat.st_size}")
+        except OSError:
+            parts.append(path.name)
+    return hashlib.sha1("\n".join(parts).encode("utf-8")).hexdigest()
+
+
 @st.cache_data(show_spinner=False)
-def _cached_timelapse_frames(ticker: str) -> list[dict[str, Any]]:
+def _cached_timelapse_frames(ticker: str, history_token: str) -> list[dict[str, Any]]:
     """Cached Market Timelapse frames (delta_surface grids + labels)."""
+    _ = history_token
     return load_all_snapshots(str(ticker or "").strip().upper())
+
+
+def _timelapse_surface_as_lists(
+    z_data: Any,
+    x: Any,
+    y: Any,
+    *,
+    z_min: float,
+    z_max: float,
+) -> go.Surface:
+    """Build a Surface whose x/y/z are JSON lists (not numpy ``bdata``).
+
+    Plotly.js animate interpolates binary ``bdata`` frames incorrectly, so every
+    timelapse frame must serialize as nested lists. Construct a fresh Surface;
+    ``update()`` on a numpy-backed trace keeps the binary encoding.
+    """
+    built = _plotly_surface(
+        z_data,
+        x,
+        y,
+        cmin=z_min,
+        cmax=z_max,
+        colorscale="Viridis",
+        colorbar={"title": "Delta"},
+        hovertemplate="Strike=%{x:.2f}<br>DTE=%{y:.1f}<br>Delta=%{z:.4f}<extra></extra>",
+    )
+    z_list = np.array(built.z, dtype=np.float64, copy=True).tolist()
+    payload: dict[str, Any] = {
+        "z": z_list,
+        "cmin": z_min,
+        "cmax": z_max,
+        "colorscale": "Viridis",
+        "colorbar": {"title": "Delta"},
+        "hovertemplate": "Strike=%{x:.2f}<br>DTE=%{y:.1f}<br>Delta=%{z:.4f}<extra></extra>",
+    }
+    if built.x is not None and built.y is not None:
+        payload["x"] = np.array(built.x, dtype=np.float64, copy=True).reshape(-1).tolist()
+        payload["y"] = np.array(built.y, dtype=np.float64, copy=True).reshape(-1).tolist()
+    return go.Surface(**payload)
 
 
 def build_market_timelapse_figure(frames: list[dict[str, Any]]) -> go.Figure:
     """Plotly Surface with ``frames``, Play/Pause, and timestamp-labeled slider.
 
     Z color/axis locked via shared min/max across all frames (no flicker).
+    Frame names are integer indices (colon-free) so Plotly animate/slider match.
     """
     if not frames:
         return go.Figure()
     z_min, z_max = timelapse_shared_z_range(item["z"] for item in frames)
-    first = frames[0]
+
+    def _axis_span(key: str) -> tuple[float, float]:
+        lo, hi = float("inf"), float("-inf")
+        for item in frames:
+            arr = np.asarray(item.get(key), dtype=np.float64).reshape(-1)
+            finite = arr[np.isfinite(arr)]
+            if finite.size == 0:
+                continue
+            lo = min(lo, float(np.min(finite)))
+            hi = max(hi, float(np.max(finite)))
+        if not np.isfinite(lo) or not np.isfinite(hi) or lo == hi:
+            pad = 1.0 if not np.isfinite(lo) else (1.0 if lo == 0.0 else abs(lo) * 0.05)
+            lo = 0.0 if not np.isfinite(lo) else lo - pad
+            hi = 1.0 if not np.isfinite(hi) else hi + pad
+        return lo, hi
+
+    x_lo, x_hi = _axis_span("x")
+    y_lo, y_hi = _axis_span("y")
 
     def _surface(item: dict[str, Any]) -> go.Surface:
         try:
             z_data = reshape_to_surface(item["z"])
             if z_data.ndim != 2 or z_data.size == 0:
                 raise ValueError("invalid surface shape")
-            return _plotly_surface(
-                z_data,
-                item["x"],
-                item["y"],
-                cmin=z_min,
-                cmax=z_max,
-                colorscale="Viridis",
-                colorbar={"title": "Delta"},
-                hovertemplate="Strike=%{x:.2f}<br>DTE=%{y:.1f}<br>Delta=%{z:.4f}<extra></extra>",
-            )
+            return _timelapse_surface_as_lists(z_data, item["x"], item["y"], z_min=z_min, z_max=z_max)
         except Exception:
             st.error("Surface rendering failed: Invalid data shape.")
-            return go.Surface(z=np.array([[np.nan]], dtype=np.float64))
+            return go.Surface(z=[[None]])
 
-    fig = go.Figure(data=[_surface(first)])
+    frame_names = [str(i) for i in range(len(frames))]
+    fig = go.Figure(data=[_surface(frames[0])])
     fig.frames = [
         go.Frame(
             data=[_surface(item)],
-            name=str(item.get("frame_name") or item["label"]),
+            name=name,
+            traces=[0],
+            layout={"sliders": [{"active": idx}]},
         )
-        for item in frames
+        for idx, (name, item) in enumerate(zip(frame_names, frames))
     ]
+    animate_step = {
+        "frame": {"duration": 0, "redraw": True},
+        "mode": "immediate",
+        "transition": {"duration": 0},
+    }
     slider_steps = [
         {
-            "args": [
-                [str(item.get("frame_name") or item["label"])],
-                {
-                    "frame": {"duration": 0, "redraw": True},
-                    "mode": "immediate",
-                    "transition": {"duration": 0},
-                },
-            ],
+            "args": [[name], animate_step],
             "label": str(item["label"]),
             "method": "animate",
         }
-        for item in frames
+        for name, item in zip(frame_names, frames)
     ]
     fig.update_layout(
         template="plotly_dark",
@@ -5125,12 +5195,14 @@ def build_market_timelapse_figure(frames: list[dict[str, Any]]) -> go.Figure:
             "xaxis_title": "Strike",
             "yaxis_title": "Days to Expiry",
             "zaxis_title": "Delta",
+            "xaxis": {"range": [x_lo, x_hi]},
+            "yaxis": {"range": [y_lo, y_hi]},
             "zaxis": {"range": [z_min, z_max]},
             "bgcolor": PANEL_BG,
             "dragmode": "orbit",
         },
         margin={"l": 8, "r": 8, "t": 48, "b": 8},
-        uirevision="market-timelapse",
+        uirevision="market-timelapse-camera",
         updatemenus=[
             {
                 "type": "buttons",
@@ -5145,11 +5217,12 @@ def build_market_timelapse_figure(frames: list[dict[str, Any]]) -> go.Figure:
                         "label": "Play",
                         "method": "animate",
                         "args": [
-                            None,
+                            frame_names,
                             {
                                 "frame": {"duration": 400, "redraw": True},
                                 "fromcurrent": True,
-                                "transition": {"duration": 200, "easing": "linear"},
+                                "mode": "immediate",
+                                "transition": {"duration": 0},
                             },
                         ],
                     },
@@ -5159,7 +5232,7 @@ def build_market_timelapse_figure(frames: list[dict[str, Any]]) -> go.Figure:
                         "args": [
                             [None],
                             {
-                                "frame": {"duration": 0, "redraw": False},
+                                "frame": {"duration": 0, "redraw": True},
                                 "mode": "immediate",
                                 "transition": {"duration": 0},
                             },
@@ -5194,10 +5267,12 @@ def add_market_timelapse_tab(tab: Any, ticker: str) -> None:
     with tab:
         st.caption(
             f"Historical morph of `{TIMELAPSE_SURFACE_KEY}` from `data_history/` "
-            "(shared Z min/max across frames)."
+            "(shared Strike × DTE mesh so delta morphs in place; color/Z locked)."
         )
+        symbol = str(ticker or "").strip().upper()
+        history_token = _timelapse_history_token(symbol)
         try:
-            frames = _cached_timelapse_frames(str(ticker or "").strip().upper())
+            frames = _cached_timelapse_frames(symbol, history_token)
         except Exception:
             st.error("Could not load Market Timelapse snapshots.")
             return
@@ -5205,12 +5280,16 @@ def add_market_timelapse_tab(tab: Any, ticker: str) -> None:
             st.info("No historical delta surfaces found for this ticker in data_history/.")
             return
         z_min, z_max = timelapse_shared_z_range(item["z"] for item in frames)
+        x0 = np.asarray(frames[0]["x"], dtype=np.float64).reshape(-1)
+        y0 = np.asarray(frames[0]["y"], dtype=np.float64).reshape(-1)
         st.write(
             {
                 "frames": len(frames),
                 "surface_key": TIMELAPSE_SURFACE_KEY,
                 "z_min": z_min,
                 "z_max": z_max,
+                "shared_strike": [float(np.nanmin(x0)), float(np.nanmax(x0))],
+                "shared_dte": [float(np.nanmin(y0)), float(np.nanmax(y0))],
                 "labels": [item["label"] for item in frames],
             }
         )
@@ -5222,7 +5301,7 @@ def add_market_timelapse_tab(tab: Any, ticker: str) -> None:
                 height=600,
                 theme=None,
                 config={"displayModeBar": True, "scrollZoom": True},
-                key="market-timelapse",
+                key=f"market-timelapse-{history_token[:16]}",
             )
         except Exception:
             st.error("Could not render the Market Timelapse animation.")
