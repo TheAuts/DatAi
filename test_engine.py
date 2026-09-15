@@ -1208,27 +1208,24 @@ def test_generate_integrated_risk_surface_nonempty() -> None:
     z = np.asarray(surface.z, dtype=float)
     assert z.ndim == 2 and z.size > 0
     assert np.any(np.isfinite(z))
-    assert surface.surfacecolor is not None
-    sc = np.asarray(surface.surfacecolor, dtype=float)
-    assert sc.shape == z.shape
+    assert float(np.nanmax(z) - np.nanmin(z)) > 1e-6
+    assert surface.surfacecolor is None
+    assert surface.opacityscale is None
     assert surface.name == "Total Risk Profile"
 
     flat_vol = generate_integrated_risk_surface(frame, include_vol=False)
     z_flat = np.asarray(flat_vol.z, dtype=float)
     finite = z_flat[np.isfinite(z_flat)]
     assert finite.size > 0
-    assert np.allclose(finite, 0.5, atol=1e-9)
+    assert float(np.max(finite) - np.min(finite)) > 1e-6
 
     no_gamma = generate_integrated_risk_surface(frame, include_gamma=False)
-    sc_ng = np.asarray(no_gamma.surfacecolor, dtype=float)
-    # Neutral mid-GEX with varying delta still packs; color span shrinks vs full gamma.
-    full_sc = np.asarray(surface.surfacecolor, dtype=float)
-    assert np.nanstd(sc_ng) <= np.nanstd(full_sc) + 1e-12
+    z_ng = np.asarray(no_gamma.z, dtype=float)
+    assert float(np.nanmax(z_ng) - np.nanmin(z_ng)) > 1e-6
 
     no_delta = generate_integrated_risk_surface(frame, include_delta=False)
-    assert list(no_delta.opacityscale) == [[0.0, 1.0], [1.0, 1.0]] or list(
-        map(list, no_delta.opacityscale)
-    ) == [[0.0, 1.0], [1.0, 1.0]]
+    z_nd = np.asarray(no_delta.z, dtype=float)
+    assert float(np.nanmax(z_nd) - np.nanmin(z_nd)) > 1e-6
 
     empty = generate_integrated_risk_surface(pd.DataFrame())
     assert isinstance(empty, go.Surface)
@@ -1239,10 +1236,7 @@ def test_generate_integrated_risk_surface_nonempty() -> None:
     z_const = np.asarray(flat.z, dtype=float)
     finite_c = z_const[np.isfinite(z_const)]
     assert finite_c.size > 0
-    assert np.allclose(finite_c, 0.5, atol=1e-9)
-    cs = list(flat.colorscale)
-    assert len(cs) <= 16
-    assert all("rgba(" not in str(stop[1]).lower() for stop in cs)
+    assert float(np.max(finite_c) - np.min(finite_c)) > 1e-6
 
     from dashboard import build_integrated_risk_figure
 
@@ -1250,8 +1244,9 @@ def test_generate_integrated_risk_surface_nonempty() -> None:
     assert fig is not None
     z_fig = np.asarray(fig.data[0].z, dtype=float)
     assert np.any(np.isfinite(z_fig))
-    z_range = fig.layout.scene.zaxis.range
-    assert list(z_range) == [0, 1]
+    assert float(np.nanmax(z_fig) - np.nanmin(z_fig)) > 1e-6
+    z_range = list(fig.layout.scene.zaxis.range)
+    assert z_range[1] > z_range[0]
 
 
 def test_compute_total_risk_score_weights_and_alert_band() -> None:

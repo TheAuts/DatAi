@@ -368,6 +368,14 @@ def compute_total_risk_score(
     return float(np.clip(score / weight_sum, 0.0, 1.0))
 
 
+def _finite_span(values: np.ndarray) -> float:
+    finite = np.asarray(values, dtype=np.float64)
+    finite = finite[np.isfinite(finite)]
+    if finite.size == 0:
+        return 0.0
+    return float(np.max(finite) - np.min(finite))
+
+
 def generate_integrated_risk_surface(
     df: pd.DataFrame,
     *,
@@ -377,19 +385,17 @@ def generate_integrated_risk_surface(
 ) -> Any:
     """Build a single Plotly ``go.Surface`` for the Total Risk Profile.
 
-    Layering (Price/Strike × DaysToExpiry grid from ``df``):
-    - ``z``: Volatility (IV) min-max normalized to ``[0, 1]``
-    - ``surfacecolor``: GEX / Gamma normalized, packed with Delta for opacity
-    - Alpha: normalized ``|Delta|`` drives per-vertex transparency (ghost effect)
-      via an rgba colorscale (Plotly Surface has no independent opacity channel)
+    ``z`` is the mean of enabled, min-max normalized layers (Vol, Gamma/GEX,
+    |Delta|) on the Price × DaysToExpiry grid. Color is Viridis on ``z``.
 
-    Overlay flags (additive; default all on):
-    - ``include_gamma=False`` → flat/neutral surfacecolor (mid GEX)
-    - ``include_delta=False`` → full opacity (Delta layer off)
-    - ``include_vol=False`` → Z flattened (hide vol contribution)
+    Plotly 3D + Streamlit cannot reliably draw ``surfacecolor`` / ``opacityscale``
+    / rgba colorscales, so this trace is a plain Surface like the Gamma chart.
 
-    Always ``.copy()``s the input frame and copies arrays before mutation.
-    Returns an empty ``go.Surface`` when required columns or finite data are missing.
+    Overlay flags drop a layer from ``z``. If every enabled layer is constant
+    (typical live IV), fall back to Gamma then |Delta| so the mesh has relief.
+
+    Always ``.copy()``s the input frame. Returns an empty ``go.Surface`` when
+    required columns or finite data are missing.
     """
     import plotly.graph_objects as go
 
@@ -432,68 +438,40 @@ def generate_integrated_risk_surface(
 
     vol_n = minmax_normalize_01(z_vol)
     gamma_n = minmax_normalize_01(z_gamma)
-    # |Delta| so puts and calls both drive opacity toward high-risk extremes.
     delta_abs = np.abs(np.array(z_delta, dtype=np.float64, copy=True))
     delta_n = minmax_normalize_01(delta_abs)
-    vol_finite = np.isfinite(vol_n)
-    finite_vol = vol_n[vol_finite]
-    # Constant IV min-maxes to 0; Plotly then autoscales z to a zero-height box
-    # and the mesh disappears. Park a constant plane at mid-axis instead.
-    if finite_vol.size and float(np.max(finite_vol) - np.min(finite_vol)) <= 1e-15:
-        vol_n = np.full_like(vol_n, 0.5, dtype=np.float64)
-        vol_n[~vol_finite] = np.nan
-    if not include_vol:
-        # Hide vol contribution: flat Z plane at mid height.
-        vol_n = np.full_like(vol_n, 0.5, dtype=np.float64)
-        vol_n[~vol_finite] = np.nan
-    if not include_gamma:
-        # Neutral / flat GEX color (mid viridis).
-        gamma_n = np.full_like(gamma_n, 0.5, dtype=np.float64)
-    if not include_delta:
-        # Full opacity when Delta layer is off.
-        delta_n = np.ones_like(delta_n, dtype=np.float64)
-    if not np.any(np.isfinite(vol_n)):
+
+    layers: list[np.ndarray] = []
+    if include_vol:
+        layers.append(vol_n)
+    if include_gamma:
+        layers.append(gamma_n)
+    if include_delta:
+        layers.append(delta_n)
+    if not layers:
+        layers.append(gamma_n)
+    stacked = np.nanmean(np.stack(layers, axis=0), axis=0)
+    if _finite_span(stacked) <= 1e-9:
+        for fallback in (gamma_n, delta_n, vol_n):
+            if _finite_span(fallback) > 1e-9:
+                stacked = fallback
+                break
+    if not np.any(np.isfinite(stacked)):
         return empty
 
-    n_gamma, n_delta = 48, 24
-    encoded = _encode_gex_delta_color(gamma_n, delta_n, n_gamma=n_gamma, n_delta=n_delta)
-    colorscale = _viridis_rgb_colorscale()
-    # Opacity floor stays visible on a dark theme. Plotly maps opacityscale to
-    # surfacecolor, so do not start at ~0.08 or the mesh ghosts out.
-    if include_delta:
-        opacityscale: list[list[Any]] = [[0.0, 0.45], [0.5, 0.75], [1.0, 1.0]]
-    else:
-        opacityscale = [[0.0, 1.0], [1.0, 1.0]]
-
-    z_surface = reshape_to_surface(vol_n)
+    z_surface = reshape_to_surface(stacked)
     z2d, x_ok, y_ok, _warning = prepare_plotly_surface_xyz(z_surface, x_axis, y_axis)
-    color_title = "GEX (Δ-opacity)"
-    if not include_gamma and not include_delta:
-        color_title = "Neutral"
-    elif not include_gamma:
-        color_title = "Δ-opacity"
-    elif not include_delta:
-        color_title = "GEX"
-    # surfacecolor must match z after reshape / axis gate.
-    color_grid = reshape_to_surface(encoded)
-    if color_grid.shape != z2d.shape:
-        color_grid = np.array(encoded, dtype=np.float64, copy=True)
-        if color_grid.shape != z2d.shape and color_grid.size == z2d.size:
-            color_grid = color_grid.reshape(z2d.shape)
+    if z2d.size == 0 or not np.any(np.isfinite(z2d)):
+        return empty
     payload: dict[str, Any] = {
         "z": np.array(z2d, dtype=np.float64, copy=True),
-        "surfacecolor": np.array(color_grid, dtype=np.float64, copy=True),
-        "cmin": 0.0,
-        "cmax": 1.0,
-        "colorscale": colorscale,
-        "opacityscale": opacityscale,
+        "colorscale": "Viridis",
+        "opacity": 1.0,
         "showscale": True,
-        "colorbar": {"title": color_title},
+        "colorbar": {"title": "Total Risk"},
         "name": "Total Risk Profile",
         "hovertemplate": (
-            "X=%{x:.2f}<br>Y=%{y:.2f}<br>"
-            "Vol (norm)=%{z:.3f}<br>"
-            "GEX×Δ=%{surfacecolor:.3f}<extra>Total Risk Profile</extra>"
+            "X=%{x:.2f}<br>Y=%{y:.2f}<br>Risk=%{z:.3f}<extra>Total Risk Profile</extra>"
         ),
     }
     if x_ok is not None and y_ok is not None:

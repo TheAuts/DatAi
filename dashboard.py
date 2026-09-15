@@ -1937,47 +1937,32 @@ def build_integrated_risk_figure(surface: go.Surface) -> go.Figure | None:
         return None
     x_raw = getattr(surface, "x", None)
     y_raw = getattr(surface, "y", None)
-    z2d, x_ok, y_ok, _warning = prepare_plotly_surface_xyz(z_data, x_raw, y_raw)
+    z2d, x_ok, y_ok, warning = prepare_plotly_surface_xyz(z_data, x_raw, y_raw)
     if z2d.ndim != 2 or z2d.size == 0 or not np.any(np.isfinite(z2d)):
         return None
-    sc_raw = getattr(surface, "surfacecolor", None)
-    color_grid = None
-    if sc_raw is not None:
-        color_grid = reshape_to_surface(sc_raw)
-        if color_grid.shape != z2d.shape:
-            color_grid = np.array(sc_raw, dtype=np.float64, copy=True)
-            if color_grid.size == z2d.size:
-                color_grid = color_grid.reshape(z2d.shape)
-            else:
-                color_grid = None
-    colorscale = getattr(surface, "colorscale", None) or "Viridis"
-    opacityscale = getattr(surface, "opacityscale", None)
-    colorbar = getattr(surface, "colorbar", None)
-    payload: dict[str, Any] = {
-        "z": np.array(z2d, dtype=np.float64, copy=True),
-        "colorscale": colorscale,
-        "cmin": 0.0,
-        "cmax": 1.0,
-        "showscale": True,
-        "name": "Total Risk Profile",
-        "hovertemplate": (
-            "X=%{x:.2f}<br>Y=%{y:.2f}<br>"
-            "Vol (norm)=%{z:.3f}<br>"
-            "GEX×Δ=%{surfacecolor:.3f}<extra>Total Risk Profile</extra>"
-        ),
-        "lighting": {"ambient": 0.72, "diffuse": 0.8, "specular": 0.1},
-        "lightposition": {"x": 80, "y": 80, "z": 100},
-    }
-    if color_grid is not None and color_grid.shape == z2d.shape:
-        payload["surfacecolor"] = np.array(color_grid, dtype=np.float64, copy=True)
-    if opacityscale is not None:
-        payload["opacityscale"] = opacityscale
-    if colorbar is not None:
-        payload["colorbar"] = colorbar
-    if x_ok is not None and y_ok is not None:
-        payload["x"] = np.array(x_ok, dtype=np.float64, copy=True)
-        payload["y"] = np.array(y_ok, dtype=np.float64, copy=True)
-    fig = go.Figure(data=[go.Surface(**payload)])
+    if warning:
+        st.warning(warning)
+    finite = z2d[np.isfinite(z2d)]
+    z_lo = float(np.min(finite))
+    z_hi = float(np.max(finite))
+    if z_hi - z_lo < 1e-6:
+        z_lo, z_hi = z_lo - 0.5, z_hi + 0.5
+    else:
+        pad = 0.08 * (z_hi - z_lo)
+        z_lo, z_hi = z_lo - pad, z_hi + pad
+    fig = go.Figure(
+        data=[
+            _plotly_surface(
+                z2d,
+                x_ok,
+                y_ok,
+                colorscale="Viridis",
+                colorbar={"title": "Total Risk"},
+                opacity=1.0,
+                hovertemplate="Price=%{x:.2f}<br>DTE=%{y:.1f}<br>Risk=%{z:.3f}<extra></extra>",
+            )
+        ]
+    )
     fig.update_layout(
         template="plotly_dark",
         paper_bgcolor=DARK_BG,
@@ -1987,13 +1972,13 @@ def build_integrated_risk_figure(surface: go.Surface) -> go.Figure | None:
         scene={
             "xaxis": {"title": "Price"},
             "yaxis": {"title": "Days to Expiry"},
-            "zaxis": {"title": "Volatility (norm)", "range": [0, 1]},
+            "zaxis": {"title": "Risk (norm)", "range": [z_lo, z_hi]},
             "bgcolor": PANEL_BG,
             "dragmode": "orbit",
-            "aspectmode": "cube",
+            "camera": {"eye": {"x": 1.6, "y": 1.6, "z": 1.15}},
         },
         margin={"l": 8, "r": 8, "t": 48, "b": 8},
-        uirevision="integrated-risk-surface",
+        uirevision="integrated-risk-surface-v2",
     )
     return fig
 
@@ -2006,14 +1991,14 @@ def render_integrated_risk_surface(surface: go.Surface) -> None:
             st.info("No integrated risk surface data to plot.")
             return
         st.caption(
-            "Z = normalized Volatility · color = GEX (normalized Gamma) · "
-            "opacity = normalized |Delta| (ghost at low delta)."
+            "Z and color = mean of enabled layers (Volatility, Gamma/GEX, |Delta|), "
+            "Viridis. Constant IV falls back to Gamma so the mesh has relief."
         )
         st.plotly_chart(
             fig,
             width="stretch",
             config={"displayModeBar": True, "scrollZoom": True},
-            key="integrated-risk-surface-chart",
+            key="integrated-risk-surface-v2",
         )
     except Exception:
         st.error("Surface rendering failed: Invalid data shape.")
@@ -5456,7 +5441,7 @@ def main() -> None:
         with integrated_tab:
             st.caption(
                 "Unified risk surface (replaces standalone 3D Gamma / Vol Surface tabs). "
-                "Z = Vol · color = GEX · opacity = |Delta|."
+                "Z = mean of enabled Volatility / Gamma / |Delta| layers."
             )
             layer_cols = st.columns(3)
             with layer_cols[0]:
