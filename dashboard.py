@@ -18,6 +18,7 @@ from data_ingestion import (
     chain_expiry_mismatch_reason,
     get_available_expirations,
 )
+from chart_views import render_charts_section
 from quant_engine import (
     DAYS_PER_YEAR,
     DEFAULT_HESTON_KAPPA,
@@ -323,6 +324,10 @@ def _init_state() -> None:
         "advanced_view_3d": False,
         "advanced_surface_greek": "Charm",
         "main_view": "Greeks",
+        "app_section": "Greeks",
+        "chart_interval": "D",
+        "chart_lookback": 180,
+        "chart_source": "TradingView",
         "sim_fingerprint": None,
         "iv_fingerprint": None,
         "persisted_iv": None,
@@ -432,10 +437,30 @@ def _apply_theme() -> None:
             letter-spacing: 0.04em;
         }}
         div[data-testid="stVerticalBlock"] > div {{ gap: 0.6rem; }}
+        div[data-testid="stSegmentedControl"] {{
+            margin: 0.15rem 0 0.85rem 0;
+        }}
         </style>
         """,
         unsafe_allow_html=True,
     )
+
+
+def _render_section_switcher() -> str:
+    """Top-of-page Greeks | Charts section control."""
+    selected = st.segmented_control(
+        "Section",
+        options=("Greeks", "Charts"),
+        key="app_section",
+        help=(
+            "Greeks: Integrated Risk View, Market Timelapse, and all option-risk tabs. "
+            "Charts: underlying candlestick and 3D volume view."
+        ),
+    )
+    current = str(selected or st.session_state.get("app_section") or "Greeks")
+    if current not in {"Greeks", "Charts"}:
+        return "Greeks"
+    return current
 
 
 def _heston_from_state() -> tuple[float, float, float, float, float]:
@@ -5357,6 +5382,11 @@ def main() -> None:
             st.error(alert)
         else:
             st.warning(alert)
+
+    section = _render_section_switcher()
+    if section == "Charts":
+        render_charts_section(ticker)
+        return
 
     st.title("Contract Greeks")
     st.caption("Price-domain Delta, Gamma, Theta, Vega, and Rho from `generate_greek_curve`.")

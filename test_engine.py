@@ -2956,3 +2956,135 @@ def test_build_anomaly_ghost_column_meshes_encloses_node() -> None:
     assert max(mesh["z"]) == pytest.approx(1.0)
     assert len(mesh["i"]) == 12
     assert len(mesh["x"]) == 8
+
+
+def _sample_ohlcv_frame() -> pd.DataFrame:
+    return pd.DataFrame(
+        {
+            "Date": pd.to_datetime(
+                ["2026-01-02", "2026-01-05", "2026-01-06", "2026-01-07"], utc=True
+            ),
+            "Open": [100.0, 102.0, 101.0, 103.0],
+            "High": [103.0, 104.0, 102.0, 105.0],
+            "Low": [99.0, 101.0, 99.5, 102.5],
+            "Close": [102.0, 101.5, 103.0, 104.0],
+            "Volume": [1_000_000.0, 1_500_000.0, 800_000.0, 2_000_000.0],
+        }
+    )
+
+
+def test_normalize_ohlcv_frame_aliases_and_high_low_bounds() -> None:
+    import data_ingestion as ingest
+
+    raw = pd.DataFrame(
+        {
+            "t": [1_704_153_600, 1_704_240_000],
+            "o": [10.0, 12.0],
+            "h": [9.0, 13.0],  # first high below open/close — must be lifted
+            "l": [11.0, 11.5],  # first low above open — must be dropped to min
+            "c": [11.0, 12.5],
+            "v": [100, None],
+        }
+    )
+    out = ingest.normalize_ohlcv_frame(raw)
+    assert list(out.columns) == list(ingest.OHLCV_COLUMNS)
+    assert len(out) == 2
+    assert float(out.iloc[0]["High"]) == pytest.approx(11.0)
+    assert float(out.iloc[0]["Low"]) == pytest.approx(9.0)
+    assert float(out.iloc[1]["Volume"]) == pytest.approx(0.0)
+    empty = ingest.normalize_ohlcv_frame(pd.DataFrame({"Open": [-1.0], "Close": [0.0]}))
+    assert empty.empty
+    assert list(empty.columns) == list(ingest.OHLCV_COLUMNS)
+
+
+def test_fetch_ohlcv_uses_candles_path_and_degrades_empty(monkeypatch) -> None:
+    import data_ingestion as ingest
+
+    captured: dict[str, Any] = {}
+
+    def _ok(path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+        captured["path"] = path
+        captured["params"] = dict(params or {})
+        return {
+            "s": "ok",
+            "o": [100.0, 101.0],
+            "h": [102.0, 103.0],
+            "l": [99.0, 100.0],
+            "c": [101.0, 102.0],
+            "v": [10.0, 20.0],
+            "t": [1_704_153_600, 1_704_240_000],
+        }
+
+    monkeypatch.setattr(ingest, "_marketdata_get", _ok)
+    frame = ingest.fetch_ohlcv("spy", resolution="daily", countback=90)
+    assert not frame.empty
+    assert captured["path"] == "/stocks/candles/D/SPY/"
+    assert captured["params"]["countback"] == 90
+    assert list(frame.columns) == list(ingest.OHLCV_COLUMNS)
+    assert float(frame["Volume"].iloc[-1]) == pytest.approx(20.0)
+
+    monkeypatch.setattr(ingest, "_marketdata_get", lambda *_a, **_k: {"s": "no_data"})
+    empty = ingest.fetch_ohlcv("SPY")
+    assert empty.empty
+
+    monkeypatch.setattr(ingest, "_marketdata_get", lambda *_a, **_k: None)
+    missing = ingest.fetch_ohlcv("SPY")
+    assert missing.empty
+
+
+def test_candlestick_and_3d_volume_figures_use_ohlcv() -> None:
+    from chart_views import build_candlestick_figure, build_volume_3d_candlestick_figure
+
+    frame = _sample_ohlcv_frame()
+    fig2d = build_candlestick_figure(frame, ticker="SPY")
+    assert fig2d is not None
+    types_2d = {getattr(tr, "type", None) for tr in fig2d.data}
+    assert "candlestick" in types_2d
+    assert "bar" in types_2d
+    vol = next(tr for tr in fig2d.data if getattr(tr, "type", None) == "bar")
+    assert list(vol.y) == list(frame["Volume"].to_numpy())
+
+    fig3d = build_volume_3d_candlestick_figure(frame, ticker="SPY")
+    assert fig3d is not None
+    types_3d = {getattr(tr, "type", None) for tr in fig3d.data}
+    assert "mesh3d" in types_3d
+    assert "scatter3d" in types_3d
+    assert fig3d.layout.scene.zaxis.title.text == "Volume"
+    hover = next(
+        tr
+        for tr in fig3d.data
+        if getattr(tr, "type", None) == "scatter3d" and getattr(tr, "name", "") == "OHLCV"
+    )
+    assert np.allclose(np.asarray(hover.z, dtype=float), frame["Volume"].to_numpy())
+    assert build_candlestick_figure(pd.DataFrame()) is None
+    assert build_volume_3d_candlestick_figure(pd.DataFrame()) is None
+
+
+def test_dashboard_keeps_greeks_tabs_and_adds_section_switcher() -> None:
+    root = Path(__file__).resolve().parent
+    dash = (root / "dashboard.py").read_text(encoding="utf-8")
+    assert "_render_section_switcher" in dash
+    assert 'options=("Greeks", "Charts")' in dash
+    assert "render_charts_section" in dash
+    for label in (
+        "Greeks",
+        "Advanced Metrics",
+        "Time-Sensitivity",
+        "Time Machine",
+        "Pro Metrics",
+        "Market Analyst",
+        "Portfolio & Risk",
+        "Integrated Risk View",
+        "Test Dashboard",
+        "Market Timelapse",
+        "Risk Terminal",
+        "Event Impact Lab",
+        "Regime Lab",
+        "Liquidation Waterfall",
+        "Sentiment Lab",
+        "Microstructure Lab",
+    ):
+        assert f'"{label}"' in dash
+    views = (root / "chart_views.py").read_text(encoding="utf-8")
+    assert "tradingview_widget_html" in views
+    assert 'zaxis' in views and "Volume" in views
