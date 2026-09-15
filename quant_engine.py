@@ -16,7 +16,7 @@ from typing import Any, Callable, Iterable, Mapping
 import numpy as np
 import pandas as pd
 from scipy.interpolate import griddata
-from scipy.ndimage import gaussian_filter
+from scipy.ndimage import gaussian_filter, maximum_filter
 from scipy.stats import norm
 
 T_MIN = 1e-4
@@ -7712,4 +7712,497 @@ def calculate_microstructure_lab(
         "liquidity_trap": trap,
         "high_adverse_selection": bool(vpin_out.get("high_adverse_selection")),
         "toxicity_alert": bool(vpin_out.get("toxicity_alert")),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Surface anomaly diagnostic (gradient × open interest)
+# ---------------------------------------------------------------------------
+ANOMALY_GRADIENT_MAD_K = 2.0
+ANOMALY_FIT_MAD_K = 2.0
+ANOMALY_LABEL_GAMMA_WALL = "Gamma Wall"
+ANOMALY_LABEL_REGIME_MISMATCH = "Model Regime Mismatch"
+ANOMALY_FIT_HIGH = "High"
+ANOMALY_FIT_LOW = "Low"
+ANOMALY_GHOST_HALF_SPAN = 0.35
+ANOMALY_MAD_TO_SIGMA = 1.4826
+
+
+def _anomaly_empty_result(ticker: str) -> dict[str, Any]:
+    return {
+        "ticker": str(ticker or "").strip().upper(),
+        "ok": False,
+        "anomalies": [],
+        "messages": [],
+        "ghost_columns": [],
+        "strike_axis": np.array([], dtype=np.float64),
+        "expiry_axis": np.array([], dtype=np.float64),
+        "gradient": np.zeros((0, 0), dtype=np.float64),
+        "residual": np.zeros((0, 0), dtype=np.float64),
+        "column_dx": 1.0,
+        "column_dy": 1.0,
+        "z_lo": 0.0,
+        "z_hi": 1.0,
+    }
+
+
+def _numeric_range_bounds(values: Any, *, as_expiry: bool = False) -> tuple[float, float] | None:
+    """Inclusive ``(lo, hi)`` from a scalar, ``(min, max)`` pair, or value list."""
+    if values is None:
+        return None
+    if isinstance(values, (str, date, datetime)):
+        seq: list[Any] = [values]
+    elif isinstance(values, (list, tuple, np.ndarray, pd.Series)):
+        seq = list(values)
+    else:
+        seq = [values]
+    collected: list[float] = []
+    for item in seq:
+        if isinstance(item, (date, datetime)):
+            years = _time_to_expiry_years(item)
+            if np.isfinite(years):
+                collected.append(float(years * DAYS_PER_YEAR) if as_expiry else float(years))
+            continue
+        if isinstance(item, str):
+            text = item.strip()
+            if not text:
+                continue
+            years = _time_to_expiry_years(text)
+            if as_expiry and np.isfinite(years):
+                collected.append(float(years * DAYS_PER_YEAR))
+                continue
+            try:
+                num = float(text)
+            except (TypeError, ValueError):
+                continue
+            if np.isfinite(num):
+                collected.append(float(num))
+            continue
+        try:
+            num = float(item)
+        except (TypeError, ValueError):
+            continue
+        if np.isfinite(num):
+            collected.append(float(num))
+    if not collected:
+        return None
+    return float(min(collected)), float(max(collected))
+
+
+def _format_anomaly_strike(strike: Any) -> str:
+    try:
+        value = float(strike)
+    except (TypeError, ValueError):
+        return str(strike)
+    if not np.isfinite(value):
+        return str(strike)
+    if abs(value - round(value)) < 1e-9:
+        return str(int(round(value)))
+    return f"{value:.4g}"
+
+
+def _format_anomaly_expiry(expiry: Any) -> str:
+    if expiry is None:
+        return ""
+    if isinstance(expiry, datetime):
+        return expiry.date().isoformat()
+    if isinstance(expiry, date):
+        return expiry.isoformat()
+    if isinstance(expiry, str):
+        text = expiry.strip()
+        if len(text) >= 10 and text[4] == "-" and text[7] == "-":
+            return text[:10]
+        return text
+    try:
+        value = float(expiry)
+    except (TypeError, ValueError):
+        return str(expiry)
+    if not np.isfinite(value):
+        return str(expiry)
+    if abs(value - round(value)) < 1e-9:
+        return str(int(round(value)))
+    return f"{value:.4g}"
+
+
+def _format_anomaly_oi(open_interest: Any) -> str:
+    try:
+        value = float(open_interest)
+    except (TypeError, ValueError):
+        return str(open_interest)
+    if not np.isfinite(value):
+        return "0"
+    if abs(value - round(value)) < 1e-9:
+        return str(int(round(value)))
+    return f"{value:.4g}"
+
+
+def format_anomaly_detected_message(
+    strike: Any,
+    expiry: Any,
+    open_interest: Any,
+    model_fit_error: str,
+) -> str:
+    """Exact UI line: ``Anomaly detected at Strike [X] / Expiry [Y]. ...``."""
+    fit = str(model_fit_error)
+    if fit not in {ANOMALY_FIT_HIGH, ANOMALY_FIT_LOW}:
+        fit = ANOMALY_FIT_HIGH if fit.lower() == "high" else ANOMALY_FIT_LOW
+    return (
+        f"Anomaly detected at Strike {_format_anomaly_strike(strike)} / "
+        f"Expiry {_format_anomaly_expiry(expiry)}. "
+        f"Open Interest: {_format_anomaly_oi(open_interest)}. "
+        f"Model Fit Error: {fit}."
+    )
+
+
+def classify_anomaly_label(*, oi_high: bool, oi_low: bool, fit_high: bool) -> str | None:
+    """High OI → Gamma Wall. Low OI + high fit error → Model Regime Mismatch."""
+    if bool(oi_high):
+        return ANOMALY_LABEL_GAMMA_WALL
+    if bool(oi_low) and bool(fit_high):
+        return ANOMALY_LABEL_REGIME_MISMATCH
+    return None
+
+
+def _robust_high_mask(values: np.ndarray, *, k: float) -> np.ndarray:
+    """True where ``values`` exceed a robust high tail (median + k σ_MAD).
+
+    σ_MAD = 1.4826 · MAD so ``k=2`` ≈ two robust standard deviations.
+    When MAD is degenerate (constant field), only strict ``> median`` flags,
+    plus a tiny floor so float noise on a plane is not an outlier.
+    """
+    arr = np.asarray(values, dtype=np.float64)
+    out = np.zeros(arr.shape, dtype=bool)
+    finite = arr[np.isfinite(arr)]
+    if finite.size == 0:
+        return out
+    med = float(np.median(finite))
+    mad = float(np.median(np.abs(finite - med)))
+    if mad > 1e-18:
+        thr = med + float(k) * float(ANOMALY_MAD_TO_SIGMA) * mad
+        return np.isfinite(arr) & (arr > thr)
+    floor = max(1e-12, abs(med) * 1e-9)
+    return np.isfinite(arr) & (arr > med + floor)
+
+
+def _robust_low_mask(values: np.ndarray, *, k: float) -> np.ndarray:
+    """True where ``values`` fall below a robust low tail (median − k σ_MAD)."""
+    arr = np.asarray(values, dtype=np.float64)
+    out = np.zeros(arr.shape, dtype=bool)
+    finite = arr[np.isfinite(arr)]
+    if finite.size == 0:
+        return out
+    med = float(np.median(finite))
+    mad = float(np.median(np.abs(finite - med)))
+    if mad > 1e-18:
+        thr = med - float(k) * float(ANOMALY_MAD_TO_SIGMA) * mad
+        return np.isfinite(arr) & (arr < thr)
+    floor = max(1e-12, abs(med) * 1e-9)
+    return np.isfinite(arr) & (arr < med - floor)
+
+
+def _axis_spacing(axis: np.ndarray, *, fallback: float) -> float:
+    a = np.asarray(axis, dtype=np.float64).reshape(-1)
+    a = a[np.isfinite(a)]
+    if a.size >= 2:
+        delta = np.diff(np.sort(np.unique(a)))
+        delta = delta[np.isfinite(delta) & (delta > 0)]
+        if delta.size:
+            return float(np.median(delta))
+    fb = float(fallback)
+    return fb if np.isfinite(fb) and fb > 0 else 1.0
+
+
+def surface_gradient_magnitude(z: Any, x: Any, y: Any) -> np.ndarray:
+    """Coordinate-aware surface gradient magnitude ``|∇z|``.
+
+    ``z`` is shaped ``(len(y), len(x))``. Spacing uses the axis coordinates:
+
+    ``∇z ≈ (∂z/∂y, ∂z/∂x)``, ``|∇z| = hypot(∂z/∂x, ∂z/∂y)``.
+
+    Non-finite cells are filled with the finite median before
+    ``np.gradient``, then restored to NaN. Always copies.
+    """
+    z_arr = np.array(z, dtype=np.float64, copy=True)
+    if z_arr.ndim != 2 or z_arr.size == 0:
+        return np.zeros((0, 0), dtype=np.float64)
+    x_arr = np.asarray(x, dtype=np.float64).reshape(-1)
+    y_arr = np.asarray(y, dtype=np.float64).reshape(-1)
+    filled = z_arr.copy()
+    finite = filled[np.isfinite(filled)]
+    fill = float(np.median(finite)) if finite.size else 0.0
+    hole = ~np.isfinite(filled)
+    filled[hole] = fill
+    x_ok = x_arr if x_arr.size == z_arr.shape[1] and np.all(np.isfinite(x_arr)) else None
+    y_ok = y_arr if y_arr.size == z_arr.shape[0] and np.all(np.isfinite(y_arr)) else None
+    with np.errstate(invalid="ignore", divide="ignore"):
+        if y_ok is not None and x_ok is not None and y_ok.size > 1 and x_ok.size > 1:
+            d_dy, d_dx = np.gradient(filled, y_ok, x_ok, edge_order=1)
+        elif x_ok is not None and x_ok.size > 1:
+            d_dx = np.gradient(filled, x_ok, axis=1, edge_order=1)
+            d_dy = np.gradient(filled, axis=0, edge_order=1)
+        elif y_ok is not None and y_ok.size > 1:
+            d_dy = np.gradient(filled, y_ok, axis=0, edge_order=1)
+            d_dx = np.gradient(filled, axis=1, edge_order=1)
+        else:
+            d_dy, d_dx = np.gradient(filled, edge_order=1)
+    mag = np.hypot(d_dx, d_dy).astype(np.float64, copy=False)
+    mag[hole] = np.nan
+    return np.array(mag, dtype=np.float64, copy=True)
+
+
+def surface_model_fit_residual(z: Any, *, sigma: float = 1.0) -> np.ndarray:
+    """Absolute residual vs a Gaussian-smoothed local model: ``|z − G_σ * z|``.
+
+    The smooth interpolant is the implied locally-uniform surface. Large
+    residuals are model-fit error. Holes filled with the finite median
+    before filtering; original non-finite cells stay NaN. Always copies.
+    """
+    z_arr = np.array(z, dtype=np.float64, copy=True)
+    if z_arr.ndim != 2 or z_arr.size == 0:
+        return np.zeros((0, 0), dtype=np.float64)
+    filled = z_arr.copy()
+    finite = filled[np.isfinite(filled)]
+    fill = float(np.median(finite)) if finite.size else 0.0
+    hole = ~np.isfinite(filled)
+    filled[hole] = fill
+    sig = float(sigma) if np.isfinite(sigma) and sigma > 0 else 1.0
+    smooth = np.asarray(gaussian_filter(filled, sigma=sig), dtype=np.float64)
+    with np.errstate(invalid="ignore"):
+        residual = np.abs(filled - smooth)
+    residual[hole] = np.nan
+    return np.array(residual, dtype=np.float64, copy=True)
+
+
+def _ghost_column_box(
+    strike: float,
+    dte: float,
+    *,
+    dx: float,
+    dy: float,
+    z_lo: float,
+    z_hi: float,
+) -> dict[str, Any]:
+    """Axis-aligned prism vertices/faces for one Ghost Column (8 verts, 12 tris)."""
+    hx = max(float(dx), 1e-9) * 0.5
+    hy = max(float(dy), 1e-9) * 0.5
+    x0, x1 = float(strike) - hx, float(strike) + hx
+    y0, y1 = float(dte) - hy, float(dte) + hy
+    z0, z1 = float(z_lo), float(z_hi)
+    x = [x0, x1, x1, x0, x0, x1, x1, x0]
+    y = [y0, y0, y1, y1, y0, y0, y1, y1]
+    z = [z0, z0, z0, z0, z1, z1, z1, z1]
+    i = [0, 0, 4, 4, 0, 0, 1, 1, 2, 2, 3, 3]
+    j = [1, 2, 6, 7, 4, 5, 5, 6, 6, 7, 7, 4]
+    k = [2, 3, 5, 6, 5, 1, 6, 2, 7, 3, 4, 0]
+    return {
+        "x": [float(v) for v in x],
+        "y": [float(v) for v in y],
+        "z": [float(v) for v in z],
+        "i": list(i),
+        "j": list(j),
+        "k": list(k),
+    }
+
+
+def build_anomaly_ghost_column_meshes(
+    anomalies: Any,
+    *,
+    dx: float,
+    dy: float,
+    z_lo: float,
+    z_hi: float,
+) -> list[dict[str, Any]]:
+    """Semi-transparent Ghost Column prisms at each anomaly ``(strike, dte)``."""
+    out: list[dict[str, Any]] = []
+    if not anomalies:
+        return out
+    lo = float(z_lo) if np.isfinite(z_lo) else 0.0
+    hi = float(z_hi) if np.isfinite(z_hi) else 1.0
+    if hi <= lo:
+        hi = lo + 1.0
+    for item in anomalies:
+        if not isinstance(item, Mapping):
+            continue
+        try:
+            strike = float(item.get("strike"))
+            dte = float(item.get("expiry_dte"))
+        except (TypeError, ValueError):
+            continue
+        if not np.isfinite(strike) or not np.isfinite(dte):
+            continue
+        mesh = _ghost_column_box(strike, dte, dx=dx, dy=dy, z_lo=lo, z_hi=hi)
+        mesh["strike"] = strike
+        mesh["expiry_dte"] = dte
+        mesh["label"] = item.get("label")
+        mesh["message"] = item.get("message")
+        out.append(mesh)
+    return out
+
+
+def diagnose_surface_anomaly(
+    ticker: str,
+    strike_range: Any,
+    expiry_range: Any,
+    *,
+    repo: DataRepository | None = None,
+    frame: pd.DataFrame | None = None,
+) -> dict[str, Any]:
+    """Locate non-uniform surface nodes and cross-reference latest open interest.
+
+    Builds a Strike × Expiry IV grid from the latest DataRepository fetch
+    (or ``frame``), restricted to ``strike_range`` / ``expiry_range``.
+    Non-uniform cells are robust outliers of ``|∇IV|`` or of the Gaussian
+    residual ``|IV − G_σ * IV|``, peak-picked on a 3×3 neighborhood.
+    Model-fit error is High/Low vs the residual tail. High OI labels
+    ``Gamma Wall``; low OI + high fit error labels ``Model Regime Mismatch``.
+
+    Always ``.copy()``s an injected frame. Returns anomaly records, exact UI
+    messages, and Ghost Column meshes.
+    """
+    symbol = str(ticker or "").strip().upper()
+    empty = _anomaly_empty_result(symbol)
+    if frame is None:
+        chain, _spot = _snapshot_chain_frame(symbol, repo=repo)
+        working = chain.copy() if isinstance(chain, pd.DataFrame) else pd.DataFrame()
+    else:
+        working = frame.copy() if isinstance(frame, pd.DataFrame) else pd.DataFrame()
+    if working is None or not isinstance(working, pd.DataFrame) or working.empty:
+        return empty
+
+    strike_col = _sentiment_column(working, "Strike", "K", "strike", "Price")
+    iv_col = _sentiment_column(working, "impliedVolatility", "IV", "sigma", "iv")
+    if strike_col is None or iv_col is None:
+        return empty
+    strikes = np.array(pd.to_numeric(strike_col, errors="coerce").to_numpy(dtype=np.float64), dtype=np.float64, copy=True)
+    ivs = np.array(pd.to_numeric(iv_col, errors="coerce").to_numpy(dtype=np.float64), dtype=np.float64, copy=True)
+    dtes = np.array(_sentiment_tenor_days(working), dtype=np.float64, copy=True)
+    oi_col = _sentiment_column(working, "openInterest", "open_interest", "OI", "oi")
+    if oi_col is None:
+        oi = np.zeros(len(working.index), dtype=np.float64)
+    else:
+        oi = np.array(pd.to_numeric(oi_col, errors="coerce").to_numpy(dtype=np.float64), dtype=np.float64, copy=True)
+        oi = np.where(np.isfinite(oi) & (oi >= 0), oi, 0.0)
+    exp_col = _sentiment_column(working, "expiration", "expiry", "Expiration")
+    if exp_col is None:
+        exp_labels = np.array([_format_anomaly_expiry(v) for v in dtes], dtype=object)
+    else:
+        exp_labels = np.array([_format_anomaly_expiry(v) for v in exp_col.to_numpy()], dtype=object)
+
+    strike_bounds = _numeric_range_bounds(strike_range, as_expiry=False)
+    expiry_bounds = _numeric_range_bounds(expiry_range, as_expiry=True)
+    in_range = np.isfinite(strikes) & (strikes > 0) & np.isfinite(ivs) & (ivs > 0) & np.isfinite(dtes) & (dtes >= 0)
+    if strike_bounds is not None:
+        in_range = in_range & (strikes >= strike_bounds[0]) & (strikes <= strike_bounds[1])
+    if expiry_bounds is not None:
+        in_range = in_range & (dtes >= expiry_bounds[0]) & (dtes <= expiry_bounds[1])
+    if not np.any(in_range):
+        return empty
+
+    table = pd.DataFrame(
+        {
+            "Strike": strikes[in_range],
+            "DTE": dtes[in_range],
+            "IV": ivs[in_range],
+            "OI": oi[in_range],
+            "Expiry": exp_labels[in_range],
+        }
+    ).copy()
+    table = table.replace([np.inf, -np.inf], np.nan).dropna(subset=["Strike", "DTE", "IV"])
+    if table.empty:
+        return empty
+    grouped = (
+        table.groupby(["Strike", "DTE"], sort=True, as_index=False)
+        .agg(IV=("IV", "mean"), OI=("OI", "sum"), Expiry=("Expiry", "first"))
+        .copy()
+    )
+    if grouped.empty:
+        return empty
+    iv_wide = grouped.pivot(index="DTE", columns="Strike", values="IV").sort_index(axis=0).sort_index(axis=1)
+    oi_wide = grouped.pivot(index="DTE", columns="Strike", values="OI").reindex(
+        index=iv_wide.index, columns=iv_wide.columns
+    )
+    exp_wide = grouped.pivot(index="DTE", columns="Strike", values="Expiry").reindex(
+        index=iv_wide.index, columns=iv_wide.columns
+    )
+    z = np.array(iv_wide.to_numpy(dtype=np.float64), dtype=np.float64, copy=True)
+    oi_grid = np.array(oi_wide.to_numpy(dtype=np.float64), dtype=np.float64, copy=True)
+    strike_axis = np.array(iv_wide.columns.to_numpy(dtype=np.float64), dtype=np.float64, copy=True)
+    expiry_axis = np.array(iv_wide.index.to_numpy(dtype=np.float64), dtype=np.float64, copy=True)
+    if z.ndim != 2 or z.size == 0 or strike_axis.size < 2 and expiry_axis.size < 2:
+        return empty
+
+    gradient = surface_gradient_magnitude(z, strike_axis, expiry_axis)
+    residual = surface_model_fit_residual(z, sigma=1.0)
+    grad_hot = _robust_high_mask(gradient, k=ANOMALY_GRADIENT_MAD_K)
+    fit_high = _robust_high_mask(residual, k=ANOMALY_FIT_MAD_K)
+    oi_high = _robust_high_mask(oi_grid, k=ANOMALY_GRADIENT_MAD_K)
+    oi_low = _robust_low_mask(oi_grid, k=ANOMALY_GRADIENT_MAD_K)
+    combined = grad_hot | fit_high
+    score = np.where(np.isfinite(residual), residual, -np.inf)
+    score = np.where(np.isfinite(gradient), score + 1e-9 * gradient, score)
+    neighborhood = maximum_filter(np.where(np.isfinite(score), score, -np.inf), size=3)
+    peak = combined & np.isfinite(score) & (score >= neighborhood - 1e-18)
+    rows_i, cols_j = np.nonzero(peak)
+    anomalies: list[dict[str, Any]] = []
+    messages: list[str] = []
+    for i, j in zip(rows_i.tolist(), cols_j.tolist()):
+        strike_v = float(strike_axis[j])
+        dte_v = float(expiry_axis[i])
+        oi_v = float(oi_grid[i, j]) if np.isfinite(oi_grid[i, j]) else 0.0
+        fit_flag = ANOMALY_FIT_HIGH if bool(fit_high[i, j]) else ANOMALY_FIT_LOW
+        exp_val = exp_wide.iloc[i, j] if exp_wide.shape == z.shape else None
+        if (
+            exp_val is None
+            or (isinstance(exp_val, float) and not np.isfinite(exp_val))
+            or str(exp_val).strip() in {"", "nan", "None"}
+        ):
+            expiry_label: Any = dte_v
+        else:
+            expiry_label = exp_val
+        label = classify_anomaly_label(
+            oi_high=bool(oi_high[i, j]),
+            oi_low=bool(oi_low[i, j]),
+            fit_high=bool(fit_high[i, j]),
+        )
+        message = format_anomaly_detected_message(strike_v, expiry_label, oi_v, fit_flag)
+        anomalies.append(
+            {
+                "strike": strike_v,
+                "expiry": _format_anomaly_expiry(expiry_label),
+                "expiry_dte": dte_v,
+                "open_interest": oi_v,
+                "model_fit_error": fit_flag,
+                "fit_residual": float(residual[i, j]) if np.isfinite(residual[i, j]) else 0.0,
+                "gradient": float(gradient[i, j]) if np.isfinite(gradient[i, j]) else 0.0,
+                "label": label,
+                "message": message,
+            }
+        )
+        messages.append(message)
+
+    finite_z = z[np.isfinite(z)]
+    if finite_z.size:
+        z_lo = float(np.min(finite_z))
+        z_hi = float(np.max(finite_z))
+        if z_hi - z_lo < 1e-12:
+            z_lo, z_hi = z_lo - 0.05, z_hi + 0.05
+    else:
+        z_lo, z_hi = 0.0, 1.0
+    dx = _axis_spacing(strike_axis, fallback=1.0) * ANOMALY_GHOST_HALF_SPAN * 2.0
+    dy = _axis_spacing(expiry_axis, fallback=1.0) * ANOMALY_GHOST_HALF_SPAN * 2.0
+    ghost = build_anomaly_ghost_column_meshes(anomalies, dx=dx, dy=dy, z_lo=z_lo, z_hi=z_hi)
+    return {
+        "ticker": symbol,
+        "ok": True,
+        "anomalies": anomalies,
+        "messages": messages,
+        "ghost_columns": ghost,
+        "strike_axis": strike_axis,
+        "expiry_axis": expiry_axis,
+        "gradient": gradient,
+        "residual": residual,
+        "column_dx": float(dx),
+        "column_dy": float(dy),
+        "z_lo": z_lo,
+        "z_hi": z_hi,
     }

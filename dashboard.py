@@ -102,6 +102,10 @@ from quant_engine import (
     OBI_HEATMAP_UNSTABLE_MSG,
     VPIN_HIGH_THRESHOLD,
     OBI_EXTREME_THRESHOLD,
+    diagnose_surface_anomaly,
+    build_anomaly_ghost_column_meshes,
+    ANOMALY_LABEL_GAMMA_WALL,
+    ANOMALY_LABEL_REGIME_MISMATCH,
 )
 
 DATA_REPO = DataRepository()
@@ -1983,13 +1987,97 @@ def build_integrated_risk_figure(surface: go.Surface) -> go.Figure | None:
     return fig
 
 
-def render_integrated_risk_surface(surface: go.Surface) -> None:
+def _figure_z_span(fig: go.Figure, fallback: tuple[float, float] = (0.0, 1.0)) -> tuple[float, float]:
+    """Visible z-span for Ghost Columns; prefers the scene axis range."""
+    try:
+        zrange = fig.layout.scene.zaxis.range
+        if zrange is not None and len(zrange) >= 2:
+            lo, hi = float(zrange[0]), float(zrange[1])
+            if np.isfinite(lo) and np.isfinite(hi) and hi > lo:
+                return lo, hi
+    except Exception:
+        pass
+    return fallback
+
+
+def overlay_anomaly_ghost_columns(fig: go.Figure, diagnosis: Mapping[str, Any] | None) -> go.Figure:
+    """Append semi-transparent Ghost Column Mesh3d traces; existing traces unchanged."""
+    if fig is None or not diagnosis:
+        return fig
+    anomalies = diagnosis.get("anomalies") or []
+    if not anomalies:
+        return fig
+    try:
+        dx = float(diagnosis.get("column_dx") or 1.0)
+        dy = float(diagnosis.get("column_dy") or 1.0)
+        z_lo, z_hi = _figure_z_span(fig, (float(diagnosis.get("z_lo") or 0.0), float(diagnosis.get("z_hi") or 1.0)))
+        meshes = build_anomaly_ghost_column_meshes(anomalies, dx=dx, dy=dy, z_lo=z_lo, z_hi=z_hi)
+    except Exception:
+        return fig
+    for mesh in meshes:
+        label = mesh.get("label")
+        if label == ANOMALY_LABEL_GAMMA_WALL:
+            color = "#7ec8e3"
+        elif label == ANOMALY_LABEL_REGIME_MISMATCH:
+            color = "#e8a87c"
+        else:
+            color = "#9aa4b2"
+        fig.add_trace(
+            go.Mesh3d(
+                x=mesh["x"],
+                y=mesh["y"],
+                z=mesh["z"],
+                i=mesh["i"],
+                j=mesh["j"],
+                k=mesh["k"],
+                opacity=0.28,
+                color=color,
+                name=str(label or "Anomaly"),
+                hovertext=str(mesh.get("message") or ""),
+                hoverinfo="text",
+                showlegend=False,
+                flatshading=True,
+            )
+        )
+    return fig
+
+
+def render_surface_anomaly_messages(diagnosis: Mapping[str, Any] | None) -> None:
+    """Print the exact anomaly lines (and labels) for the diagnostic overlay."""
+    if not diagnosis:
+        return
+    for item in diagnosis.get("anomalies") or []:
+        if not isinstance(item, Mapping):
+            continue
+        message = item.get("message")
+        if message:
+            st.text(str(message))
+        label = item.get("label")
+        if label:
+            st.text(str(label))
+
+
+@st.cache_data(show_spinner=False)
+def cached_diagnose_surface_anomaly(
+    ticker: str,
+    strike_range: tuple[float, ...],
+    expiry_range: tuple[float, ...],
+) -> dict[str, Any]:
+    return diagnose_surface_anomaly(str(ticker), strike_range, expiry_range)
+
+
+def render_integrated_risk_surface(
+    surface: go.Surface,
+    *,
+    diagnosis: Mapping[str, Any] | None = None,
+) -> None:
     """Plot a single Total Risk Profile ``go.Surface`` (Integrated Risk View)."""
     try:
         fig = build_integrated_risk_figure(surface)
         if fig is None:
             st.info("No integrated risk surface data to plot.")
             return
+        overlay_anomaly_ghost_columns(fig, diagnosis)
         st.caption(
             "Z and color = mean of enabled layers (Volatility, Gamma/GEX, |Delta|), "
             "Viridis. Constant IV falls back to Gamma so the mesh has relief."
@@ -2000,6 +2088,7 @@ def render_integrated_risk_surface(surface: go.Surface) -> None:
             config={"displayModeBar": True, "scrollZoom": True},
             key="integrated-risk-surface-v2",
         )
+        render_surface_anomaly_messages(diagnosis)
     except Exception:
         st.error("Surface rendering failed: Invalid data shape.")
 
@@ -5480,7 +5569,15 @@ def main() -> None:
                     include_delta=bool(toggle_delta),
                     include_vol=bool(toggle_vol),
                 )
-                render_integrated_risk_surface(surface)
+                try:
+                    diagnosis = cached_diagnose_surface_anomaly(
+                        str(ticker),
+                        tuple(float(p) for p in prices) if prices else tuple(),
+                        tuple(float(d) for d in expiry_range) if expiry_range else tuple(),
+                    )
+                except Exception:
+                    diagnosis = None
+                render_integrated_risk_surface(surface, diagnosis=diagnosis)
                 # Risk Dashboard — weights documented in quant_engine (equal thirds by default).
                 total_score = compute_total_risk_score(
                     risk_frame.copy(),
