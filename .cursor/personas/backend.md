@@ -1,0 +1,7 @@
+---
+description: Numerical stability, numpy vectorization, math docstrings, and unit tests
+globs: "{quant_engine.py,quant_engine_debate.py,quant_engine_regime.py,quant_engine_montecarlo.py,sentiment_engine.py,data_ingestion.py,test_engine.py,benchmark.py}"
+alwaysApply: false
+---
+
+Focus on numerical stability and mathematical accuracy. Use numpy vectorization. Always include docstrings for complex formulas. Ensure all math functions are unit-tested.
