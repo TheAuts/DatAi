@@ -1,0 +1,127 @@
+2026-09-14 19:27:17.823 [warning] UtilityProcess: ignoring environment variable with an invalid name: 'CommonProgramFiles(x86)'
+2026-09-14 19:27:17.823 [warning] UtilityProcess: ignoring environment variable with an invalid name: 'ProgramFiles(x86)'
+2026-09-14 19:27:17.850 [info] [RendererPing] enabled (intervalMs=5000, blockThresholdMs=15000, stacks=true)
+2026-09-14 19:27:17.873 [info] updateURL https://api2.cursor.sh/updates/api/update/win32-x64-user/cursor/3.20.21/48bd606179787444295b485edee75be85ce17b6e27c128d0bc65a675d74a95ba/stable
+2026-09-14 19:27:17.874 [info] update#setState idle
+2026-09-14 19:27:18.721 [info] [LocalAgentStorage] Scanned 3 recent databases (skipped 1 old), found 5 agent headers, deduped to 5
+2026-09-14 19:27:18.771 [warning] UtilityProcess: ignoring environment variable with an invalid name: '=::'
+2026-09-14 19:27:18.771 [warning] UtilityProcess: ignoring environment variable with an invalid name: '=C:'
+2026-09-14 19:27:18.771 [warning] UtilityProcess: ignoring environment variable with an invalid name: 'CommonProgramFiles(x86)'
+2026-09-14 19:27:18.771 [warning] UtilityProcess: ignoring environment variable with an invalid name: 'ProgramFiles(x86)'
+2026-09-14 19:27:18.838 [warning] UtilityProcess: ignoring environment variable with an invalid name: 'CommonProgramFiles(x86)'
+2026-09-14 19:27:18.838 [warning] UtilityProcess: ignoring environment variable with an invalid name: 'ProgramFiles(x86)'
+2026-09-14 19:27:19.008 [warning] UtilityProcess: ignoring environment variable with an invalid name: '=::'
+2026-09-14 19:27:19.008 [warning] UtilityProcess: ignoring environment variable with an invalid name: '=C:'
+2026-09-14 19:27:19.008 [warning] UtilityProcess: ignoring environment variable with an invalid name: 'CommonProgramFiles(x86)'
+2026-09-14 19:27:19.008 [warning] UtilityProcess: ignoring environment variable with an invalid name: 'ProgramFiles(x86)'
+2026-09-14 19:27:19.539 [warning] RequestStore#acceptReply was called without receiving a matching request 1
+2026-09-14 19:27:19.540 [warning] RequestStore#acceptReply was called without receiving a matching request 2
+2026-09-14 19:27:19.540 [warning] RequestStore#acceptReply was called without receiving a matching request 3
+2026-09-14 19:27:19.540 [warning] RequestStore#acceptReply was called without receiving a matching request 4
+2026-09-14 19:27:19.540 [warning] RequestStore#acceptReply was called without receiving a matching request 5
+2026-09-14 19:27:19.540 [warning] RequestStore#acceptReply was called without receiving a matching request 6
+2026-09-14 19:27:19.541 [warning] RequestStore#acceptReply was called without receiving a matching request 7
+2026-09-14 19:27:19.578 [warning] UtilityProcess: ignoring environment variable with an invalid name: '=::'
+2026-09-14 19:27:19.578 [warning] UtilityProcess: ignoring environment variable with an invalid name: '=C:'
+2026-09-14 19:27:19.578 [warning] UtilityProcess: ignoring environment variable with an invalid name: 'CommonProgramFiles(x86)'
+2026-09-14 19:27:19.578 [warning] UtilityProcess: ignoring environment variable with an invalid name: 'ProgramFiles(x86)'
+2026-09-14 19:27:19.579 [warning] UtilityProcess: ignoring environment variable with an invalid name: '=::'
+2026-09-14 19:27:19.579 [warning] UtilityProcess: ignoring environment variable with an invalid name: '=C:'
+2026-09-14 19:27:19.579 [warning] UtilityProcess: ignoring environment variable with an invalid name: 'CommonProgramFiles(x86)'
+2026-09-14 19:27:19.579 [warning] UtilityProcess: ignoring environment variable with an invalid name: 'ProgramFiles(x86)'
+2026-09-14 19:27:19.579 [warning] UtilityProcess: ignoring environment variable with an invalid name: '=::'
+2026-09-14 19:27:19.579 [warning] UtilityProcess: ignoring environment variable with an invalid name: '=C:'
+2026-09-14 19:27:19.580 [warning] UtilityProcess: ignoring environment variable with an invalid name: 'CommonProgramFiles(x86)'
+2026-09-14 19:27:19.580 [warning] UtilityProcess: ignoring environment variable with an invalid name: 'ProgramFiles(x86)'
+2026-09-14 19:27:19.774 [warning] UtilityProcess: ignoring environment variable with an invalid name: 'CommonProgramFiles(x86)'
+2026-09-14 19:27:19.774 [warning] UtilityProcess: ignoring environment variable with an invalid name: 'ProgramFiles(x86)'
+2026-09-14 19:27:20.359 [warning] UtilityProcess: ignoring environment variable with an invalid name: '=::'
+2026-09-14 19:27:20.359 [warning] UtilityProcess: ignoring environment variable with an invalid name: '=C:'
+2026-09-14 19:27:20.359 [warning] UtilityProcess: ignoring environment variable with an invalid name: 'CommonProgramFiles(x86)'
+2026-09-14 19:27:20.359 [warning] UtilityProcess: ignoring environment variable with an invalid name: 'ProgramFiles(x86)'
+2026-09-14 19:27:20.962 [warning] UtilityProcess: ignoring environment variable with an invalid name: 'CommonProgramFiles(x86)'
+2026-09-14 19:27:20.962 [warning] UtilityProcess: ignoring environment variable with an invalid name: 'ProgramFiles(x86)'
+2026-09-14 19:27:21.052 [warning] RequestStore#acceptReply was called without receiving a matching request 15
+2026-09-14 19:27:21.053 [warning] RequestStore#acceptReply was called without receiving a matching request 16
+2026-09-14 19:27:21.053 [warning] RequestStore#acceptReply was called without receiving a matching request 17
+2026-09-14 19:27:21.053 [warning] RequestStore#acceptReply was called without receiving a matching request 18
+2026-09-14 19:27:21.054 [warning] RequestStore#acceptReply was called without receiving a matching request 19
+2026-09-14 19:27:21.054 [warning] RequestStore#acceptReply was called without receiving a matching request 20
+2026-09-14 19:27:21.054 [warning] RequestStore#acceptReply was called without receiving a matching request 21
+2026-09-14 19:27:21.445 [warning] UtilityProcess: ignoring environment variable with an invalid name: 'CommonProgramFiles(x86)'
+2026-09-14 19:27:21.445 [warning] UtilityProcess: ignoring environment variable with an invalid name: 'ProgramFiles(x86)'
+2026-09-14 19:27:22.899 [warning] RequestStore#acceptReply was called without receiving a matching request 22
+2026-09-14 19:27:22.899 [warning] RequestStore#acceptReply was called without receiving a matching request 23
+2026-09-14 19:27:22.900 [warning] RequestStore#acceptReply was called without receiving a matching request 24
+2026-09-14 19:27:22.900 [warning] RequestStore#acceptReply was called without receiving a matching request 25
+2026-09-14 19:27:22.900 [warning] RequestStore#acceptReply was called without receiving a matching request 26
+2026-09-14 19:27:22.900 [warning] RequestStore#acceptReply was called without receiving a matching request 27
+2026-09-14 19:27:22.901 [warning] RequestStore#acceptReply was called without receiving a matching request 28
+2026-09-14 19:27:22.902 [warning] UtilityProcess: ignoring environment variable with an invalid name: 'CommonProgramFiles(x86)'
+2026-09-14 19:27:22.902 [warning] UtilityProcess: ignoring environment variable with an invalid name: 'ProgramFiles(x86)'
+2026-09-14 19:27:31.543 [info] [CursorProclistService] Config enabled feature (subsample every 10s; memoryPressureMonitorEnabled=true)
+2026-09-14 19:27:31.574 [info] [CursorProclistService] Config enabled feature (subsample every 10s; memoryPressureMonitorEnabled=true)
+2026-09-14 19:27:34.665 [warning] UtilityProcess: ignoring environment variable with an invalid name: 'CommonProgramFiles(x86)'
+2026-09-14 19:27:34.665 [warning] UtilityProcess: ignoring environment variable with an invalid name: 'ProgramFiles(x86)'
+2026-09-14 19:27:48.725 [info] update#setState checking for updates
+2026-09-14 19:27:52.924 [info] update#setState idle
+2026-09-14 19:28:08.902 [info] Extension host with pid 11888 exited with code: 0, signal: unknown.
+2026-09-14 19:28:08.944 [info] Extension host with pid 18948 exited with code: 0, signal: unknown.
+2026-09-14 19:28:11.324 [info] [LocalAgentStorage] Scanned 3 recent databases (skipped 1 old), found 5 agent headers, deduped to 5
+2026-09-14 19:28:11.371 [warning] UtilityProcess: ignoring environment variable with an invalid name: '=::'
+2026-09-14 19:28:11.371 [warning] UtilityProcess: ignoring environment variable with an invalid name: '=C:'
+2026-09-14 19:28:11.371 [warning] UtilityProcess: ignoring environment variable with an invalid name: 'CommonProgramFiles(x86)'
+2026-09-14 19:28:11.371 [warning] UtilityProcess: ignoring environment variable with an invalid name: 'ProgramFiles(x86)'
+2026-09-14 19:28:12.117 [warning] UtilityProcess: ignoring environment variable with an invalid name: 'CommonProgramFiles(x86)'
+2026-09-14 19:28:12.117 [warning] UtilityProcess: ignoring environment variable with an invalid name: 'ProgramFiles(x86)'
+2026-09-14 19:28:12.249 [warning] UtilityProcess: ignoring environment variable with an invalid name: '=::'
+2026-09-14 19:28:12.249 [warning] UtilityProcess: ignoring environment variable with an invalid name: '=C:'
+2026-09-14 19:28:12.249 [warning] UtilityProcess: ignoring environment variable with an invalid name: 'CommonProgramFiles(x86)'
+2026-09-14 19:28:12.249 [warning] UtilityProcess: ignoring environment variable with an invalid name: 'ProgramFiles(x86)'
+2026-09-14 19:28:12.306 [warning] RequestStore#acceptReply was called without receiving a matching request 36
+2026-09-14 19:28:12.306 [warning] RequestStore#acceptReply was called without receiving a matching request 37
+2026-09-14 19:28:12.307 [warning] RequestStore#acceptReply was called without receiving a matching request 38
+2026-09-14 19:28:12.307 [warning] RequestStore#acceptReply was called without receiving a matching request 39
+2026-09-14 19:28:12.307 [warning] RequestStore#acceptReply was called without receiving a matching request 40
+2026-09-14 19:28:12.307 [warning] RequestStore#acceptReply was called without receiving a matching request 41
+2026-09-14 19:28:12.307 [warning] RequestStore#acceptReply was called without receiving a matching request 42
+2026-09-14 19:28:14.202 [warning] UtilityProcess: ignoring environment variable with an invalid name: 'CommonProgramFiles(x86)'
+2026-09-14 19:28:14.203 [warning] UtilityProcess: ignoring environment variable with an invalid name: 'ProgramFiles(x86)'
+2026-09-14 19:28:23.947 [info] [CursorProclistService] Config enabled feature (subsample every 10s; memoryPressureMonitorEnabled=true)
+2026-09-14 19:29:30.573 [info] Extension host with pid 26308 exited with code: 0, signal: unknown.
+2026-09-14 19:29:34.780 [info] Extension host with pid 7196 exited with code: 0, signal: unknown.
+2026-09-14 19:32:29.775 [info] [LocalAgentStorage] Scanned 3 recent databases (skipped 1 old), found 5 agent headers, deduped to 5
+2026-09-14 19:32:29.823 [warning] UtilityProcess: ignoring environment variable with an invalid name: '=::'
+2026-09-14 19:32:29.823 [warning] UtilityProcess: ignoring environment variable with an invalid name: '=C:'
+2026-09-14 19:32:29.823 [warning] UtilityProcess: ignoring environment variable with an invalid name: 'CommonProgramFiles(x86)'
+2026-09-14 19:32:29.823 [warning] UtilityProcess: ignoring environment variable with an invalid name: 'ProgramFiles(x86)'
+2026-09-14 19:32:30.571 [warning] UtilityProcess: ignoring environment variable with an invalid name: 'CommonProgramFiles(x86)'
+2026-09-14 19:32:30.572 [warning] UtilityProcess: ignoring environment variable with an invalid name: 'ProgramFiles(x86)'
+2026-09-14 19:32:30.700 [warning] UtilityProcess: ignoring environment variable with an invalid name: '=::'
+2026-09-14 19:32:30.700 [warning] UtilityProcess: ignoring environment variable with an invalid name: '=C:'
+2026-09-14 19:32:30.700 [warning] UtilityProcess: ignoring environment variable with an invalid name: 'CommonProgramFiles(x86)'
+2026-09-14 19:32:30.700 [warning] UtilityProcess: ignoring environment variable with an invalid name: 'ProgramFiles(x86)'
+2026-09-14 19:32:30.758 [warning] RequestStore#acceptReply was called without receiving a matching request 50
+2026-09-14 19:32:30.759 [warning] RequestStore#acceptReply was called without receiving a matching request 51
+2026-09-14 19:32:30.759 [warning] RequestStore#acceptReply was called without receiving a matching request 52
+2026-09-14 19:32:30.760 [warning] RequestStore#acceptReply was called without receiving a matching request 53
+2026-09-14 19:32:30.760 [warning] RequestStore#acceptReply was called without receiving a matching request 54
+2026-09-14 19:32:30.760 [warning] RequestStore#acceptReply was called without receiving a matching request 55
+2026-09-14 19:32:30.760 [warning] RequestStore#acceptReply was called without receiving a matching request 56
+2026-09-14 19:32:32.657 [warning] UtilityProcess: ignoring environment variable with an invalid name: 'CommonProgramFiles(x86)'
+2026-09-14 19:32:32.657 [warning] UtilityProcess: ignoring environment variable with an invalid name: 'ProgramFiles(x86)'
+2026-09-14 19:32:42.321 [info] [CursorProclistService] Config enabled feature (subsample every 10s; memoryPressureMonitorEnabled=true)
+2026-09-14 19:34:01.845 [info] Extension host with pid 13796 exited with code: 0, signal: unknown.
+2026-09-14 19:35:00.940 [warning] UtilityProcess: ignoring environment variable with an invalid name: '=::'
+2026-09-14 19:35:00.940 [warning] UtilityProcess: ignoring environment variable with an invalid name: '=C:'
+2026-09-14 19:35:00.940 [warning] UtilityProcess: ignoring environment variable with an invalid name: 'CommonProgramFiles(x86)'
+2026-09-14 19:35:00.940 [warning] UtilityProcess: ignoring environment variable with an invalid name: 'ProgramFiles(x86)'
+2026-09-14 19:35:01.008 [warning] RequestStore#acceptReply was called without receiving a matching request 57
+2026-09-14 19:35:01.008 [warning] RequestStore#acceptReply was called without receiving a matching request 58
+2026-09-14 19:35:01.009 [warning] RequestStore#acceptReply was called without receiving a matching request 59
+2026-09-14 19:35:01.010 [warning] RequestStore#acceptReply was called without receiving a matching request 60
+2026-09-14 19:35:01.010 [warning] RequestStore#acceptReply was called without receiving a matching request 61
+2026-09-14 19:35:01.010 [warning] RequestStore#acceptReply was called without receiving a matching request 62
+2026-09-14 19:35:01.010 [warning] RequestStore#acceptReply was called without receiving a matching request 63
+2026-09-14 19:35:02.893 [warning] UtilityProcess: ignoring environment variable with an invalid name: 'CommonProgramFiles(x86)'
+2026-09-14 19:35:02.893 [warning] UtilityProcess: ignoring environment variable with an invalid name: 'ProgramFiles(x86)'
