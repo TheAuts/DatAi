@@ -23,6 +23,7 @@ from quant_engine import (
     MODEL_HESTON,
     DataRepository,
     prepare_plotly_surface_xyz,
+    reshape_to_surface,
     calculate_greeks,
     calculate_heston_greeks,
     calculate_portfolio_risk,
@@ -918,6 +919,84 @@ def test_prepare_plotly_surface_xyz_reshape_and_axis_gate() -> None:
     already_2d = np.ones((4, 5))
     z_keep, _, _, _ = prepare_plotly_surface_xyz(already_2d)
     assert z_keep.shape == (4, 5)
+
+
+def test_reshape_to_surface_1d_perfect_square() -> None:
+    flat = np.arange(9, dtype=object)  # object → float64 coercion
+    out = reshape_to_surface(flat)
+    assert out.dtype == np.float64
+    assert out.shape == (3, 3)
+    assert np.allclose(out, np.arange(9, dtype=np.float64).reshape(3, 3))
+    # Returned array is a copy.
+    out[0, 0] = -1.0
+    assert float(flat[0]) == 0.0
+
+
+def test_reshape_to_surface_pad_with_median() -> None:
+    flat = np.array([1.0, 2.0, 3.0, 4.0, 5.0], dtype=np.float64)
+    out = reshape_to_surface(flat)
+    assert out.dtype == np.float64
+    assert out.shape == (3, 3)  # ceil(sqrt(5))**2 == 9
+    med = float(np.median(flat))
+    assert np.allclose(out.ravel()[:5], flat)
+    assert np.allclose(out.ravel()[5:], med)
+
+
+def test_reshape_to_surface_float64_and_2d_passthrough() -> None:
+    grid = np.ones((2, 3), dtype=np.float32)
+    out = reshape_to_surface(grid)
+    assert out.dtype == np.float64
+    assert out.shape == (2, 3)
+    assert out is not grid
+    # List with None → float64 NaN cells, then pad to square.
+    listed = reshape_to_surface([1, None, 3])
+    assert listed.dtype == np.float64
+    assert listed.shape == (2, 2)
+
+
+def test_reshape_to_surface_empty_and_invalid() -> None:
+    empty = reshape_to_surface([])
+    assert empty.shape == (0, 0)
+    assert empty.dtype == np.float64
+    assert reshape_to_surface(None).shape == (0, 0)
+    assert reshape_to_surface("not-an-array").shape == (0, 0)
+    assert reshape_to_surface(np.array([])).shape == (0, 0)
+
+
+def test_audit_go_surface_paths_use_reshape_to_surface() -> None:
+    """Gatekeeper: every dashboard ``go.Surface`` construction applies ``reshape_to_surface``."""
+    root = Path(__file__).resolve().parent
+    eng = (root / "quant_engine.py").read_text(encoding="utf-8")
+    dash = (root / "dashboard.py").read_text(encoding="utf-8")
+    assert "def reshape_to_surface(" in eng
+    assert "reshape_to_surface" in dash
+
+    # Shared builder must reshape before constructing Surface.
+    start = dash.index("def _plotly_surface")
+    end = dash.index("\ndef ", start + 1)
+    helper = dash[start:end]
+    assert "reshape_to_surface" in helper
+    assert "go.Surface" in helper
+    assert 'st.error("Surface rendering failed: Invalid data shape.")' in helper
+
+    # Named 3D render paths must call reshape_to_surface.
+    for marker in (
+        "def render_integrated_risk_surface",
+        "def render_time_machine_vol_surface",
+        "def liquidation_waterfall_build_heatmap",
+        "def event_impact_render_shock_surface",
+        "def build_market_timelapse_figure",
+    ):
+        assert marker in dash, marker
+        fn_start = dash.index(marker)
+        fn_end = dash.index("\ndef ", fn_start + 1)
+        body = dash[fn_start:fn_end]
+        assert "reshape_to_surface" in body, f"{marker} missing reshape_to_surface"
+
+    # Engine integrated-risk builder also reshapes before Surface.
+    eng_start = eng.index("def generate_integrated_risk_surface")
+    eng_end = eng.index("\ndef ", eng_start + 1)
+    assert "reshape_to_surface" in eng[eng_start:eng_end]
 
 
 def test_generate_greek_curve_uses_injected_repo() -> None:
