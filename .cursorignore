@@ -1,0 +1,10 @@
+﻿# Keep Composer/Agent from indexing bulky/generated files
+data_history/
+cache/
+.venv/
+venv/
+logs/
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+.env
