@@ -5178,7 +5178,7 @@ def add_market_timelapse_tab(tab: Any, ticker: str) -> None:
     with tab:
         st.caption(
             f"Historical morph of `{TIMELAPSE_SURFACE_KEY}` from `data_history/` "
-            "(shared Z min/max across frames)."
+            "(shared Strike × DTE mesh so delta morphs in place; color/Z locked)."
         )
         symbol = str(ticker or "").strip().upper()
         history_token = _timelapse_history_token(symbol)
@@ -5191,12 +5191,16 @@ def add_market_timelapse_tab(tab: Any, ticker: str) -> None:
             st.info("No historical delta surfaces found for this ticker in data_history/.")
             return
         z_min, z_max = timelapse_shared_z_range(item["z"] for item in frames)
+        x0 = np.asarray(frames[0]["x"], dtype=np.float64).reshape(-1)
+        y0 = np.asarray(frames[0]["y"], dtype=np.float64).reshape(-1)
         st.write(
             {
                 "frames": len(frames),
                 "surface_key": TIMELAPSE_SURFACE_KEY,
                 "z_min": z_min,
                 "z_max": z_max,
+                "shared_strike": [float(np.nanmin(x0)), float(np.nanmax(x0))],
+                "shared_dte": [float(np.nanmin(y0)), float(np.nanmax(y0))],
                 "labels": [item["label"] for item in frames],
             }
         )

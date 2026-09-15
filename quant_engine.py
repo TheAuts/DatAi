@@ -15,7 +15,7 @@ from typing import Any, Callable, Iterable, Mapping
 
 import numpy as np
 import pandas as pd
-from scipy.interpolate import griddata
+from scipy.interpolate import RegularGridInterpolator, griddata
 from scipy.ndimage import gaussian_filter
 from scipy.stats import norm
 
@@ -5053,6 +5053,162 @@ def delta_surface_to_grid(surface: Mapping[str, Any] | None) -> tuple[np.ndarray
     return z2d, x_axis, y_axis
 
 
+_TIMELAPSE_DTE_DEGENERATE_SPAN = 1e-4
+
+
+def _fill_row_nans(z: np.ndarray) -> np.ndarray:
+    """Linear-fill NaNs along each strike row; leave all-NaN rows untouched."""
+    out = np.array(z, dtype=np.float64, copy=True)
+    idx = np.arange(out.shape[1], dtype=np.float64)
+    for i in range(out.shape[0]):
+        row = out[i]
+        ok = np.isfinite(row)
+        if ok.any() and not ok.all():
+            row[~ok] = np.interp(idx[~ok], idx[ok], row[ok])
+            out[i] = row
+    return out
+
+
+def _resample_delta_grid(
+    x_src: Any,
+    y_src: Any,
+    z_src: Any,
+    x_dst: np.ndarray,
+    y_dst: np.ndarray,
+) -> np.ndarray:
+    """Map one delta grid onto ``(y_dst, x_dst)``. Single-DTE smiles are extruded."""
+    x_src = np.asarray(x_src, dtype=np.float64).reshape(-1)
+    y_src = np.asarray(y_src, dtype=np.float64).reshape(-1)
+    z_src = np.asarray(z_src, dtype=np.float64)
+    n_y, n_x = int(y_dst.size), int(x_dst.size)
+    empty = np.full((n_y, n_x), np.nan, dtype=np.float64)
+    if z_src.size == 0 or x_src.size == 0 or y_src.size == 0:
+        return empty
+    if z_src.ndim != 2:
+        if z_src.size == y_src.size * x_src.size:
+            z_src = z_src.reshape(y_src.size, x_src.size)
+        else:
+            return empty
+    if z_src.shape != (y_src.size, x_src.size):
+        return empty
+
+    order_x = np.argsort(x_src)
+    x_src = x_src[order_x]
+    z_src = z_src[:, order_x]
+    order_y = np.argsort(y_src)
+    y_src = y_src[order_y]
+    z_src = z_src[order_y, :]
+
+    y_span = float(y_src[-1] - y_src[0]) if y_src.size else 0.0
+    if y_src.size < 2 or y_span < _TIMELAPSE_DTE_DEGENERATE_SPAN:
+        z_line = np.nanmean(np.atleast_2d(z_src), axis=0)
+        ok = np.isfinite(z_line) & np.isfinite(x_src)
+        if not np.any(ok):
+            return empty
+        z_at_x = np.interp(x_dst, x_src[ok], z_line[ok])
+        return np.broadcast_to(z_at_x, (n_y, n_x)).copy()
+
+    if x_src.size >= 2 and np.any(np.diff(x_src) <= 0.0):
+        rounded = np.round(x_src, 10)
+        ux, inv = np.unique(rounded, return_inverse=True)
+        z_new = np.zeros((z_src.shape[0], ux.size), dtype=np.float64)
+        for j in range(ux.size):
+            z_new[:, j] = np.nanmean(z_src[:, inv == j], axis=1)
+        x_src, z_src = ux, z_new
+    if y_src.size >= 2 and np.any(np.diff(y_src) <= 0.0):
+        rounded = np.round(y_src, 10)
+        uy, inv = np.unique(rounded, return_inverse=True)
+        z_new = np.zeros((uy.size, z_src.shape[1]), dtype=np.float64)
+        for i in range(uy.size):
+            z_new[i] = np.nanmean(z_src[inv == i, :], axis=0)
+        y_src, z_src = uy, z_new
+        if y_src.size < 2 or float(y_src[-1] - y_src[0]) < _TIMELAPSE_DTE_DEGENERATE_SPAN:
+            z_line = np.nanmean(np.atleast_2d(z_src), axis=0)
+            ok = np.isfinite(z_line) & np.isfinite(x_src)
+            if not np.any(ok):
+                return empty
+            z_at_x = np.interp(x_dst, x_src[ok], z_line[ok])
+            return np.broadcast_to(z_at_x, (n_y, n_x)).copy()
+
+    if x_src.size < 2:
+        z_col = np.nanmean(np.atleast_2d(z_src), axis=1)
+        z_at_y = np.interp(y_dst, y_src, z_col)
+        return np.repeat(z_at_y.reshape(-1, 1), n_x, axis=1)
+
+    z_src = _fill_row_nans(z_src)
+    interpolator = RegularGridInterpolator(
+        (y_src, x_src),
+        z_src,
+        bounds_error=False,
+        fill_value=None,
+        method="linear",
+    )
+    yy, xx = np.meshgrid(y_dst, x_dst, indexing="ij")
+    return np.asarray(interpolator((yy, xx)), dtype=np.float64)
+
+
+def align_timelapse_frames_to_shared_grid(frames: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Put every timelapse frame on one Strike × DTE mesh so playback morphs z.
+
+    History files are often a single expiry. Native grids then sit at different
+    DTE (and sometimes strike) ranges, so a Plotly redraw looks like an axis
+    offset instead of a morph. Degenerate single-DTE smiles are interpolated
+    along strike and extruded across the shared DTE axis.
+    """
+    if len(frames) < 2:
+        return frames
+
+    x_mins: list[float] = []
+    x_maxs: list[float] = []
+    y_mins: list[float] = []
+    y_maxs: list[float] = []
+    n_xs: list[int] = []
+    n_ys: list[int] = []
+    for item in frames:
+        x = np.asarray(item.get("x"), dtype=np.float64).reshape(-1)
+        y = np.asarray(item.get("y"), dtype=np.float64).reshape(-1)
+        xf = x[np.isfinite(x)]
+        yf = y[np.isfinite(y)]
+        if xf.size:
+            x_mins.append(float(xf.min()))
+            x_maxs.append(float(xf.max()))
+            n_xs.append(int(xf.size))
+        if yf.size:
+            y_mins.append(float(yf.min()))
+            y_maxs.append(float(yf.max()))
+            n_ys.append(int(yf.size))
+    if not x_mins or not y_mins:
+        return frames
+
+    x_min, x_max = min(x_mins), max(x_maxs)
+    y_min, y_max = min(y_mins), max(y_maxs)
+    n_x = max(int(VOL_SURFACE_STRIKE_POINTS), max(n_xs), 2)
+    n_y = max(int(VOL_SURFACE_DTE_POINTS), max(n_ys), 2)
+    if x_max <= x_min:
+        x_max = x_min + 1e-6
+    if (y_max - y_min) < _TIMELAPSE_DTE_DEGENERATE_SPAN:
+        n_y = max(max(n_ys), 2)
+        y_max = y_min + 1e-6
+
+    def _axes_close(a: Any, b: Any) -> bool:
+        aa = np.asarray(a, dtype=np.float64).reshape(-1)
+        bb = np.asarray(b, dtype=np.float64).reshape(-1)
+        return aa.shape == bb.shape and bool(np.allclose(aa, bb, rtol=0.0, atol=1e-9, equal_nan=True))
+
+    first_x = frames[0].get("x")
+    first_y = frames[0].get("y")
+    if all(_axes_close(item.get("x"), first_x) and _axes_close(item.get("y"), first_y) for item in frames[1:]):
+        return frames
+
+    x_shared = np.linspace(x_min, x_max, n_x, dtype=np.float64)
+    y_shared = np.linspace(y_min, y_max, n_y, dtype=np.float64)
+    for item in frames:
+        item["z"] = _resample_delta_grid(item.get("x"), item.get("y"), item.get("z"), x_shared, y_shared)
+        item["x"] = np.array(x_shared, copy=True)
+        item["y"] = np.array(y_shared, copy=True)
+    return frames
+
+
 def timelapse_shared_z_range(grids: Iterable[Any]) -> tuple[float, float]:
     """Shared finite Z min/max across all timelapse frames (locks color / z-axis)."""
     lo = float("inf")
@@ -5088,7 +5244,9 @@ def load_all_snapshots(
         z (2D ndarray), x (strikes), y (DTEs), surface_key
 
     Snapshots without a usable delta surface after in-memory backfill are skipped.
-    Does not rewrite history files.
+    Consecutive identical native grids are dropped, then remaining frames are
+    resampled onto one shared Strike × DTE mesh so playback morphs delta in
+    place instead of jumping along an axis. Does not rewrite history files.
     """
     root = Path(history_dir) if history_dir is not None else Path(__file__).resolve().parent / "data_history"
     safe = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in str(ticker or "").strip().upper()) or "_"
@@ -5162,7 +5320,18 @@ def load_all_snapshots(
             continue
         unique.append(item)
         prev_sig = sig
-    frames = unique
+    frames = align_timelapse_frames_to_shared_grid(unique)
+    # After resampling, consecutive identical z on the shared mesh can still stall Play.
+    compact: list[dict[str, Any]] = []
+    prev_z: tuple[Any, ...] | None = None
+    for item in frames:
+        z = np.asarray(item["z"], dtype=np.float64)
+        sig_z = (z.shape, z.tobytes(), np.isnan(z).tobytes())
+        if sig_z == prev_z:
+            continue
+        compact.append(item)
+        prev_z = sig_z
+    frames = compact
     # Disambiguate duplicate HH:MM:SS labels for Plotly frame names / slider steps.
     seen: dict[str, int] = {}
     for item in frames:
