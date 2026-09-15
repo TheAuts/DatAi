@@ -1,0 +1,23 @@
+#!/bin/sh
+# Dual-save: every local commit is pushed so GitHub matches this checkout.
+git_dir=$(git rev-parse --git-dir 2>/dev/null) || exit 0
+
+if [ -d "$git_dir/rebase-merge" ] || [ -d "$git_dir/rebase-apply" ] ||
+   [ -f "$git_dir/MERGE_HEAD" ] || [ -f "$git_dir/CHERRY_PICK_HEAD" ] ||
+   [ -f "$git_dir/REVERT_HEAD" ]; then
+  exit 0
+fi
+
+git symbolic-ref --quiet HEAD >/dev/null || exit 0
+
+if [ -n "$DATAI_SKIP_POST_COMMIT_PUSH" ]; then
+  exit 0
+fi
+
+branch=$(git symbolic-ref --short HEAD)
+if git push -u origin HEAD; then
+  echo "DatAi dual-save: origin/$branch updated."
+else
+  echo "DatAi dual-save: commit is local only. Push failed; run: git push -u origin HEAD" >&2
+fi
+exit 0
