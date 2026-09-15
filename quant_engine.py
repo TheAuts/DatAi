@@ -5150,6 +5150,19 @@ def load_all_snapshots(
         )
 
     frames.sort(key=lambda item: (float(item["timestamp"]), str(item["stamp"]), str(item["path"])))
+    # Consecutive identical grids make Play look stuck; keep the first of each run.
+    unique: list[dict[str, Any]] = []
+    prev_sig: tuple[Any, ...] | None = None
+    for item in frames:
+        z = np.asarray(item["z"], dtype=np.float64)
+        x = np.asarray(item["x"], dtype=np.float64)
+        y = np.asarray(item["y"], dtype=np.float64)
+        sig = (z.shape, z.tobytes(), np.isnan(z).tobytes(), x.tobytes(), y.tobytes())
+        if sig == prev_sig:
+            continue
+        unique.append(item)
+        prev_sig = sig
+    frames = unique
     # Disambiguate duplicate HH:MM:SS labels for Plotly frame names / slider steps.
     seen: dict[str, int] = {}
     for item in frames:

@@ -1338,6 +1338,14 @@ def test_load_all_snapshots_sorted_and_delta_surface(tmp_path: Path) -> None:
     assert lo == pytest.approx(-0.2)
     assert hi == pytest.approx(1.0)
 
+    _write("2026-09-13_1030", 125.0, [0.1, 0.2, 0.3, 0.4])  # identical z to 10:00
+    frames2 = load_all_snapshots("AAA", history_dir=history)
+    assert [f["stamp"] for f in frames2] == [
+        "2026-09-13_0900",
+        "2026-09-13_1000",
+        "2026-09-13_1100",
+    ]
+
 
 def test_build_market_timelapse_figure_json_frames_play_in_order() -> None:
     """Frames serialize as JSON lists with integer names so Plotly animate can swap z."""
